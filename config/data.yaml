@@ -1,0 +1,55 @@
+# Dataset + dataloader defaults.
+# Expected manifest line format:
+# file_name|duration|transcript|target_npy|prompt_file_name|prompt_duration|prompt_transcript|prompt_npy
+
+data:
+  train_manifest: dataset/train_manifest.txt
+  val_manifest: dataset/val_manifest.txt
+  test_manifest: null
+  manifest_root: dataset
+  vocab_path: dataset/vocab.txt
+
+  loader:
+    train_batch_size: 8
+    val_batch_size: 8
+    test_batch_size: 8
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last_train: true
+    shuffle_train: true
+    shuffle_val: false
+    shuffle_test: false
+
+  shared_layout:
+    # Discrete ids are [0, discrete_token_count - 1].
+    # Special ids are derived by build_shared_token_layout().
+    discrete_token_count: 2048
+    delay_token_id: 2048
+    eos_token_id: 2049
+    pad_token_id: 2050
+    text_token_offset: 2051
+
+  dataset:
+    # PrismDataset(...) arguments.
+    prompt_length: null
+    min_prompt_length: 1
+    min_target_length: 1
+    append_eos_to_text: false
+    cache_npy: false
+    discrete_stream_count: 8
+    continuous_feature_dim: 128
+
+  collate:
+    # BatchCollate(...) arguments.
+    text_pad_value: null
+    discrete_pad_value: null
+    continuous_pad_value: 0.0
+    include_attention_mask: true
+    prompt_length: null
+    min_prompt_length: 1
+    min_target_length: 1
+    stream_delay: null
+    discrete_stream_delay_ms: 80.0
+    codec_frame_rate_hz: 12.5

@@ -1,0 +1,57 @@
+experiment:
+  # Optional: pick alternative base config files.
+  # `train.py` reads these and then applies the overrides below.
+  config_paths:
+    trainer: config/trainer.yaml
+    model: config/model.yaml
+    data: config/data.yaml
+
+  # Free-form experiment name (used for logging/checkpoint naming below).
+  name: prism_tts
+
+  trainer:
+    logger:
+      # Default logger.
+      type: wandb
+      project: prism_tts
+      name: baseline_local
+      save_dir: logs
+      offline: false
+      log_model: false
+
+    checkpoint:
+      dirpath: checkpoints/baseline_local
+      filename: prism_tts-{step:07d}
+      monitor: val/loss
+      mode: min
+      save_top_k: 3
+      save_last: true
+      every_n_train_steps: 5000
+
+    lightning_trainer:
+      accelerator: auto
+      devices: 1
+      strategy: auto
+      precision: bf16-mixed
+      max_steps: 300000
+      min_steps: 0
+      gradient_clip_val: 1.0
+      accumulate_grad_batches: 1
+      log_every_n_steps: 10
+      val_check_interval: 1000
+      num_sanity_val_steps: 2
+      limit_train_batches: 1.0
+      limit_val_batches: 1.0
+      benchmark: true
+      deterministic: false
+      enable_checkpointing: true
+      enable_progress_bar: true
+      enable_model_summary: true
+
+  data:
+    # Set these to your real manifests before training.
+    train_manifest: dataset/train_manifest.txt
+    val_manifest: dataset/val_manifest.txt
+    test_manifest: null
+    manifest_root: dataset
+    vocab_path: dataset/vocab.txt
