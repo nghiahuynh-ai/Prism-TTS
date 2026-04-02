@@ -14,13 +14,13 @@ experiment:
       # Default logger.
       type: wandb
       project: prism_tts
-      name: baseline_local
+      name: baseline
       save_dir: logs
       offline: false
       log_model: false
 
     checkpoint:
-      dirpath: checkpoints/baseline_local
+      dirpath: checkpoints/baseline
       filename: prism_tts-{step:07d}
       monitor: val/loss
       mode: min

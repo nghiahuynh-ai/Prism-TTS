@@ -92,6 +92,54 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run test loop after fit if test manifest is configured.",
     )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        default=None,
+        help="Override trainer.logger.project for WandB runs.",
+    )
+    parser.add_argument(
+        "--wandb-name",
+        type=str,
+        default=None,
+        help="Override trainer.logger.name for WandB runs.",
+    )
+    parser.add_argument(
+        "--wandb-save-dir",
+        type=str,
+        default=None,
+        help="Override trainer.logger.save_dir for WandB runs.",
+    )
+    parser.add_argument(
+        "--wandb-offline",
+        type=str,
+        default=None,
+        help="Override trainer.logger.offline (true/false).",
+    )
+    parser.add_argument(
+        "--wandb-log-model",
+        type=str,
+        default=None,
+        help="Override trainer.logger.log_model (true/false/all).",
+    )
+    parser.add_argument(
+        "--wandb-entity",
+        type=str,
+        default=None,
+        help="Override trainer.logger.entity for WandB runs.",
+    )
+    parser.add_argument(
+        "--wandb-group",
+        type=str,
+        default=None,
+        help="Override trainer.logger.group for WandB runs.",
+    )
+    parser.add_argument(
+        "--wandb-tags",
+        type=str,
+        default=None,
+        help="Override trainer.logger.tags as comma-separated values.",
+    )
     return parser.parse_args()
 
 
@@ -138,6 +186,24 @@ def _maybe_str(value: Any) -> str | None:
     return None
 
 
+def _parse_bool_string(value: str, *, field_name: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{field_name} must be a boolean string (true/false), got {value!r}.")
+
+
+def _coerce_wandb_log_model(value: str) -> bool | str:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    return value
+
+
 def _extract_config_path_overrides(experiment_cfg: dict[str, Any]) -> dict[str, str]:
     overrides: dict[str, str] = {}
 
@@ -172,6 +238,31 @@ def _extract_config_path_overrides(experiment_cfg: dict[str, Any]) -> dict[str, 
                 overrides["data_config"] = data_path
 
     return overrides
+
+
+def _apply_wandb_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
+    trainer_cfg = _require_mapping(config, "trainer")
+    logger_cfg = _require_mapping(trainer_cfg, "logger")
+
+    if args.wandb_project is not None:
+        logger_cfg["project"] = args.wandb_project
+    if args.wandb_name is not None:
+        logger_cfg["name"] = args.wandb_name
+    if args.wandb_save_dir is not None:
+        logger_cfg["save_dir"] = args.wandb_save_dir
+    if args.wandb_offline is not None:
+        logger_cfg["offline"] = _parse_bool_string(
+            args.wandb_offline,
+            field_name="--wandb-offline",
+        )
+    if args.wandb_log_model is not None:
+        logger_cfg["log_model"] = _coerce_wandb_log_model(args.wandb_log_model)
+    if args.wandb_entity is not None:
+        logger_cfg["entity"] = args.wandb_entity
+    if args.wandb_group is not None:
+        logger_cfg["group"] = args.wandb_group
+    if args.wandb_tags is not None:
+        logger_cfg["tags"] = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
 
 
 @dataclass
@@ -573,6 +664,9 @@ def _build_logger(logger_cfg: dict[str, Any]) -> Any:
             "save_dir": save_dir,
             "offline": bool(logger_cfg.get("offline", False)),
             "log_model": logger_cfg.get("log_model", False),
+            "entity": logger_cfg.get("entity"),
+            "group": logger_cfg.get("group"),
+            "tags": logger_cfg.get("tags"),
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
         kwargs = _filter_kwargs_for_callable(
@@ -734,6 +828,7 @@ def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any])
 def run(args: argparse.Namespace) -> None:
     resolved = _load_merged_configs(args)
     config = resolved.merged
+    _apply_wandb_cli_overrides(config, args)
 
     _validate_config_consistency(config)
     _apply_distributed_training_config(config)

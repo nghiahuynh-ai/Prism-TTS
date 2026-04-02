@@ -969,8 +969,17 @@ else:
             target_continuous = target_continuous[:, :target_len, :]
             pred_continuous = pred_continuous[:, :target_len, :]
 
-            num_samples = min(self.max_audio_samples, int(target_continuous.shape[0]))
-            table = wandb.Table(columns=["sample_id", "target_audio", "synthesized_audio"])
+            # Keep eval-stage media payload small and deterministic: log exactly one sample.
+            num_samples = min(1, self.max_audio_samples, int(target_continuous.shape[0]))
+            table = wandb.Table(
+                columns=[
+                    "sample_id",
+                    "target_audio",
+                    "target_mel_spectrogram",
+                    "synthesized_audio",
+                    "synthesized_mel_spectrogram",
+                ]
+            )
 
             added = 0
             for sample_idx in range(num_samples):
@@ -979,6 +988,15 @@ else:
                 if target_audio is None or synth_audio is None:
                     continue
 
+                target_mel = self._build_mel_spectrogram_image(
+                    target_audio,
+                    title=f"Target Mel Spectrogram (sample {sample_idx})",
+                )
+                synth_mel = self._build_mel_spectrogram_image(
+                    synth_audio,
+                    title=f"Synthesized Mel Spectrogram (sample {sample_idx})",
+                )
+
                 table.add_data(
                     sample_idx,
                     wandb.Audio(
@@ -986,15 +1004,150 @@ else:
                         sample_rate=self.audio_sample_rate,
                         caption=f"target_sample_{sample_idx}",
                     ),
+                    target_mel,
                     wandb.Audio(
                         synth_audio,
                         sample_rate=self.audio_sample_rate,
                         caption=f"synth_sample_{sample_idx}",
                     ),
+                    synth_mel,
                 )
                 added += 1
 
             return table if added > 0 else None
+
+        def _build_mel_spectrogram_image(self, audio: np.ndarray, *, title: str) -> Optional[Any]:
+            try:
+                import matplotlib.pyplot as plt
+                import wandb
+            except ModuleNotFoundError:
+                return None
+
+            log_mel = self._compute_log_mel_spectrogram(audio)
+            if log_mel is None:
+                return None
+
+            fig, ax = plt.subplots(figsize=(6.0, 2.8), dpi=130, constrained_layout=True)
+            mel_img = ax.imshow(
+                log_mel,
+                origin="lower",
+                aspect="auto",
+                cmap="magma",
+            )
+            ax.set_title(title, fontsize=10, weight="bold")
+            ax.set_xlabel("Frame")
+            ax.set_ylabel("Mel Bin")
+            fig.colorbar(mel_img, ax=ax, fraction=0.046, pad=0.02)
+
+            image = wandb.Image(fig)
+            plt.close(fig)
+            return image
+
+        def _compute_log_mel_spectrogram(self, audio: np.ndarray) -> Optional[np.ndarray]:
+            waveform = np.asarray(audio, dtype=np.float32).reshape(-1)
+            if waveform.size < 2:
+                return None
+
+            waveform_tensor = torch.from_numpy(waveform)
+            n_fft = 1024
+            win_length = 1024
+            hop_length = 256
+            n_mels = 80
+
+            window = torch.hann_window(win_length, dtype=torch.float32, device=waveform_tensor.device)
+            stft = torch.stft(
+                waveform_tensor,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                return_complex=True,
+                center=True,
+            )
+            power_spec = stft.abs().pow(2.0)
+            if power_spec.numel() == 0:
+                return None
+
+            mel_filter = self._build_mel_filter_bank(
+                sample_rate=self.audio_sample_rate,
+                n_fft=n_fft,
+                n_mels=n_mels,
+                f_min=0.0,
+                f_max=float(self.audio_sample_rate) * 0.5,
+                device=power_spec.device,
+            )
+
+            mel_power = mel_filter @ power_spec
+            log_mel = torch.log10(mel_power.clamp_min(1e-10))
+            return log_mel.detach().cpu().numpy()
+
+        @staticmethod
+        def _build_mel_filter_bank(
+            *,
+            sample_rate: int,
+            n_fft: int,
+            n_mels: int,
+            f_min: float,
+            f_max: float,
+            device: torch.device,
+        ) -> torch.Tensor:
+            if sample_rate < 1:
+                raise ValueError("sample_rate must be >= 1 for mel filter bank construction.")
+            if n_fft < 2:
+                raise ValueError("n_fft must be >= 2 for mel filter bank construction.")
+            if n_mels < 1:
+                raise ValueError("n_mels must be >= 1 for mel filter bank construction.")
+
+            nyquist = float(sample_rate) * 0.5
+            f_min = max(0.0, float(f_min))
+            f_max = min(max(f_min + 1e-6, float(f_max)), nyquist)
+            n_freqs = n_fft // 2 + 1
+
+            def hz_to_mel(freq_hz: np.ndarray) -> np.ndarray:
+                return 2595.0 * np.log10(1.0 + (freq_hz / 700.0))
+
+            def mel_to_hz(freq_mel: np.ndarray) -> np.ndarray:
+                return 700.0 * (np.power(10.0, freq_mel / 2595.0) - 1.0)
+
+            mel_points = np.linspace(
+                hz_to_mel(np.array([f_min], dtype=np.float32))[0],
+                hz_to_mel(np.array([f_max], dtype=np.float32))[0],
+                num=n_mels + 2,
+                dtype=np.float32,
+            )
+            hz_points = mel_to_hz(mel_points)
+            fft_bins = np.floor(((n_fft + 1) * hz_points) / float(sample_rate)).astype(np.int64)
+            fft_bins = np.clip(fft_bins, 0, n_freqs - 1)
+
+            filters = np.zeros((n_mels, n_freqs), dtype=np.float32)
+            for mel_idx in range(1, n_mels + 1):
+                left = int(fft_bins[mel_idx - 1])
+                center = int(fft_bins[mel_idx])
+                right = int(fft_bins[mel_idx + 1])
+
+                if center <= left:
+                    center = min(left + 1, n_freqs - 1)
+                if right <= center:
+                    right = min(center + 1, n_freqs)
+
+                if center > left:
+                    filters[mel_idx - 1, left:center] = np.linspace(
+                        0.0,
+                        1.0,
+                        num=center - left,
+                        endpoint=False,
+                        dtype=np.float32,
+                    )
+                if right > center:
+                    filters[mel_idx - 1, center:right] = np.linspace(
+                        1.0,
+                        0.0,
+                        num=right - center,
+                        endpoint=False,
+                        dtype=np.float32,
+                    )
+
+            return torch.tensor(filters, dtype=torch.float32, device=device)
 
         def _decode_audio(self, latents: torch.Tensor) -> Optional[np.ndarray]:
             if self.audio_decoder is None:

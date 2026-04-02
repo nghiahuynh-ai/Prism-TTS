@@ -12,9 +12,27 @@ GENERATE_SCRIPT ?= generate.py
 TRAINER_CONFIG ?= config/trainer.yaml
 MODEL_CONFIG ?= config/model.yaml
 DATA_CONFIG ?= config/data.yaml
+
+# Convenience selector: `make train EXPERIMENT=experiment_alt`
+# resolves to `config/experiment_alt.yaml`.
+EXPERIMENT ?=
+ifneq ($(strip $(EXPERIMENT)),)
+EXPERIMENT_CONFIG ?= config/$(EXPERIMENT).yaml
+else
 EXPERIMENT_CONFIG ?= config/experiment.yaml
+endif
 
 CKPT ?=
+
+# Defaults aligned with config/experiment.yaml
+WANDB_PROJECT ?= prism_tts
+WANDB_NAME ?= baseline
+WANDB_SAVE_DIR ?= logs
+WANDB_OFFLINE ?= false
+WANDB_LOG_MODEL ?= false
+WANDB_ENTITY ?=
+WANDB_GROUP ?=
+WANDB_TAGS ?=
 
 TRAIN_ARGS ?=
 VALIDATE_ARGS ?=
@@ -28,6 +46,32 @@ COMMON_TRAIN_ARGS = \
 	--model-config $(MODEL_CONFIG) \
 	--data-config $(DATA_CONFIG) \
 	--experiment-config $(EXPERIMENT_CONFIG)
+
+WANDB_ARGS :=
+ifneq ($(strip $(WANDB_PROJECT)),)
+WANDB_ARGS += --wandb-project "$(WANDB_PROJECT)"
+endif
+ifneq ($(strip $(WANDB_NAME)),)
+WANDB_ARGS += --wandb-name "$(WANDB_NAME)"
+endif
+ifneq ($(strip $(WANDB_SAVE_DIR)),)
+WANDB_ARGS += --wandb-save-dir "$(WANDB_SAVE_DIR)"
+endif
+ifneq ($(strip $(WANDB_OFFLINE)),)
+WANDB_ARGS += --wandb-offline "$(WANDB_OFFLINE)"
+endif
+ifneq ($(strip $(WANDB_LOG_MODEL)),)
+WANDB_ARGS += --wandb-log-model "$(WANDB_LOG_MODEL)"
+endif
+ifneq ($(strip $(WANDB_ENTITY)),)
+WANDB_ARGS += --wandb-entity "$(WANDB_ENTITY)"
+endif
+ifneq ($(strip $(WANDB_GROUP)),)
+WANDB_ARGS += --wandb-group "$(WANDB_GROUP)"
+endif
+ifneq ($(strip $(WANDB_TAGS)),)
+WANDB_ARGS += --wandb-tags "$(WANDB_TAGS)"
+endif
 
 ifneq ($(strip $(CKPT)),)
 CKPT_ARG := --ckpt-path $(CKPT)
@@ -48,10 +92,19 @@ help:
 	@echo ""
 	@echo "Common overrides:"
 	@echo "  CKPT=<path>            Add --ckpt-path"
+	@echo "  EXPERIMENT=<name>      Use config/<name>.yaml as experiment config"
 	@echo "  EXPERIMENT_CONFIG=...  Override experiment config"
 	@echo "  TRAINER_CONFIG=...     Override trainer config"
 	@echo "  MODEL_CONFIG=...       Override model config"
 	@echo "  DATA_CONFIG=...        Override data config"
+	@echo "  WANDB_PROJECT=...      WandB project (default: prism_tts)"
+	@echo "  WANDB_NAME=...         WandB run name (default: baseline_local)"
+	@echo "  WANDB_SAVE_DIR=...     WandB save dir (default: logs)"
+	@echo "  WANDB_OFFLINE=true     WandB offline mode (default: false)"
+	@echo "  WANDB_LOG_MODEL=...    WandB log_model (default: false)"
+	@echo "  WANDB_ENTITY=...       Override WandB entity"
+	@echo "  WANDB_GROUP=...        Override WandB group"
+	@echo "  WANDB_TAGS=a,b,c       Override WandB tags"
 	@echo ""
 	@echo "Extra args:"
 	@echo "  TRAIN_ARGS='...'"
@@ -62,16 +115,16 @@ help:
 	@echo "  GENERATE_ARGS='...'"
 
 train:
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(CKPT_ARG) $(TRAIN_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) $(CKPT_ARG) $(TRAIN_ARGS)
 
 validate:
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) --validate-only $(CKPT_ARG) $(VALIDATE_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --validate-only $(CKPT_ARG) $(VALIDATE_ARGS)
 
 test:
 	@if [ -z "$(CKPT)" ]; then \
 		echo "[make test] CKPT is empty: this will run fit before test."; \
 	fi
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) --test-after-fit $(CKPT_ARG) $(TEST_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --test-after-fit $(CKPT_ARG) $(TEST_ARGS)
 
 unit-test:
 	$(PYTHON) -m pytest test $(PYTEST_ARGS)
