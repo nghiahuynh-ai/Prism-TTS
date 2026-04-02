@@ -1,0 +1,13 @@
+torch>=2.2
+transformers>=4.40
+lightning>=2.2
+numpy>=1.24
+PyYAML>=6.0
+
+# Used by default logger/eval flows and visualization scripts.
+wandb>=0.16
+matplotlib>=3.7
+tensorboard>=2.14
+
+# Test runner used by `make unit-test`.
+pytest>=8.0
