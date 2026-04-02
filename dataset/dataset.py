@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,12 +93,17 @@ class SharedVocabTokenizer:
 
     def __call__(self, text: str) -> list[int]:
         token_ids: list[int] = []
-        for char in text:
-            if char not in self.char_to_id:
-                raise ValueError(
-                    f"Character {char!r} not found in vocab {self.vocab_path}."
+        for index, char in enumerate(text):
+            local_id = self.char_to_id.get(char)
+            if local_id is None:
+                warnings.warn(
+                    f"Skipping out-of-vocab character {char!r} at index {index} "
+                    f"for vocab {self.vocab_path}.",
+                    RuntimeWarning,
+                    stacklevel=2,
                 )
-            token_ids.append(self.text_token_offset + self.char_to_id[char])
+                continue
+            token_ids.append(self.text_token_offset + local_id)
         if self.append_eos:
             token_ids.append(self.eos_token_id)
         return token_ids
