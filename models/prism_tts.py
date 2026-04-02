@@ -353,6 +353,22 @@ class PrismTTS(nn.Module):
         block_mask = block_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
         return stream_mask, block_mask
 
+    def _inject_continuous_latent_noise(
+        self,
+        continuous_latents: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        if not self.training:
+            return continuous_latents
+        noise_levels = torch.rand(
+            continuous_latents.shape[0],
+            continuous_latents.shape[1],
+            1,
+            device=continuous_latents.device,
+            dtype=continuous_latents.dtype,
+        )
+        noise = torch.randn_like(continuous_latents)
+        return continuous_latents + noise_levels * noise
+
     def _build_inputs_embeds(
         self,
         text_tokens: torch.LongTensor,
@@ -361,7 +377,8 @@ class PrismTTS(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text_embeds = self.text_embedding(text_tokens).unsqueeze(2)  # [B, L, 1, H]
         discrete_embeds = self.discrete_embedding(discrete_tokens)  # [B, L, N, H]
-        continuous_embeds = self.continuous_proj(continuous_latents).unsqueeze(2)  # [B, L, 1, H]
+        noised_continuous = self._inject_continuous_latent_noise(continuous_latents)
+        continuous_embeds = self.continuous_proj(noised_continuous).unsqueeze(2)  # [B, L, 1, H]
 
         block_embeds = torch.cat([text_embeds, discrete_embeds, continuous_embeds], dim=2)
         block_embeds = block_embeds + self.stream_type_embeddings.view(
