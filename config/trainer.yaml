@@ -19,6 +19,15 @@ trainer:
     use_ema_for_periodic_eval: true
     sync_dist_logging: false
 
+  distributed:
+    enabled: false
+    accelerator: gpu
+    devices: auto
+    gpu_indices: null
+    strategy: ddp_find_unused_parameters_false
+    num_nodes: 1
+    sync_dist_logging: true
+
   optimizer:
     name: adamw
 

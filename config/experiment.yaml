@@ -29,6 +29,7 @@ experiment:
       every_n_train_steps: 5000
 
     lightning_trainer:
+      # Fallback Trainer settings (used when trainer.distributed.enabled=false).
       accelerator: auto
       devices: 1
       strategy: auto
@@ -47,6 +48,17 @@ experiment:
       enable_checkpointing: true
       enable_progress_bar: true
       enable_model_summary: true
+
+    distributed:
+      enabled: true
+      accelerator: gpu
+      devices: auto
+      # Optional explicit GPU indices on each node. If set, this overrides `devices`.
+      # Example: [0, 1] uses GPU0 and GPU1 on the current node.
+      gpu_indices: null
+      strategy: ddp_find_unused_parameters_false
+      num_nodes: 1
+      sync_dist_logging: true
 
   data:
     # Set these to your real manifests before training.

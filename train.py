@@ -654,6 +654,69 @@ def _trainer_supports_ckpt_path() -> bool:
     return "ckpt_path" in inspect.signature(pl.Trainer.fit).parameters
 
 
+def _coerce_gpu_indices(value: Any) -> list[int]:
+    indices: list[int]
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip() != ""]
+        if not parts:
+            raise ValueError(
+                "trainer.distributed.gpu_indices string must contain comma-separated GPU indices."
+            )
+        try:
+            indices = [int(part) for part in parts]
+        except ValueError as exc:
+            raise ValueError(
+                "trainer.distributed.gpu_indices string must contain only integer values."
+            ) from exc
+    elif isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            raise ValueError("trainer.distributed.gpu_indices cannot be empty.")
+        try:
+            indices = [int(index) for index in value]
+        except ValueError as exc:
+            raise ValueError(
+                "trainer.distributed.gpu_indices list must contain only integer values."
+            ) from exc
+    else:
+        raise ValueError(
+            "trainer.distributed.gpu_indices must be a list/tuple of ints "
+            "or a comma-separated string."
+        )
+
+    if any(index < 0 for index in indices):
+        raise ValueError("trainer.distributed.gpu_indices must contain non-negative indices.")
+    if len(set(indices)) != len(indices):
+        raise ValueError("trainer.distributed.gpu_indices must not contain duplicates.")
+    return indices
+
+
+def _apply_distributed_training_config(config: dict[str, Any]) -> None:
+    trainer_cfg = _require_mapping(config, "trainer")
+    distributed_cfg = trainer_cfg.get("distributed")
+    if not isinstance(distributed_cfg, dict) or not bool(distributed_cfg.get("enabled", False)):
+        return
+
+    lightning_trainer_cfg = _require_mapping(trainer_cfg, "lightning_trainer")
+    lightning_trainer_cfg["accelerator"] = distributed_cfg.get("accelerator", "gpu")
+    gpu_indices = distributed_cfg.get("gpu_indices")
+    if gpu_indices is not None:
+        lightning_trainer_cfg["devices"] = _coerce_gpu_indices(gpu_indices)
+    else:
+        lightning_trainer_cfg["devices"] = distributed_cfg.get("devices", "auto")
+    lightning_trainer_cfg["strategy"] = distributed_cfg.get(
+        "strategy",
+        "ddp_find_unused_parameters_false",
+    )
+
+    num_nodes = distributed_cfg.get("num_nodes")
+    if num_nodes is not None:
+        lightning_trainer_cfg["num_nodes"] = int(num_nodes)
+
+    module_cfg = _require_mapping(trainer_cfg, "lightning_module")
+    if "sync_dist_logging" in distributed_cfg:
+        module_cfg["sync_dist_logging"] = bool(distributed_cfg["sync_dist_logging"])
+
+
 def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any]) -> Any:
     trainer_cfg = _require_mapping(config, "trainer")
     lightning_trainer_cfg = dict(_require_mapping(trainer_cfg, "lightning_trainer"))
@@ -673,6 +736,7 @@ def run(args: argparse.Namespace) -> None:
     config = resolved.merged
 
     _validate_config_consistency(config)
+    _apply_distributed_training_config(config)
 
     trainer_cfg = _require_mapping(config, "trainer")
     seed = trainer_cfg.get("seed")
