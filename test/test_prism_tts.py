@@ -190,7 +190,11 @@ class TestPrismTTS(unittest.TestCase):
         self.assertIsNotNone(outputs.loss)
         self.assertIsNotNone(outputs.discrete_loss)
         self.assertIsNotNone(outputs.flow_loss)
-        self.assertEqual(tuple(outputs.keys()), ("loss", "discrete_loss", "flow_loss"))
+        self.assertIsNotNone(outputs.text_loss)
+        self.assertEqual(
+            tuple(outputs.keys()),
+            ("loss", "discrete_loss", "flow_loss", "text_loss"),
+        )
 
     def test_build_inputs_embeds_uses_block_major_order(self):
         model = PrismTTS(

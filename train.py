@@ -390,12 +390,21 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
                 "model.prism_tts.continuous_latent_size must match "
                 f"data.dataset.continuous_feature_dim ({dataset_continuous_dim})."
             )
+    text_loss_weight = float(prism_cfg.get("text_loss_weight", 0.1))
+    if text_loss_weight < 0.0:
+        raise ValueError("model.prism_tts.text_loss_weight must be >= 0.")
 
     discrete_vocab_size = int(prism_cfg["discrete_vocab_size"])
     if discrete_vocab_size < text_offset:
         raise ValueError(
             "model.prism_tts.discrete_vocab_size is too small for shared token layout. "
             f"Need at least {text_offset}, got {discrete_vocab_size}."
+        )
+    llama_vocab_size = int(llama_cfg["vocab_size"])
+    if discrete_vocab_size > llama_vocab_size:
+        raise ValueError(
+            "model.prism_tts.discrete_vocab_size must be <= model.llama_config.vocab_size "
+            "because text and discrete embeddings are unified."
         )
 
     if "pad_token_id" in llama_cfg and int(llama_cfg["pad_token_id"]) != pad_id:
@@ -426,6 +435,7 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
+        text_loss_weight=float(prism_cfg.get("text_loss_weight", 0.1)),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 16)),
     )
 

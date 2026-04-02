@@ -14,6 +14,8 @@ model:
     flow_num_res_blocks: 4
     flow_model_channels: null
     flow_loss_weight: 1.0
+    # Auxiliary next-block text CE loss weight.
+    text_loss_weight: 0.1
     flow_sample_steps: 16
 
   llama_config:

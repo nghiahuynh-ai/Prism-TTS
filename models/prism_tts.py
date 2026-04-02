@@ -18,6 +18,7 @@ class PrismTTSOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     discrete_loss: Optional[torch.Tensor] = None
     flow_loss: Optional[torch.Tensor] = None
+    text_loss: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -43,6 +44,7 @@ class PrismTTS(nn.Module):
         flow_num_res_blocks: int = 4,
         flow_model_channels: Optional[int] = None,
         flow_loss_weight: float = 1.0,
+        text_loss_weight: float = 0.1,
         flow_sample_steps: int = 16,
     ):
         super().__init__()
@@ -50,8 +52,15 @@ class PrismTTS(nn.Module):
             raise ValueError("num_discrete_tokens must be at least 1.")
         if discrete_vocab_size < 1:
             raise ValueError("discrete_vocab_size must be at least 1.")
+        if discrete_vocab_size > llama_config.vocab_size:
+            raise ValueError(
+                "discrete_vocab_size must be <= llama_config.vocab_size when "
+                "text and discrete embeddings are unified."
+            )
         if continuous_latent_size < 1:
             raise ValueError("continuous_latent_size must be at least 1.")
+        if text_loss_weight < 0.0:
+            raise ValueError("text_loss_weight must be >= 0.")
         if flow_sample_steps < 1:
             raise ValueError("flow_sample_steps must be at least 1.")
 
@@ -61,13 +70,11 @@ class PrismTTS(nn.Module):
         self.continuous_latent_size = continuous_latent_size
         self.block_size = num_discrete_tokens + 2  # text + N discrete + continuous
         self.flow_loss_weight = flow_loss_weight
+        self.text_loss_weight = text_loss_weight
         self.flow_sample_steps = flow_sample_steps
 
         self.backbone = LlamaBackbone(llama_config)
-        # Reuse text embedding space from the Llama backbone.
-        self.text_embedding = self.backbone.embed_tokens
-        # One shared embedding/head across all discrete streams.
-        self.discrete_embedding = nn.Embedding(discrete_vocab_size, self.hidden_size)
+        # Text and discrete streams share one token embedding table.
         self.discrete_lm_head = nn.Linear(self.hidden_size, discrete_vocab_size, bias=False)
         self.continuous_proj = nn.Linear(continuous_latent_size, self.hidden_size)
 
@@ -88,12 +95,19 @@ class PrismTTS(nn.Module):
 
     def reset_parameters(self) -> None:
         std = getattr(self.backbone.config, "initializer_range", 0.02)
-        nn.init.normal_(self.discrete_embedding.weight, mean=0.0, std=std)
         nn.init.normal_(self.discrete_lm_head.weight, mean=0.0, std=std)
         nn.init.normal_(self.continuous_proj.weight, mean=0.0, std=std)
         nn.init.normal_(self.stream_type_embeddings, mean=0.0, std=std)
         if self.continuous_proj.bias is not None:
             nn.init.zeros_(self.continuous_proj.bias)
+
+    @property
+    def text_embedding(self) -> nn.Embedding:
+        return self.backbone.embed_tokens
+
+    @property
+    def discrete_embedding(self) -> nn.Embedding:
+        return self.backbone.embed_tokens
 
     def _normalize_text_tokens(
         self,
@@ -329,30 +343,6 @@ class PrismTTS(nn.Module):
         block_mask = block_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
         return stream_mask, block_mask
 
-    def _build_text_target_key_mask(
-        self,
-        batch_size: int,
-        total_blocks: int,
-        target_block_mask: torch.BoolTensor,
-        device: torch.device,
-    ) -> torch.Tensor:
-        key_mask = torch.ones(
-            batch_size,
-            total_blocks * self.block_size,
-            dtype=torch.bool,
-            device=device,
-        )
-        if target_block_mask.shape != (batch_size, total_blocks):
-            raise ValueError(
-                "target_block_mask must have shape "
-                f"[{batch_size}, {total_blocks}], got {tuple(target_block_mask.shape)}."
-            )
-        target_batch_ids, target_block_ids = torch.where(target_block_mask)
-        if target_batch_ids.numel() > 0:
-            target_text_positions = target_block_ids * self.block_size
-            key_mask[target_batch_ids, target_text_positions] = False
-        return key_mask
-
     def _build_inputs_embeds(
         self,
         text_tokens: torch.LongTensor,
@@ -501,6 +491,50 @@ class PrismTTS(nn.Module):
         if not valid_targets.any():
             return hidden_states.new_zeros(())
         return F.cross_entropy(discrete_logits[valid_targets], target_discrete_tokens[valid_targets])
+
+    def _compute_text_loss(
+        self,
+        hidden_states: torch.Tensor,
+        full_text_tokens: torch.LongTensor,
+        target_block_mask: torch.BoolTensor,
+        block_attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        batch_size, total_tokens, _ = hidden_states.shape
+        total_blocks = total_tokens // self.block_size
+        if total_blocks < 2:
+            return hidden_states.new_zeros(())
+
+        if full_text_tokens.shape != (batch_size, total_blocks):
+            raise ValueError(
+                "full_text_tokens must have shape "
+                f"[{batch_size}, {total_blocks}], got {tuple(full_text_tokens.shape)}."
+            )
+        if target_block_mask.shape != (batch_size, total_blocks):
+            raise ValueError(
+                "target_block_mask must have shape "
+                f"[{batch_size}, {total_blocks}], got {tuple(target_block_mask.shape)}."
+            )
+
+        block_hidden = hidden_states.reshape(
+            batch_size,
+            total_blocks,
+            self.block_size,
+            self.hidden_size,
+        )
+        source_text_states = block_hidden[:, :-1, 0, :]  # [B, L-1, H]
+        text_logits = F.linear(source_text_states, self.text_embedding.weight)  # [B, L-1, V]
+        target_text_tokens = full_text_tokens[:, 1:]  # [B, L-1]
+
+        valid_targets = target_block_mask[:, 1:].clone()
+        if block_attention_mask is not None:
+            valid_targets = valid_targets & block_attention_mask[:, 1:]
+        pad_token_id = self.backbone.config.pad_token_id
+        if pad_token_id is not None:
+            valid_targets = valid_targets & (target_text_tokens != int(pad_token_id))
+
+        if not valid_targets.any():
+            return hidden_states.new_zeros(())
+        return F.cross_entropy(text_logits[valid_targets], target_text_tokens[valid_targets])
 
     def _compute_flow_loss(
         self,
@@ -802,15 +836,8 @@ class PrismTTS(nn.Module):
             device=inputs_embeds.device,
         )
         # stream_mask/block_mask: [B, 1, T, T], T=(L1 + L2) * block_size
-        # Do not propagate gradients through text_target stream by masking it as keys.
-        text_target_key_mask = self._build_text_target_key_mask(
-            batch_size=batch_size,
-            total_blocks=total_blocks,
-            target_block_mask=target_block_mask,
-            device=inputs_embeds.device,
-        )
-        stream_mask = stream_mask & text_target_key_mask[:, None, None, :]
-        block_mask = block_mask & text_target_key_mask[:, None, None, :]
+        # Keep target text tokens visible as keys during training so discrete prediction
+        # conditioning better matches generation-time behavior.
         position_embeddings = self._build_two_level_rope_position_embeddings(
             inputs_embeds=inputs_embeds,
             total_blocks=total_blocks,
@@ -833,6 +860,13 @@ class PrismTTS(nn.Module):
             target_block_mask=target_block_mask,
             block_attention_mask=block_attention_mask,
         )
+        # Auxiliary AR over text to directly supervise text conditioning.
+        text_loss = self._compute_text_loss(
+            hidden_states=backbone_outputs.last_hidden_state,
+            full_text_tokens=full_text,
+            target_block_mask=target_block_mask,
+            block_attention_mask=block_attention_mask,
+        )
         # Flow over continuous only: conditioned by current block discrete sum.
         flow_loss = self._compute_flow_loss(
             full_discrete_tokens=full_discrete,
@@ -842,15 +876,20 @@ class PrismTTS(nn.Module):
             flow_timesteps=flow_timesteps,
             noise=noise,
         )
-        loss = discrete_loss + self.flow_loss_weight * flow_loss
+        loss = (
+            discrete_loss
+            + self.flow_loss_weight * flow_loss
+            + self.text_loss_weight * text_loss
+        )
 
         if not return_dict:
-            return loss, discrete_loss, flow_loss
+            return loss, discrete_loss, flow_loss, text_loss
 
         return PrismTTSOutput(
             loss=loss,
             discrete_loss=discrete_loss,
             flow_loss=flow_loss,
+            text_loss=text_loss,
         )
 
     @torch.no_grad()

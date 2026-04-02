@@ -201,6 +201,26 @@ else:
                 batch_size=batch_size,
                 sync_dist=self.sync_dist_logging,
             )
+            if outputs.text_loss is not None:
+                self.log(
+                    "train/text_loss",
+                    outputs.text_loss,
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=True,
+                    batch_size=batch_size,
+                    sync_dist=self.sync_dist_logging,
+                )
+                text_ppl = torch.exp(outputs.text_loss.detach().clamp(max=20.0))
+                self.log(
+                    "train/text_ppl",
+                    text_ppl,
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=False,
+                    batch_size=batch_size,
+                    sync_dist=self.sync_dist_logging,
+                )
 
             discrete_ppl = torch.exp(outputs.discrete_loss.detach().clamp(max=20.0))
             self.log(
@@ -260,6 +280,16 @@ else:
                 batch_size=batch_size,
                 sync_dist=self.sync_dist_logging,
             )
+            if outputs.text_loss is not None:
+                self.log(
+                    "val/text_loss",
+                    outputs.text_loss,
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                    batch_size=batch_size,
+                    sync_dist=self.sync_dist_logging,
+                )
             return outputs.loss
 
         def on_fit_start(self) -> None:
@@ -842,6 +872,8 @@ else:
             payload: dict[str, Any] = {
                 "eval/loss": float(eval_outputs.loss.detach().cpu()),
             }
+            if eval_outputs.text_loss is not None:
+                payload["eval/text_loss"] = float(eval_outputs.text_loss.detach().cpu())
 
             figure = self._build_professional_eval_figure(
                 target_latent=viz["target_latent"],
