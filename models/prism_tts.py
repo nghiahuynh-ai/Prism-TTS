@@ -219,6 +219,7 @@ class PrismTTS(nn.Module):
         block_ids = torch.arange(total_blocks, device=device).unsqueeze(0)
         target_starts = prompt_lens.unsqueeze(1)
         target_ends = (prompt_lens + target_lens).clamp(max=total_blocks).unsqueeze(1)
+        # True only on generated target blocks; prompt and tail blocks are excluded.
         return (block_ids >= target_starts) & (block_ids < target_ends)
 
     def _prepare_attention_masks(
@@ -236,10 +237,13 @@ class PrismTTS(nn.Module):
         if attention_mask.shape[0] != batch_size:
             raise ValueError("attention_mask batch size must match inputs.")
 
+        # Non-zero entries are treated as visible/valid positions.
         mask = attention_mask.to(device=device)
         if mask.shape[-1] == total_blocks:
+            # Block-level mask: directly marks valid blocks.
             return mask.to(dtype=torch.bool)
         if mask.shape[-1] == total_blocks * self.block_size:
+            # Token-level mask collapsed to blocks: any masked token invalidates its block.
             return mask.reshape(batch_size, total_blocks, self.block_size).all(dim=-1)
 
         unique_prompt_lens = torch.unique(prompt_lens)
@@ -258,6 +262,7 @@ class PrismTTS(nn.Module):
                 device=device,
                 dtype=mask.dtype,
             )
+            # Generated-only block mask: prompt blocks stay visible for conditioning.
             block_mask = torch.cat([prompt_prefix, mask], dim=-1).to(dtype=torch.bool)
             return block_mask
 
@@ -268,6 +273,7 @@ class PrismTTS(nn.Module):
                 device=device,
                 dtype=mask.dtype,
             )
+            # Generated-only token mask: prepend visible prompt tokens, then collapse to blocks.
             flat_mask = torch.cat([prompt_prefix, mask], dim=-1)
             block_mask = flat_mask.reshape(batch_size, total_blocks, self.block_size).all(dim=-1)
             return block_mask
@@ -288,6 +294,7 @@ class PrismTTS(nn.Module):
         if attention_mask.dim() != 2:
             raise ValueError("attention_mask must be a 2D tensor.")
         if attention_mask.shape[-1] == num_blocks:
+            # Expand each block flag to all streams/tokens in that block.
             return attention_mask.repeat_interleave(self.block_size, dim=-1)
         if attention_mask.shape[-1] == num_blocks * self.block_size:
             return attention_mask
@@ -306,6 +313,7 @@ class PrismTTS(nn.Module):
         if attention_mask.shape[-1] == num_blocks:
             return attention_mask.to(dtype=torch.bool)
         flat_mask = self._flatten_attention_mask(attention_mask, num_blocks)
+        # Aggregate back to block visibility for loss masking and target selection.
         return flat_mask.reshape(flat_mask.shape[0], num_blocks, self.block_size).all(dim=-1)
 
     def _build_dual_attention_masks(
@@ -328,15 +336,17 @@ class PrismTTS(nn.Module):
         positions = torch.arange(total_tokens, device=device)
         query_positions = positions[:, None]
         key_positions = positions[None, :]
+        # Base autoregressive mask: disallow looking ahead in token time.
         causal_mask = key_positions <= query_positions
 
         query_blocks = query_positions // self.block_size
         key_blocks = key_positions // self.block_size
 
+        # Stream-wise mask: token attends only to the same stream slot across past/current blocks.
         stream_mask = causal_mask & (
             (query_positions % self.block_size) == (key_positions % self.block_size)
         )
-        # Block-wise attention: each block can see all previous blocks and itself.
+        # Block-wise mask: token attends to all streams from past/current blocks.
         block_mask = key_blocks <= query_blocks
 
         stream_mask = stream_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
@@ -402,6 +412,7 @@ class PrismTTS(nn.Module):
         )
         start = block_idx * self.block_size
         end = start + self.block_size
+        # Keep only current-block queries; keys include all tokens up to current block.
         stream_step = stream_full[:, :, start:end, :end]
         block_step = block_full[:, :, start:end, :end]
         return stream_step, block_step
@@ -480,12 +491,14 @@ class PrismTTS(nn.Module):
                 "target_block_mask must have shape "
                 f"[{batch_size}, {total_blocks}], got {tuple(target_block_mask.shape)}."
             )
+        # Train only on generated target blocks (shifted by one block for AR prediction).
         valid_targets = target_block_mask[:, 1:].unsqueeze(-1).expand(
             batch_size,
             -1,
             self.num_discrete_tokens,
         )
         if block_attention_mask is not None:
+            # Further drop blocks marked invalid by user-provided attention masking.
             valid_targets = valid_targets & block_attention_mask[:, 1:].unsqueeze(-1)
 
         if not valid_targets.any():
@@ -525,6 +538,7 @@ class PrismTTS(nn.Module):
         text_logits = F.linear(source_text_states, self.text_embedding.weight)  # [B, L-1, V]
         target_text_tokens = full_text_tokens[:, 1:]  # [B, L-1]
 
+        # Same generated-target gating used for text auxiliary loss.
         valid_targets = target_block_mask[:, 1:].clone()
         if block_attention_mask is not None:
             valid_targets = valid_targets & block_attention_mask[:, 1:]
@@ -552,8 +566,10 @@ class PrismTTS(nn.Module):
                 f"[{batch_size}, {total_blocks}], got {tuple(target_block_mask.shape)}."
             )
 
+        # Flow loss only uses generated blocks; prompt blocks are excluded.
         valid_blocks = target_block_mask
         if block_attention_mask is not None:
+            # External attention mask can additionally suppress specific blocks.
             valid_blocks = valid_blocks & block_attention_mask
         if not valid_blocks.any():
             return full_continuous_latents.new_zeros(())
@@ -687,6 +703,7 @@ class PrismTTS(nn.Module):
             sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
             sorted_probs = torch.softmax(sorted_logits, dim=-1)
             cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            # Mask tail tokens outside nucleus so sampling keeps only top-p probability mass.
             sorted_mask = cumulative_probs > top_p
             sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
             sorted_mask[..., 0] = False
@@ -815,6 +832,7 @@ class PrismTTS(nn.Module):
             target_lens=target_lens,
             device=full_text.device,
         )
+        # target_block_mask: True for blocks that contribute training losses.
 
         block_attention_mask = self._prepare_attention_masks(
             attention_mask=attention_mask,
@@ -823,7 +841,7 @@ class PrismTTS(nn.Module):
             batch_size=batch_size,
             device=full_text.device,
         )
-        # block_attention_mask: [B, L1 + L2] or None
+        # block_attention_mask: optional validity gate from input mask (applied on top of targets).
         inputs_embeds, _ = self._build_inputs_embeds(
             text_tokens=full_text,
             discrete_tokens=full_discrete,
@@ -835,7 +853,7 @@ class PrismTTS(nn.Module):
             batch_size=batch_size,
             device=inputs_embeds.device,
         )
-        # stream_mask/block_mask: [B, 1, T, T], T=(L1 + L2) * block_size
+        # stream_mask/block_mask: stream-only history vs full-block history visibility.
         # Keep target text tokens visible as keys during training so discrete prediction
         # conditioning better matches generation-time behavior.
         position_embeddings = self._build_two_level_rope_position_embeddings(
@@ -1003,7 +1021,7 @@ class PrismTTS(nn.Module):
                 batch_size=batch_size,
                 device=inputs_embeds.device,
             )
-            # stream_mask/block_mask: [B, 1, T, T], T=cur_L * block_size
+            # stream_mask enforces same-stream AR, block_mask lets each stream read full past blocks.
             position_embeddings = self._build_two_level_rope_position_embeddings(
                 inputs_embeds=inputs_embeds,
                 total_blocks=total_blocks,
@@ -1148,7 +1166,7 @@ class PrismTTS(nn.Module):
                 batch_size=batch_size,
                 device=prompt_embeds.device,
             )
-            # prompt_stream_mask/prompt_block_mask: [B, 1, T1, T1], T1=L1*block_size
+            # Prompt prefill uses the same stream/block visibility rules as full forward pass.
             prompt_position_embeddings = self._build_two_level_rope_position_embeddings(
                 inputs_embeds=prompt_embeds,
                 total_blocks=prompt_len,
@@ -1212,7 +1230,7 @@ class PrismTTS(nn.Module):
                 block_idx=block_idx,
                 device=proposal_embeds.device,
             )
-            # step_stream_mask/step_block_mask: [B, 1, block_size, total_blocks*block_size]
+            # Step masks limit queries to current block while preserving full key history.
             step_position_embeddings = self._build_step_rope_position_embeddings(
                 inputs_embeds=proposal_embeds,
                 block_idx=block_idx,
