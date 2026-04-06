@@ -74,6 +74,7 @@ else:
             audio_decoder: Optional[AudioDecoder] = None,
             audio_sample_rate: int = 24_000,
             max_audio_samples: int = 2,
+            log_media_on_validation_end: bool = True,
             ema_decay: float = 0.999,
             ema_start_step: int = 0,
             ema_update_every_n_steps: int = 1,
@@ -107,6 +108,7 @@ else:
             self.audio_decoder = audio_decoder
             self.audio_sample_rate = audio_sample_rate
             self.max_audio_samples = max_audio_samples
+            self.log_media_on_validation_end = log_media_on_validation_end
             self.ema_decay = ema_decay
             self.ema_start_step = ema_start_step
             self.ema_update_every_n_steps = ema_update_every_n_steps
@@ -132,6 +134,7 @@ else:
                     "eval_every_n_steps": eval_every_n_steps,
                     "audio_sample_rate": audio_sample_rate,
                     "max_audio_samples": max_audio_samples,
+                    "log_media_on_validation_end": log_media_on_validation_end,
                     "ema_decay": ema_decay,
                     "ema_start_step": ema_start_step,
                     "ema_update_every_n_steps": ema_update_every_n_steps,
@@ -319,6 +322,19 @@ else:
 
         def on_validation_epoch_end(self) -> None:
             self._maybe_restore_after_validation()
+            if not self.log_media_on_validation_end:
+                return
+            if self._periodic_eval_active:
+                return
+            trainer = self.trainer
+            if trainer is None or trainer.sanity_checking:
+                return
+
+            self._periodic_eval_active = True
+            try:
+                self._run_periodic_eval()
+            finally:
+                self._periodic_eval_active = False
 
         def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
             if not self._ema_state:

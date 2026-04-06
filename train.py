@@ -1,17 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import inspect
 import math
+import os
+import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+_DEFAULTED_CUDA_ALLOC_CONF = False
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+    _DEFAULTED_CUDA_ALLOC_CONF = True
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from transformers import LlamaConfig
 
+from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism_sample_lengths
 from dataset.dataset import BatchCollate, PrismDataset, build_shared_token_layout
 from models.prism_tts import PrismTTS
 from models.prism_tts_lightning import PrismTTSLightning
@@ -424,7 +434,21 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         raise ValueError(f"Unsupported model.name={model_name!r}. Only 'prism_tts' is supported.")
 
     prism_cfg = _require_mapping(model_cfg, "prism_tts")
-    llama_cfg = _require_mapping(model_cfg, "llama_config")
+    llama_cfg = dict(_require_mapping(model_cfg, "llama_config"))
+    attn_impl = str(llama_cfg.get("_attn_implementation", "eager")).lower()
+    force_eager = os.environ.get("PRISM_TTS_FORCE_EAGER_ATTN", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if torch.cuda.is_available() and attn_impl == "eager" and not force_eager:
+        llama_cfg["_attn_implementation"] = "sdpa"
+        print(
+            "[train.py] model.llama_config._attn_implementation='eager' detected on CUDA; "
+            "overriding to 'sdpa' to avoid eager-attention allocator instability. "
+            "Set PRISM_TTS_FORCE_EAGER_ATTN=true to keep eager."
+        )
     llama_config = LlamaConfig(**llama_cfg)
 
     return PrismTTS(
@@ -506,6 +530,7 @@ def _build_lightning_module(
         scheduler_cfg=scheduler_cfg,
         max_steps=max_steps,
     )
+    audio_decoder = _build_audio_decoder(module_cfg)
 
     return PrismTTSLightning(
         model=model,
@@ -514,8 +539,10 @@ def _build_lightning_module(
         betas=_coerce_betas(module_cfg.get("betas", [0.9, 0.95])),
         eval_every_n_steps=int(module_cfg.get("eval_every_n_steps", 5000)),
         scheduler_factory=scheduler_factory,
+        audio_decoder=audio_decoder,
         audio_sample_rate=int(module_cfg.get("audio_sample_rate", 24_000)),
         max_audio_samples=int(module_cfg.get("max_audio_samples", 2)),
+        log_media_on_validation_end=bool(module_cfg.get("log_media_on_validation_end", True)),
         ema_decay=float(module_cfg.get("ema_decay", 0.999)),
         ema_start_step=int(module_cfg.get("ema_start_step", 0)),
         ema_update_every_n_steps=int(module_cfg.get("ema_update_every_n_steps", 1)),
@@ -524,6 +551,84 @@ def _build_lightning_module(
         use_ema_for_periodic_eval=bool(module_cfg.get("use_ema_for_periodic_eval", True)),
         sync_dist_logging=bool(module_cfg.get("sync_dist_logging", False)),
     )
+
+
+def _resolve_import_string(path: str, *, field_name: str) -> Any:
+    if ":" in path:
+        module_name, attr_name = path.split(":", 1)
+    else:
+        module_name, sep, attr_name = path.rpartition(".")
+        if sep == "":
+            raise ValueError(
+                f"{field_name} must be an import path like 'pkg.mod:obj' or 'pkg.mod.obj'."
+            )
+
+    module_name = module_name.strip()
+    attr_name = attr_name.strip()
+    if module_name == "" or attr_name == "":
+        raise ValueError(
+            f"{field_name} must be an import path like 'pkg.mod:obj' or 'pkg.mod.obj'."
+        )
+
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise ValueError(
+            f"Unable to import module {module_name!r} referenced by {field_name}."
+        ) from exc
+
+    try:
+        return getattr(module, attr_name)
+    except AttributeError as exc:
+        raise ValueError(
+            f"Unable to resolve attribute {attr_name!r} in module {module_name!r} "
+            f"for {field_name}."
+        ) from exc
+
+
+def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
+    decoder_spec = module_cfg.get("audio_decoder")
+    if decoder_spec is None:
+        return None
+    if isinstance(decoder_spec, str) and decoder_spec.strip() == "":
+        return None
+    if not isinstance(decoder_spec, str):
+        raise ValueError(
+            "trainer.lightning_module.audio_decoder must be a string import path "
+            "or null."
+        )
+
+    decoder_kwargs = module_cfg.get("audio_decoder_kwargs", {})
+    if decoder_kwargs is None:
+        decoder_kwargs = {}
+    if not isinstance(decoder_kwargs, dict):
+        raise ValueError(
+            "trainer.lightning_module.audio_decoder_kwargs must be a mapping when set."
+        )
+
+    decoder_obj = _resolve_import_string(
+        decoder_spec.strip(),
+        field_name="trainer.lightning_module.audio_decoder",
+    )
+    if not callable(decoder_obj):
+        raise ValueError(
+            "trainer.lightning_module.audio_decoder must resolve to a callable."
+        )
+
+    if inspect.isclass(decoder_obj):
+        instance = decoder_obj(**decoder_kwargs)
+        if callable(instance):
+            return instance
+        decode_method = getattr(instance, "decode", None)
+        if callable(decode_method):
+            return decode_method
+        raise ValueError(
+            "Audio decoder class instance must be callable or expose a callable `decode` method."
+        )
+
+    if decoder_kwargs:
+        return lambda latents, fn=decoder_obj, kwargs=dict(decoder_kwargs): fn(latents, **kwargs)
+    return decoder_obj
 
 
 def _optional_path(value: Any) -> str | None:
@@ -538,6 +643,63 @@ def _optional_path(value: Any) -> str | None:
     if not path.is_absolute():
         path = Path.cwd() / path
     return str(path.resolve())
+
+
+def _shared_memory_total_bytes() -> int | None:
+    try:
+        return int(shutil.disk_usage("/dev/shm").total)
+    except OSError:
+        return None
+
+
+def _parse_env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return _parse_bool_string(raw, field_name=name)
+    except ValueError:
+        print(f"[train.py] Ignoring invalid {name}={raw!r}; using default={default}.")
+        return default
+
+
+def _parse_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[train.py] Ignoring invalid {name}={raw!r}; using default={default}.")
+        return default
+
+
+def _length_quantile(values: Sequence[int], quantile: float) -> int:
+    if not values:
+        raise ValueError("values must not be empty.")
+    if quantile <= 0.0 or quantile > 1.0:
+        raise ValueError(f"quantile must be in (0, 1], got {quantile}.")
+
+    sorted_values = sorted(max(1, int(value)) for value in values)
+    rank = max(0, min(len(sorted_values) - 1, int(math.ceil(quantile * len(sorted_values))) - 1))
+    return int(sorted_values[rank])
+
+
+def _should_force_single_process_loader(num_workers: int) -> bool:
+    if num_workers <= 0:
+        return False
+
+    # Allow explicit opt-out for environments where low /dev/shm is still acceptable.
+    if _parse_env_bool("PRISM_TTS_DISABLE_SHM_GUARD", False):
+        return False
+
+    total_bytes = _shared_memory_total_bytes()
+    if total_bytes is None:
+        return False
+
+    default_threshold = 512 * 1024 * 1024
+    threshold = _parse_env_int("PRISM_TTS_MIN_SHM_BYTES", default_threshold)
+    return total_bytes < threshold
 
 
 def _build_data_objects(
@@ -593,6 +755,21 @@ def _build_data_objects(
     persistent_workers = bool(loader_cfg.get("persistent_workers", False)) and num_workers > 0
     pin_memory = bool(loader_cfg.get("pin_memory", False))
 
+    if _should_force_single_process_loader(num_workers):
+        shm_total = _shared_memory_total_bytes()
+        shm_mb = "unknown"
+        if shm_total is not None:
+            shm_mb = f"{(shm_total / (1024 * 1024)):.1f}"
+        print(
+            "[train.py] Detected low shared memory "
+            f"(/dev/shm={shm_mb} MB). "
+            "Overriding data.loader.num_workers=0 and persistent_workers=false "
+            "to avoid DataLoader bus errors. "
+            "Set PRISM_TTS_DISABLE_SHM_GUARD=true to keep configured worker settings."
+        )
+        num_workers = 0
+        persistent_workers = False
+
     common_loader_kwargs: dict[str, Any] = {
         "num_workers": num_workers,
         "pin_memory": pin_memory,
@@ -603,13 +780,112 @@ def _build_data_objects(
     if num_workers > 0 and prefetch_factor is not None:
         common_loader_kwargs["prefetch_factor"] = int(prefetch_factor)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(loader_cfg.get("train_batch_size", 8)),
-        shuffle=bool(loader_cfg.get("shuffle_train", True)),
-        drop_last=bool(loader_cfg.get("drop_last_train", True)),
-        **common_loader_kwargs,
-    )
+    train_batch_size = int(loader_cfg.get("train_batch_size", 8))
+    shuffle_train = bool(loader_cfg.get("shuffle_train", True))
+    configured_drop_last_train = bool(loader_cfg.get("drop_last_train", False))
+    if configured_drop_last_train:
+        print(
+            "[train.py] data.loader.drop_last_train=true is not allowed; "
+            "overriding to false so all samples are used in training."
+        )
+    drop_last_train = False
+
+    adaptive_cfg_raw = loader_cfg.get("adaptive_batching")
+    adaptive_cfg: dict[str, Any] = {}
+    if adaptive_cfg_raw is not None:
+        if not isinstance(adaptive_cfg_raw, dict):
+            raise ValueError("data.loader.adaptive_batching must be a mapping when provided.")
+        adaptive_cfg = adaptive_cfg_raw
+    adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
+
+    if adaptive_enabled:
+        target_memory_utilization = float(adaptive_cfg.get("target_memory_utilization", 0.8))
+        if target_memory_utilization <= 0.0 or target_memory_utilization > 1.0:
+            raise ValueError(
+                "data.loader.adaptive_batching.target_memory_utilization must be in (0, 1]."
+            )
+
+        max_batch_size = int(adaptive_cfg.get("max_batch_size", max(1, train_batch_size * 2)))
+        if max_batch_size < 1:
+            raise ValueError("data.loader.adaptive_batching.max_batch_size must be >= 1.")
+
+        reference_quantile = float(adaptive_cfg.get("reference_length_quantile", 0.95))
+        if reference_quantile <= 0.0 or reference_quantile > 1.0:
+            raise ValueError(
+                "data.loader.adaptive_batching.reference_length_quantile must be in (0, 1]."
+            )
+
+        shared_delay_tokens = collate._resolve_shared_delay()
+        sample_lengths = estimate_prism_sample_lengths(
+            train_dataset,
+            codec_frame_rate_hz=float(collate.codec_frame_rate_hz),
+            shared_delay_tokens=int(shared_delay_tokens),
+        )
+
+        reference_length = _length_quantile(sample_lengths, reference_quantile)
+        memory_budget_raw = adaptive_cfg.get("memory_budget")
+        if memory_budget_raw is None:
+            memory_budget = train_batch_size * (reference_length**2)
+        else:
+            memory_budget = int(memory_budget_raw)
+        if memory_budget < 1:
+            raise ValueError("data.loader.adaptive_batching.memory_budget must be >= 1.")
+
+        target_batch_cost_raw = adaptive_cfg.get("target_batch_cost")
+        if target_batch_cost_raw is None:
+            target_batch_cost = int(max(1, round(memory_budget * target_memory_utilization)))
+        else:
+            target_batch_cost = int(target_batch_cost_raw)
+        if target_batch_cost < 1:
+            raise ValueError("data.loader.adaptive_batching.target_batch_cost must be >= 1.")
+
+        trainer_cfg = config.get("trainer")
+        seed_fallback = 0
+        if isinstance(trainer_cfg, dict):
+            trainer_seed = trainer_cfg.get("seed")
+            if trainer_seed is not None:
+                seed_fallback = int(trainer_seed)
+        adaptive_seed_raw = adaptive_cfg.get("seed", seed_fallback)
+        if adaptive_seed_raw is None:
+            sampler_seed = int.from_bytes(os.urandom(8), byteorder="big") & 0x7FFF_FFFF
+            print(
+                "[train.py] data.loader.adaptive_batching.seed is null; "
+                f"generated random sampler seed={sampler_seed}."
+            )
+        else:
+            sampler_seed = int(adaptive_seed_raw)
+
+        train_batch_sampler = AdaptiveMemoryBatchSampler(
+            sample_lengths=sample_lengths,
+            target_batch_cost=target_batch_cost,
+            max_batch_size=max_batch_size,
+            shuffle=shuffle_train,
+            drop_last=drop_last_train,
+            seed=sampler_seed,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_batch_sampler,
+            **common_loader_kwargs,
+        )
+
+        print(
+            "[train.py] Adaptive train batching enabled: "
+            f"target_memory_utilization={target_memory_utilization:.2f}, "
+            f"target_batch_cost={target_batch_cost}, "
+            f"memory_budget={memory_budget}, "
+            f"reference_length(q={reference_quantile:.2f})={reference_length}, "
+            f"max_batch_size={max_batch_size}, "
+            f"seed={sampler_seed}."
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=train_batch_size,
+            shuffle=shuffle_train,
+            drop_last=drop_last_train,
+            **common_loader_kwargs,
+        )
 
     val_loader = None
     if val_dataset is not None:
@@ -727,7 +1003,20 @@ def _build_callbacks(config: dict[str, Any]) -> list[Any]:
     enable_checkpointing = bool(lightning_trainer_cfg.get("enable_checkpointing", True))
     if enable_checkpointing:
         checkpoint_kwargs = dict(checkpoint_cfg)
+        save_every_validation_stage = bool(
+            checkpoint_kwargs.pop("save_every_validation_stage", False)
+        )
+        every_val_filename = str(
+            checkpoint_kwargs.pop(
+                "every_val_filename",
+                "prism_tts-val-stage={val_stage:05d}-step={step:07d}",
+            )
+        )
+        every_val_save_weights_only = bool(
+            checkpoint_kwargs.pop("every_val_save_weights_only", False)
+        )
         dirpath = checkpoint_kwargs.get("dirpath")
+        resolved_ckpt_dir = Path.cwd() / "checkpoints"
         if dirpath is not None:
             ckpt_dir = Path(str(dirpath)).expanduser()
             if not ckpt_dir.is_absolute():
@@ -735,6 +1024,9 @@ def _build_callbacks(config: dict[str, Any]) -> list[Any]:
             ckpt_dir = ckpt_dir.resolve()
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             checkpoint_kwargs["dirpath"] = str(ckpt_dir)
+            resolved_ckpt_dir = ckpt_dir
+        else:
+            resolved_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         checkpoint_kwargs = _filter_kwargs_for_callable(
             ModelCheckpoint.__init__,
@@ -742,6 +1034,14 @@ def _build_callbacks(config: dict[str, Any]) -> list[Any]:
             context="ModelCheckpoint",
         )
         callbacks.append(ModelCheckpoint(**checkpoint_kwargs))
+        if save_every_validation_stage:
+            callbacks.append(
+                SaveEveryValidationStageCheckpoint(
+                    dirpath=resolved_ckpt_dir,
+                    filename=every_val_filename,
+                    save_weights_only=every_val_save_weights_only,
+                )
+            )
 
     if bool(scheduler_cfg.get("enabled", True)):
         lr_monitor_kwargs = _filter_kwargs_for_callable(
@@ -752,6 +1052,61 @@ def _build_callbacks(config: dict[str, Any]) -> list[Any]:
         callbacks.append(LearningRateMonitor(**lr_monitor_kwargs))
 
     return callbacks
+
+
+class SaveEveryValidationStageCheckpoint(pl.Callback):
+    """Persist a checkpoint at the end of every validation stage."""
+
+    def __init__(
+        self,
+        *,
+        dirpath: Path,
+        filename: str,
+        save_weights_only: bool,
+    ) -> None:
+        super().__init__()
+        self.dirpath = Path(dirpath).expanduser().resolve()
+        self.filename = filename
+        self.save_weights_only = save_weights_only
+        self._val_stage = 0
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"val_stage": int(self._val_stage)}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._val_stage = int(state_dict.get("val_stage", 0))
+
+    def on_validation_end(self, trainer: Any, pl_module: Any) -> None:
+        del pl_module
+        if trainer.sanity_checking:
+            return
+        if not bool(getattr(trainer, "is_global_zero", True)):
+            return
+
+        self._val_stage += 1
+        format_values = {
+            "step": int(trainer.global_step),
+            "epoch": int(trainer.current_epoch),
+            "val_stage": int(self._val_stage),
+        }
+        filename = self.filename.format(**format_values)
+        if not filename.endswith(".ckpt"):
+            filename = f"{filename}.ckpt"
+
+        self.dirpath.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = self._next_available_path(self.dirpath / filename)
+        trainer.save_checkpoint(str(checkpoint_path), weights_only=self.save_weights_only)
+
+    @staticmethod
+    def _next_available_path(path: Path) -> Path:
+        if not path.exists():
+            return path
+        version = 1
+        while True:
+            candidate = path.with_name(f"{path.stem}-v{version}{path.suffix}")
+            if not candidate.exists():
+                return candidate
+            version += 1
 
 
 def _trainer_supports_ckpt_path() -> bool:
@@ -794,6 +1149,35 @@ def _coerce_gpu_indices(value: Any) -> list[int]:
     return indices
 
 
+def _resolve_requested_device_count(
+    *,
+    accelerator: str,
+    devices: Any,
+    gpu_indices: list[int] | None,
+    num_nodes: int,
+) -> int | None:
+    if num_nodes > 1:
+        # Keep distributed strategy for multi-node setups even if per-node device count is 1.
+        return None
+
+    if gpu_indices is not None:
+        return len(gpu_indices)
+
+    if isinstance(devices, int):
+        return devices
+    if isinstance(devices, (list, tuple)):
+        return len(devices)
+    if isinstance(devices, str):
+        lowered = devices.strip().lower()
+        if lowered == "auto":
+            if accelerator in {"gpu", "cuda"} and torch.cuda.is_available():
+                return torch.cuda.device_count()
+            return 1
+        if lowered.isdigit():
+            return int(lowered)
+    return None
+
+
 def _apply_distributed_training_config(config: dict[str, Any]) -> None:
     trainer_cfg = _require_mapping(config, "trainer")
     distributed_cfg = trainer_cfg.get("distributed")
@@ -801,20 +1185,39 @@ def _apply_distributed_training_config(config: dict[str, Any]) -> None:
         return
 
     lightning_trainer_cfg = _require_mapping(trainer_cfg, "lightning_trainer")
-    lightning_trainer_cfg["accelerator"] = distributed_cfg.get("accelerator", "gpu")
+    accelerator = str(distributed_cfg.get("accelerator", "gpu"))
+    lightning_trainer_cfg["accelerator"] = accelerator
     gpu_indices = distributed_cfg.get("gpu_indices")
+    resolved_gpu_indices: list[int] | None = None
     if gpu_indices is not None:
-        lightning_trainer_cfg["devices"] = _coerce_gpu_indices(gpu_indices)
+        resolved_gpu_indices = _coerce_gpu_indices(gpu_indices)
+        lightning_trainer_cfg["devices"] = resolved_gpu_indices
     else:
         lightning_trainer_cfg["devices"] = distributed_cfg.get("devices", "auto")
-    lightning_trainer_cfg["strategy"] = distributed_cfg.get(
-        "strategy",
-        "ddp_find_unused_parameters_false",
-    )
 
     num_nodes = distributed_cfg.get("num_nodes")
+    resolved_num_nodes = 1
     if num_nodes is not None:
-        lightning_trainer_cfg["num_nodes"] = int(num_nodes)
+        resolved_num_nodes = int(num_nodes)
+        lightning_trainer_cfg["num_nodes"] = resolved_num_nodes
+
+    requested_strategy = str(
+        distributed_cfg.get("strategy", "ddp_find_unused_parameters_false")
+    )
+    device_count = _resolve_requested_device_count(
+        accelerator=accelerator,
+        devices=lightning_trainer_cfg.get("devices"),
+        gpu_indices=resolved_gpu_indices,
+        num_nodes=resolved_num_nodes,
+    )
+    if device_count is not None and device_count <= 1 and requested_strategy.startswith("ddp"):
+        lightning_trainer_cfg["strategy"] = "auto"
+        print(
+            "[train.py] Distributed mode requested with <=1 device; "
+            "overriding strategy to 'auto' to avoid single-process DDP overhead/issues."
+        )
+    else:
+        lightning_trainer_cfg["strategy"] = requested_strategy
 
     module_cfg = _require_mapping(trainer_cfg, "lightning_module")
     if "sync_dist_logging" in distributed_cfg:
@@ -838,6 +1241,11 @@ def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any])
 def run(args: argparse.Namespace) -> None:
     resolved = _load_merged_configs(args)
     config = resolved.merged
+    if _DEFAULTED_CUDA_ALLOC_CONF:
+        print(
+            "[train.py] PYTORCH_CUDA_ALLOC_CONF was unset; defaulting to "
+            "'backend:cudaMallocAsync' to avoid NVML-related allocator assertions."
+        )
     _apply_wandb_cli_overrides(config, args)
 
     _validate_config_consistency(config)

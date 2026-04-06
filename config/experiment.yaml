@@ -9,61 +9,24 @@ experiment:
   # Free-form experiment name (used for logging/checkpoint naming below).
   name: prism_tts
 
+  # Keep trainer defaults in config/trainer.yaml and override only
+  # experiment-specific values here.
   trainer:
     logger:
-      # Default logger.
-      type: wandb
-      project: prism_tts
       name: baseline
-      save_dir: logs
-      offline: false
-      log_model: false
 
     checkpoint:
       dirpath: checkpoints/baseline
-      filename: prism_tts-{step:07d}
-      monitor: val/loss
-      mode: min
-      save_top_k: 3
-      save_last: true
-      every_n_train_steps: 5000
-
-    lightning_trainer:
-      # Fallback Trainer settings (used when trainer.distributed.enabled=false).
-      accelerator: auto
-      devices: 1
-      strategy: auto
-      precision: bf16-mixed
-      max_steps: 300000
-      min_steps: 0
-      gradient_clip_val: 1.0
-      accumulate_grad_batches: 1
-      log_every_n_steps: 10
-      val_check_interval: 1000
-      num_sanity_val_steps: 2
-      limit_train_batches: 1.0
-      limit_val_batches: 1.0
-      benchmark: true
-      deterministic: false
-      enable_checkpointing: true
-      enable_progress_bar: true
-      enable_model_summary: true
 
     distributed:
       enabled: true
-      accelerator: gpu
-      devices: auto
-      # Optional explicit GPU indices on each node. If set, this overrides `devices`.
-      # Example: [0, 1] uses GPU0 and GPU1 on the current node.
-      gpu_indices: null
-      strategy: ddp_find_unused_parameters_false
-      num_nodes: 1
-      sync_dist_logging: true
 
-  data:
-    # Set these to your real manifests before training.
-    train_manifest: dataset/train_manifest.txt
-    val_manifest: dataset/val_manifest.txt
-    test_manifest: null
-    manifest_root: dataset
-    vocab_path: dataset/vocab.txt
+  # data:
+  #   Optional per-experiment data overrides.
+  #   Leave unset to use paths from config/data.yaml.
+  #   Example:
+  #   train_manifest: /path/to/train_manifest.txt
+  #   val_manifest: /path/to/val_manifest.txt
+  #   test_manifest: null
+  #   manifest_root: /path/to/feature_root
+  #   vocab_path: dataset/vocab.txt

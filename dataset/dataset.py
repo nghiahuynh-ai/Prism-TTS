@@ -239,6 +239,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
     def _parse_manifest_line(self, line: str, line_number: int) -> ManifestEntry:
         parts = [part.strip() for part in line.split("|")]
+        # Some manifests include a trailing delimiter, producing an empty final field.
+        while parts and parts[-1] == "":
+            parts.pop()
         if len(parts) != 8:
             raise ValueError(
                 "Each manifest line must have exactly 8 fields separated by '|'. "
@@ -351,6 +354,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             continuous = _to_float_2d(continuous_raw, f"{npy_path}:continuous")
         except Exception as exc:
             raise RuntimeError(f"Failed to load npy file {npy_path}: {exc}") from exc
+
+        if self.discrete_stream_count is not None and discrete.shape[1] > self.discrete_stream_count:
+            discrete = discrete[:, : self.discrete_stream_count]
 
         self._validate_feature_shapes(discrete, continuous, npy_path)
 

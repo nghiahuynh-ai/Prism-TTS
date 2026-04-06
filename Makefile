@@ -33,6 +33,7 @@ WANDB_LOG_MODEL ?= false
 WANDB_ENTITY ?=
 WANDB_GROUP ?=
 WANDB_TAGS ?=
+PYTORCH_CUDA_ALLOC_CONF ?= backend:cudaMallocAsync
 
 TRAIN_ARGS ?=
 VALIDATE_ARGS ?=
@@ -105,6 +106,7 @@ help:
 	@echo "  WANDB_ENTITY=...       Override WandB entity"
 	@echo "  WANDB_GROUP=...        Override WandB group"
 	@echo "  WANDB_TAGS=a,b,c       Override WandB tags"
+	@echo "  PYTORCH_CUDA_ALLOC_CONF=...  CUDA allocator config (default: backend:cudaMallocAsync)"
 	@echo ""
 	@echo "Extra args:"
 	@echo "  TRAIN_ARGS='...'"
@@ -115,15 +117,18 @@ help:
 	@echo "  GENERATE_ARGS='...'"
 
 train:
+	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
 	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) $(CKPT_ARG) $(TRAIN_ARGS)
 
 validate:
+	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
 	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --validate-only $(CKPT_ARG) $(VALIDATE_ARGS)
 
 test:
 	@if [ -z "$(CKPT)" ]; then \
 		echo "[make test] CKPT is empty: this will run fit before test."; \
 	fi
+	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
 	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --test-after-fit $(CKPT_ARG) $(TEST_ARGS)
 
 unit-test:

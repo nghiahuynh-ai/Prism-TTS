@@ -3,24 +3,43 @@
 # file_name|duration|transcript|target_npy|prompt_file_name|prompt_duration|prompt_transcript|prompt_npy
 
 data:
-  train_manifest: dataset/train_manifest.txt
-  val_manifest: dataset/val_manifest.txt
+  train_manifest: /astro/nghiahuynh/data/emilia/metadata-600-train.txt
+  val_manifest: /astro/nghiahuynh/data/emilia/metadata-600-val.txt
   test_manifest: null
-  manifest_root: dataset
+  # Keep null to resolve relative paths against the manifest directory.
+  manifest_root: null
   vocab_path: dataset/vocab.txt
 
   loader:
-    train_batch_size: 8
-    val_batch_size: 8
-    test_batch_size: 8
+    # Variable-length batches can spike attention memory; keep a conservative
+    # per-device batch size and scale effective batch with grad accumulation.
+    train_batch_size: 4
+    val_batch_size: 4
+    test_batch_size: 4
     num_workers: 4
     pin_memory: true
     persistent_workers: true
     prefetch_factor: 2
-    drop_last_train: true
+    drop_last_train: false
     shuffle_train: true
     shuffle_val: false
     shuffle_test: false
+    adaptive_batching:
+      # Set true to enable dynamic batch sizes based on estimated memory usage.
+      enabled: true
+      # Target utilization against the configured/derived memory_budget.
+      target_memory_utilization: 0.9
+      # Optional absolute budget in "cost units" (batch_size * max_len^2).
+      # null -> derive from train_batch_size and a reference sequence-length quantile.
+      memory_budget: null
+      # Optional direct target in "cost units"; overrides utilization*memory_budget.
+      target_batch_cost: 3300000
+      # Quantile used when deriving memory_budget automatically.
+      reference_length_quantile: 0.95
+      # Upper bound for dynamic batch size (allows adding samples when memory is underused).
+      max_batch_size: 64
+      # Sampler RNG seed; null falls back to trainer.seed (or 0).
+      seed: null
 
   shared_layout:
     # Discrete ids are [0, discrete_token_count - 1].
@@ -38,8 +57,8 @@ data:
     min_target_length: 1
     append_eos_to_text: false
     cache_npy: false
-    discrete_stream_count: 8
-    continuous_feature_dim: 128
+    discrete_stream_count: 1
+    continuous_feature_dim: 512
 
   collate:
     # BatchCollate(...) arguments.
