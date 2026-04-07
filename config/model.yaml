@@ -33,7 +33,7 @@ model:
     initializer_range: 0.02
     pad_token_id: 2050
     eos_token_id: 2049
-    use_cache: true
+    use_cache: false
     tie_word_embeddings: false
     # Prefer memory-efficient attention for training stability/performance.
     _attn_implementation: sdpa
