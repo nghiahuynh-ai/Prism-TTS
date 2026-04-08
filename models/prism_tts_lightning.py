@@ -313,7 +313,7 @@ else:
 
             self._periodic_eval_active = True
             try:
-                self._run_periodic_eval()
+                self._run_periodic_eval(log_on_step=True)
             finally:
                 self._periodic_eval_active = False
 
@@ -332,7 +332,7 @@ else:
 
             self._periodic_eval_active = True
             try:
-                self._run_periodic_eval()
+                self._run_periodic_eval(log_on_step=False)
             finally:
                 self._periodic_eval_active = False
 
@@ -580,7 +580,7 @@ else:
                 return None
             return float(trainer.optimizers[0].param_groups[0]["lr"])
 
-        def _run_periodic_eval(self) -> None:
+        def _run_periodic_eval(self, *, log_on_step: bool) -> None:
             eval_batch = self._next_eval_batch()
             if eval_batch is None:
                 return
@@ -623,8 +623,8 @@ else:
                 "eval/loss",
                 eval_outputs.loss,
                 prog_bar=False,
-                on_step=True,
-                on_epoch=False,
+                on_step=log_on_step,
+                on_epoch=not log_on_step,
                 batch_size=batch_size,
                 sync_dist=self.sync_dist_logging,
             )
