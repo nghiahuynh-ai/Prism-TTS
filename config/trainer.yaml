@@ -12,8 +12,11 @@ trainer:
     audio_sample_rate: 24000
     max_audio_samples: 2
     log_media_on_validation_end: true
-    audio_decoder: null
-    audio_decoder_kwargs: {}
+    audio_decoder: models.mimi_latent_decoder.MimiPreUpsampleLatentDecoder
+    audio_decoder_kwargs:
+      pretrained_model_name_or_path: kyutai/mimi
+      device: cpu
+      dtype: float32
     ema_decay: 0.999
     ema_start_step: 0
     ema_update_every_n_steps: 1

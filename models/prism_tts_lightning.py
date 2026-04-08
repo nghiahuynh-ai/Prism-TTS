@@ -60,7 +60,7 @@ else:
     class PrismTTSLightning(pl.LightningModule):
         """
         Lightning wrapper for PrismTTS with step-level training logs and periodic
-        qualitative evaluation logs to Weights & Biases.
+        audio/mel evaluation media logs to Weights & Biases.
         """
 
         def __init__(
@@ -106,6 +106,9 @@ else:
             self.eval_every_n_steps = eval_every_n_steps
             self.scheduler_factory = scheduler_factory
             self.audio_decoder = audio_decoder
+            decoder_sample_rate = getattr(audio_decoder, "sample_rate", None)
+            if isinstance(decoder_sample_rate, (int, np.integer)) and int(decoder_sample_rate) > 0:
+                audio_sample_rate = int(decoder_sample_rate)
             self.audio_sample_rate = audio_sample_rate
             self.max_audio_samples = max_audio_samples
             self.log_media_on_validation_end = log_media_on_validation_end
@@ -120,7 +123,6 @@ else:
             self._eval_loader_ref: Optional[Any] = None
             self._eval_loader_iter: Optional[Iterator[Any]] = None
             self._periodic_eval_active = False
-            self._audio_skip_logged = False
             self._ema_state: dict[str, torch.Tensor] = {}
             self._ema_updates = 0
             self._last_ema_step = -1
@@ -313,7 +315,7 @@ else:
 
             self._periodic_eval_active = True
             try:
-                self._run_periodic_eval(log_on_step=True)
+                self._run_periodic_eval()
             finally:
                 self._periodic_eval_active = False
 
@@ -332,7 +334,7 @@ else:
 
             self._periodic_eval_active = True
             try:
-                self._run_periodic_eval(log_on_step=False)
+                self._run_periodic_eval()
             finally:
                 self._periodic_eval_active = False
 
@@ -580,7 +582,7 @@ else:
                 return None
             return float(trainer.optimizers[0].param_groups[0]["lr"])
 
-        def _run_periodic_eval(self, *, log_on_step: bool) -> None:
+        def _run_periodic_eval(self) -> None:
             eval_batch = self._next_eval_batch()
             if eval_batch is None:
                 return
@@ -603,7 +605,6 @@ else:
                 with self._ema_scope(enabled=self.use_ema_for_periodic_eval):
                     self.model.eval()
                     with torch.no_grad():
-                        eval_outputs = self._forward_batch(batch_inputs)
                         generation = self.model.generate_with_kv_cache(
                             text_prompt=batch_inputs.text_prompt,
                             discrete_prompt=batch_inputs.discrete_prompt,
@@ -617,25 +618,11 @@ else:
                 if was_training:
                     self.model.train()
 
-            viz = self._build_eval_visuals(batch_inputs, generation)
-            batch_size = self._batch_size(batch_inputs)
-            self.log(
-                "eval/loss",
-                eval_outputs.loss,
-                prog_bar=False,
-                on_step=log_on_step,
-                on_epoch=not log_on_step,
-                batch_size=batch_size,
-                sync_dist=self.sync_dist_logging,
-            )
-
             if not self._is_global_zero():
                 return
             self._log_eval_media_to_wandb(
                 batch_inputs=batch_inputs,
                 generation=generation,
-                eval_outputs=eval_outputs,
-                viz=viz,
             )
 
         def _next_eval_batch(self) -> Optional[Any]:
@@ -670,85 +657,6 @@ else:
             if isinstance(val_loaders, (list, tuple)):
                 return val_loaders[0] if len(val_loaders) > 0 else None
             return val_loaders
-
-        def _build_eval_visuals(
-            self,
-            batch_inputs: PrismBatch,
-            generation: PrismTTSGenerationOutput,
-        ) -> dict[str, np.ndarray]:
-            if batch_inputs.continuous_target is None or batch_inputs.text_target is None:
-                return {
-                    "target_latent": np.zeros((1, 1), dtype=np.float32),
-                    "pred_latent": np.zeros((1, 1), dtype=np.float32),
-                    "abs_error": np.zeros((1, 1), dtype=np.float32),
-                }
-            target_continuous = self.model._normalize_continuous_latents(
-                batch_inputs.continuous_target,
-                expected_len=batch_inputs.text_target.shape[1],
-                name="continuous_target",
-            )
-            pred_continuous = generation.continuous_latents
-
-            target_len = min(
-                int(target_continuous.shape[1]),
-                int(pred_continuous.shape[1]),
-            )
-            if target_len < 1:
-                return {
-                    "target_latent": np.zeros((1, 1), dtype=np.float32),
-                    "pred_latent": np.zeros((1, 1), dtype=np.float32),
-                    "abs_error": np.zeros((1, 1), dtype=np.float32),
-                }
-
-            target_continuous = target_continuous[:, :target_len, :]
-            pred_continuous = pred_continuous[:, :target_len, :]
-            valid_mask = self._resolve_generated_mask(
-                attention_mask=batch_inputs.attention_mask,
-                target_len=target_len,
-                batch_size=int(target_continuous.shape[0]),
-                device=target_continuous.device,
-            )
-
-            sample_mask = valid_mask[0]
-            target_latent = target_continuous[0][sample_mask].detach().float().cpu().numpy()
-            pred_latent = pred_continuous[0][sample_mask].detach().float().cpu().numpy()
-            if target_latent.shape[0] == 0:
-                target_latent = target_continuous[0].detach().float().cpu().numpy()[:1]
-                pred_latent = pred_continuous[0].detach().float().cpu().numpy()[:1]
-
-            abs_error = np.abs(pred_latent - target_latent)
-            return {
-                "target_latent": target_latent,
-                "pred_latent": pred_latent,
-                "abs_error": abs_error,
-            }
-
-        def _resolve_generated_mask(
-            self,
-            attention_mask: Optional[torch.Tensor],
-            target_len: int,
-            batch_size: int,
-            device: torch.device,
-        ) -> torch.Tensor:
-            default_mask = torch.ones(batch_size, target_len, dtype=torch.bool, device=device)
-            if attention_mask is None or attention_mask.dim() != 2:
-                return default_mask
-
-            if attention_mask.shape[1] == target_len:
-                return attention_mask.to(device=device, dtype=torch.bool)
-
-            token_len = target_len * self.model.block_size
-            if attention_mask.shape[1] == token_len:
-                return attention_mask.to(device=device, dtype=torch.bool).reshape(
-                    batch_size,
-                    target_len,
-                    self.model.block_size,
-                ).all(dim=-1)
-
-            if attention_mask.shape[1] > target_len:
-                return attention_mask[:, -target_len:].to(device=device, dtype=torch.bool)
-
-            return default_mask
 
         def _initialize_ema_if_needed(self) -> None:
             if self._ema_state:
@@ -873,8 +781,6 @@ else:
             self,
             batch_inputs: PrismBatch,
             generation: PrismTTSGenerationOutput,
-            eval_outputs: PrismTTSOutput,
-            viz: Mapping[str, np.ndarray],
         ) -> None:
             run = self._wandb_run()
             if run is None:
@@ -885,108 +791,11 @@ else:
             except ModuleNotFoundError:
                 return
 
-            payload: dict[str, Any] = {
-                "eval/loss": float(eval_outputs.loss.detach().cpu()),
-            }
-            if eval_outputs.text_loss is not None:
-                payload["eval/text_loss"] = float(eval_outputs.text_loss.detach().cpu())
-
-            figure = self._build_professional_eval_figure(
-                target_latent=viz["target_latent"],
-                pred_latent=viz["pred_latent"],
-                abs_error=viz["abs_error"],
-                step=int(self.global_step),
-            )
-            if figure is not None:
-                payload["eval/qualitative"] = wandb.Image(figure)
-                try:
-                    import matplotlib.pyplot as plt
-
-                    plt.close(figure)
-                except ModuleNotFoundError:
-                    figure.clf()
-
             audio_table = self._build_audio_table(batch_inputs, generation)
-            if audio_table is not None:
-                payload["eval/audio_samples"] = audio_table
-            elif self.audio_decoder is None and not self._audio_skip_logged:
-                payload["eval/audio_logging_skipped"] = 1.0
-                self._audio_skip_logged = True
+            if audio_table is None:
+                return
 
-            run.log(payload, step=int(self.global_step))
-
-        def _build_professional_eval_figure(
-            self,
-            target_latent: np.ndarray,
-            pred_latent: np.ndarray,
-            abs_error: np.ndarray,
-            step: int,
-        ) -> Any:
-            try:
-                import matplotlib.pyplot as plt
-            except ModuleNotFoundError:
-                return None
-
-            plt.style.use("seaborn-v0_8-whitegrid")
-            fig = plt.figure(figsize=(14, 4.8), dpi=140, constrained_layout=True)
-            grid = fig.add_gridspec(1, 3)
-
-            value_min = float(min(np.min(target_latent), np.min(pred_latent)))
-            value_max = float(max(np.max(target_latent), np.max(pred_latent)))
-            if np.isclose(value_min, value_max):
-                value_min -= 1e-3
-                value_max += 1e-3
-
-            error_max = float(max(np.max(abs_error), 1e-6))
-
-            ax_target = fig.add_subplot(grid[0, 0])
-            target_img = ax_target.imshow(
-                target_latent.T,
-                aspect="auto",
-                origin="lower",
-                cmap="viridis",
-                vmin=value_min,
-                vmax=value_max,
-            )
-            ax_target.set_title("Ground Truth Continuous Latents", fontsize=12, weight="bold")
-            ax_target.set_xlabel("Time Step")
-            ax_target.set_ylabel("Latent Channel")
-            fig.colorbar(target_img, ax=ax_target, fraction=0.046, pad=0.02)
-
-            ax_pred = fig.add_subplot(grid[0, 1])
-            pred_img = ax_pred.imshow(
-                pred_latent.T,
-                aspect="auto",
-                origin="lower",
-                cmap="viridis",
-                vmin=value_min,
-                vmax=value_max,
-            )
-            ax_pred.set_title("Synthesized Continuous Latents", fontsize=12, weight="bold")
-            ax_pred.set_xlabel("Time Step")
-            ax_pred.set_ylabel("Latent Channel")
-            fig.colorbar(pred_img, ax=ax_pred, fraction=0.046, pad=0.02)
-
-            ax_err = fig.add_subplot(grid[0, 2])
-            err_img = ax_err.imshow(
-                abs_error.T,
-                aspect="auto",
-                origin="lower",
-                cmap="magma",
-                vmin=0.0,
-                vmax=error_max,
-            )
-            ax_err.set_title("Absolute Error |Synth - GT|", fontsize=11, weight="bold")
-            ax_err.set_xlabel("Time Step")
-            ax_err.set_ylabel("Latent Channel")
-            fig.colorbar(err_img, ax=ax_err, fraction=0.046, pad=0.02)
-
-            fig.suptitle(
-                f"Prism-TTS Periodic Evaluation Preview (Step {step})",
-                fontsize=15,
-                weight="bold",
-            )
-            return fig
+            run.log({"eval/audio_samples": audio_table}, step=int(self.global_step))
 
         def _build_audio_table(
             self,
@@ -1201,7 +1010,10 @@ else:
             if self.audio_decoder is None:
                 return None
 
-            decoded = self.audio_decoder(latents.detach())
+            try:
+                decoded = self.audio_decoder(latents.detach())
+            except Exception:
+                return None
             if isinstance(decoded, torch.Tensor):
                 decoded = decoded.detach().cpu().float().numpy()
             else:
