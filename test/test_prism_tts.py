@@ -552,6 +552,180 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             )
         )
 
+    def test_generate_with_kv_cache_respects_prompt_and_target_lengths(self) -> None:
+        batch_size = 1
+        prompt_len = 3
+        padded_prompt_len = 6
+        target_len = 2
+        padded_target_len = 5
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+        text_pad_value = int(self.model.backbone.config.pad_token_id or 0)
+
+        text_prompt_trim = torch.randint(
+            1,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt_trim = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt_trim = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target_trim = torch.randint(
+            1,
+            text_vocab_upper,
+            (batch_size, target_len),
+            device=self.device,
+        )
+
+        text_prompt_padded = torch.full(
+            (batch_size, padded_prompt_len),
+            text_pad_value,
+            dtype=torch.long,
+            device=self.device,
+        )
+        text_prompt_padded[:, :prompt_len] = text_prompt_trim
+
+        discrete_prompt_padded = torch.full(
+            (batch_size, self.num_discrete_tokens, padded_prompt_len),
+            text_pad_value,
+            dtype=torch.long,
+            device=self.device,
+        )
+        discrete_prompt_padded[:, :, :prompt_len] = discrete_prompt_trim
+
+        continuous_prompt_padded = torch.zeros(
+            batch_size,
+            padded_prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        continuous_prompt_padded[:, :prompt_len, :] = continuous_prompt_trim
+
+        text_target_padded = torch.full(
+            (batch_size, padded_target_len),
+            text_pad_value,
+            dtype=torch.long,
+            device=self.device,
+        )
+        text_target_padded[:, :target_len] = text_target_trim
+
+        with torch.no_grad():
+            torch.manual_seed(77)
+            trimmed_outputs = self.model.generate_with_kv_cache(
+                text_prompt=text_prompt_trim,
+                discrete_prompt=discrete_prompt_trim,
+                continuous_prompt=continuous_prompt_trim,
+                text_target=text_target_trim,
+                max_new_blocks=target_len,
+                do_sample=False,
+                return_dict=True,
+            )
+            torch.manual_seed(77)
+            padded_outputs = self.model.generate_with_kv_cache(
+                text_prompt=text_prompt_padded,
+                discrete_prompt=discrete_prompt_padded,
+                continuous_prompt=continuous_prompt_padded,
+                text_target=text_target_padded,
+                prompt_lengths=torch.tensor([prompt_len], device=self.device),
+                target_lengths=torch.tensor([target_len], device=self.device),
+                max_new_blocks=target_len,
+                do_sample=False,
+                return_dict=True,
+            )
+
+        self.assertTrue(torch.equal(trimmed_outputs.text_ids, padded_outputs.text_ids))
+        self.assertTrue(torch.equal(trimmed_outputs.discrete_ids, padded_outputs.discrete_ids))
+        self.assertTrue(
+            torch.allclose(
+                trimmed_outputs.continuous_latents,
+                padded_outputs.continuous_latents,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+
+    def test_special_discrete_blocks_produce_silent_continuous_latents(self) -> None:
+        batch_size = 1
+        prompt_len = 2
+        generated_len = 1
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+        special_id = self.discrete_vocab_size - 1
+
+        text_prompt = torch.randint(
+            1,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            1,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+
+        original_sampler = self.model._sample_discrete_ids
+
+        def _always_special(
+            logits: torch.Tensor,
+            temperature: float = 0.8,
+            top_k: int = 50,
+            top_p: float = 0.95,
+            do_sample: bool = True,
+        ) -> torch.LongTensor:
+            del temperature, top_k, top_p, do_sample
+            return torch.full(
+                logits.shape[:-1],
+                fill_value=special_id,
+                dtype=torch.long,
+                device=logits.device,
+            )
+
+        self.model._sample_discrete_ids = _always_special
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    text_prompt=text_prompt,
+                    discrete_prompt=discrete_prompt,
+                    continuous_prompt=continuous_prompt,
+                    text_target=text_target,
+                    max_new_blocks=generated_len,
+                    do_sample=False,
+                    discrete_eos_token_id=special_id,
+                    force_silent_special_tokens=True,
+                    return_dict=True,
+                )
+        finally:
+            self.model._sample_discrete_ids = original_sampler
+
+        self.assertTrue(
+            torch.all(
+                outputs.continuous_latents
+                == torch.zeros_like(outputs.continuous_latents)
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

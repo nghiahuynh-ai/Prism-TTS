@@ -785,6 +785,60 @@ class PrismTTS(nn.Module):
 
         return x.reshape(*cond_shape, self.continuous_latent_size)
 
+    def _resolve_generation_discrete_eos_token_id(
+        self,
+        discrete_eos_token_id: Optional[int],
+    ) -> int:
+        if discrete_eos_token_id is not None:
+            return int(discrete_eos_token_id)
+        candidate = self.backbone.config.eos_token_id
+        if candidate is None or not (0 <= int(candidate) < self.discrete_vocab_size):
+            return 0
+        return int(candidate)
+
+    def _infer_special_discrete_token_ids(
+        self,
+        discrete_eos_token_id: int,
+    ) -> tuple[int, ...]:
+        ids: set[int] = set()
+        if 0 <= discrete_eos_token_id < self.discrete_vocab_size:
+            ids.add(int(discrete_eos_token_id))
+
+        cfg_eos = self.backbone.config.eos_token_id
+        cfg_pad = self.backbone.config.pad_token_id
+        if cfg_eos is not None and 0 <= int(cfg_eos) < self.discrete_vocab_size:
+            ids.add(int(cfg_eos))
+        if cfg_pad is not None and 0 <= int(cfg_pad) < self.discrete_vocab_size:
+            ids.add(int(cfg_pad))
+        if (
+            cfg_eos is not None
+            and cfg_pad is not None
+            and int(cfg_pad) == int(cfg_eos) + 1
+            and 0 <= int(cfg_eos) - 1 < self.discrete_vocab_size
+        ):
+            # Shared-vocab layout used by dataset.py: DELAY = EOS - 1.
+            ids.add(int(cfg_eos) - 1)
+
+        return tuple(sorted(ids))
+
+    def _build_special_block_mask(
+        self,
+        discrete_tokens: torch.LongTensor,
+        special_token_ids: tuple[int, ...],
+    ) -> torch.BoolTensor:
+        if len(special_token_ids) == 0:
+            return torch.zeros(
+                discrete_tokens.shape[0],
+                dtype=torch.bool,
+                device=discrete_tokens.device,
+            )
+        ids = torch.tensor(
+            special_token_ids,
+            dtype=discrete_tokens.dtype,
+            device=discrete_tokens.device,
+        )
+        return torch.isin(discrete_tokens, ids).all(dim=-1)
+
     def forward(
         self,
         text: torch.LongTensor,
@@ -934,14 +988,17 @@ class PrismTTS(nn.Module):
         discrete_prompt: torch.LongTensor,
         continuous_prompt: torch.FloatTensor,
         text_target: Optional[torch.LongTensor] = None,
+        prompt_lengths: Optional[torch.Tensor | int] = None,
+        target_lengths: Optional[torch.Tensor | int] = None,
         max_new_blocks: Optional[int] = 128,
         text_eos_token_id: Optional[int] = None,
-        discrete_eos_token_id: int = 0,
+        discrete_eos_token_id: Optional[int] = None,
         temperature: float = 0.8,
         top_k: int = 50,
         top_p: float = 0.95,
         do_sample: bool = True,
         flow_num_steps: Optional[int] = None,
+        force_silent_special_tokens: bool = True,
         return_dict: bool = True,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         # text_prompt: [B, L1]
@@ -975,9 +1032,39 @@ class PrismTTS(nn.Module):
             if text_target.shape[0] != batch_size:
                 raise ValueError("text_target must have the same batch size as prompts.")
 
+        prompt_lens = self._normalize_lengths(
+            lengths=prompt_lengths,
+            batch_size=batch_size,
+            max_length=prompt_len,
+            name="prompt_lengths",
+            device=text_prompt.device,
+            default_value=prompt_len,
+        )
+        if (prompt_lens < 1).any():
+            raise ValueError("prompt_lengths must be >= 1 for generation.")
+        if torch.unique(prompt_lens).numel() != 1:
+            raise ValueError(
+                "Batched generation requires identical prompt_lengths across the batch. "
+                "Trim per sample before calling generate or use batch size 1."
+            )
+        effective_prompt_len = int(prompt_lens[0].item())
+        if effective_prompt_len < prompt_len:
+            text_prompt = text_prompt[:, :effective_prompt_len]
+            discrete_prompt = discrete_prompt[:, :effective_prompt_len, :]
+            continuous_prompt = continuous_prompt[:, :effective_prompt_len, :]
+            prompt_len = effective_prompt_len
+
         target_len = text_target.shape[1]
+        target_lens = self._normalize_lengths(
+            lengths=target_lengths,
+            batch_size=batch_size,
+            max_length=target_len,
+            name="target_lengths",
+            device=text_target.device,
+            default_value=target_len,
+        )
         if max_new_blocks is None:
-            max_new_blocks = max(1, target_len)
+            max_new_blocks = max(1, int(target_lens.max().item()))
         if max_new_blocks < 1:
             raise ValueError("max_new_blocks must be at least 1.")
 
@@ -987,6 +1074,14 @@ class PrismTTS(nn.Module):
                 text_eos_token_id = self.backbone.config.pad_token_id
             if text_eos_token_id is None:
                 text_eos_token_id = 0
+        discrete_eos_token_id = self._resolve_generation_discrete_eos_token_id(
+            discrete_eos_token_id
+        )
+        special_discrete_token_ids = (
+            self._infer_special_discrete_token_ids(discrete_eos_token_id)
+            if force_silent_special_tokens
+            else tuple()
+        )
         cur_text = text_prompt  # [B, cur_L]
         cur_discrete = discrete_prompt  # [B, cur_L, N]
         cur_continuous = continuous_prompt  # [B, cur_L, C]
@@ -1043,21 +1138,36 @@ class PrismTTS(nn.Module):
                 do_sample=do_sample,
             )
             # next_discrete: [B, N]
-            next_continuous = self.sample_continuous_latent(
-                cond=self._discrete_condition(next_discrete),
-                num_steps=flow_num_steps,
+            special_block_mask = self._build_special_block_mask(
+                discrete_tokens=next_discrete,
+                special_token_ids=special_discrete_token_ids,
             )
+            if special_block_mask.all():
+                next_continuous = torch.zeros(
+                    batch_size,
+                    self.continuous_latent_size,
+                    dtype=cur_continuous.dtype,
+                    device=cur_continuous.device,
+                )
+            else:
+                next_continuous = self.sample_continuous_latent(
+                    cond=self._discrete_condition(next_discrete),
+                    num_steps=flow_num_steps,
+                )
+                if special_block_mask.any():
+                    next_continuous = next_continuous.clone()
+                    next_continuous[special_block_mask] = 0.0
             # next_continuous: [B, C]
 
-            if step_idx < target_len:
-                next_text = text_target[:, step_idx : step_idx + 1]
-            else:
-                next_text = torch.full(
-                    (batch_size, 1),
-                    fill_value=text_eos_token_id,
-                    dtype=cur_text.dtype,
-                    device=cur_text.device,
-                )
+            next_text = torch.full(
+                (batch_size, 1),
+                fill_value=text_eos_token_id,
+                dtype=cur_text.dtype,
+                device=cur_text.device,
+            )
+            use_teacher = step_idx < target_lens
+            if step_idx < target_len and use_teacher.any():
+                next_text[use_teacher, 0] = text_target[use_teacher, step_idx]
 
             finalized_discrete = next_discrete.unsqueeze(1)  # [B, 1, N]
             finalized_continuous = next_continuous.unsqueeze(1)  # [B, 1, C]
@@ -1106,14 +1216,17 @@ class PrismTTS(nn.Module):
         discrete_prompt: torch.LongTensor,
         continuous_prompt: torch.FloatTensor,
         text_target: Optional[torch.LongTensor] = None,
+        prompt_lengths: Optional[torch.Tensor | int] = None,
+        target_lengths: Optional[torch.Tensor | int] = None,
         max_new_blocks: Optional[int] = 128,
         text_eos_token_id: Optional[int] = None,
-        discrete_eos_token_id: int = 0,
+        discrete_eos_token_id: Optional[int] = None,
         temperature: float = 0.8,
         top_k: int = 50,
         top_p: float = 0.95,
         do_sample: bool = True,
         flow_num_steps: Optional[int] = None,
+        force_silent_special_tokens: bool = True,
         return_dict: bool = True,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         # text_prompt: [B, L1]
@@ -1147,9 +1260,39 @@ class PrismTTS(nn.Module):
             if text_target.shape[0] != batch_size:
                 raise ValueError("text_target must have the same batch size as prompts.")
 
+        prompt_lens = self._normalize_lengths(
+            lengths=prompt_lengths,
+            batch_size=batch_size,
+            max_length=prompt_len,
+            name="prompt_lengths",
+            device=text_prompt.device,
+            default_value=prompt_len,
+        )
+        if (prompt_lens < 1).any():
+            raise ValueError("prompt_lengths must be >= 1 for generation.")
+        if torch.unique(prompt_lens).numel() != 1:
+            raise ValueError(
+                "Batched generation requires identical prompt_lengths across the batch. "
+                "Trim per sample before calling generate_with_kv_cache or use batch size 1."
+            )
+        effective_prompt_len = int(prompt_lens[0].item())
+        if effective_prompt_len < prompt_len:
+            text_prompt = text_prompt[:, :effective_prompt_len]
+            discrete_prompt = discrete_prompt[:, :effective_prompt_len, :]
+            continuous_prompt = continuous_prompt[:, :effective_prompt_len, :]
+            prompt_len = effective_prompt_len
+
         target_len = text_target.shape[1]
+        target_lens = self._normalize_lengths(
+            lengths=target_lengths,
+            batch_size=batch_size,
+            max_length=target_len,
+            name="target_lengths",
+            device=text_target.device,
+            default_value=target_len,
+        )
         if max_new_blocks is None:
-            max_new_blocks = max(1, target_len)
+            max_new_blocks = max(1, int(target_lens.max().item()))
         if max_new_blocks < 1:
             raise ValueError("max_new_blocks must be at least 1.")
 
@@ -1159,6 +1302,14 @@ class PrismTTS(nn.Module):
                 text_eos_token_id = self.backbone.config.pad_token_id
             if text_eos_token_id is None:
                 text_eos_token_id = 0
+        discrete_eos_token_id = self._resolve_generation_discrete_eos_token_id(
+            discrete_eos_token_id
+        )
+        special_discrete_token_ids = (
+            self._infer_special_discrete_token_ids(discrete_eos_token_id)
+            if force_silent_special_tokens
+            else tuple()
+        )
         past_key_values = None
         prompt_embeds, _ = self._build_inputs_embeds(
             text_tokens=text_prompt,
@@ -1205,21 +1356,36 @@ class PrismTTS(nn.Module):
                 do_sample=do_sample,
             )
             # next_discrete: [B, N]
-            next_continuous = self.sample_continuous_latent(
-                cond=self._discrete_condition(next_discrete),
-                num_steps=flow_num_steps,
+            special_block_mask = self._build_special_block_mask(
+                discrete_tokens=next_discrete,
+                special_token_ids=special_discrete_token_ids,
             )
+            if special_block_mask.all():
+                next_continuous = torch.zeros(
+                    batch_size,
+                    self.continuous_latent_size,
+                    dtype=continuous_prompt.dtype,
+                    device=continuous_prompt.device,
+                )
+            else:
+                next_continuous = self.sample_continuous_latent(
+                    cond=self._discrete_condition(next_discrete),
+                    num_steps=flow_num_steps,
+                )
+                if special_block_mask.any():
+                    next_continuous = next_continuous.clone()
+                    next_continuous[special_block_mask] = 0.0
             # next_continuous: [B, C]
 
-            if step_idx < target_len:
-                next_text = text_target[:, step_idx : step_idx + 1]
-            else:
-                next_text = torch.full(
-                    (batch_size, 1),
-                    fill_value=text_eos_token_id,
-                    dtype=text_prompt.dtype,
-                    device=text_prompt.device,
-                )
+            next_text = torch.full(
+                (batch_size, 1),
+                fill_value=text_eos_token_id,
+                dtype=text_prompt.dtype,
+                device=text_prompt.device,
+            )
+            use_teacher = step_idx < target_lens
+            if step_idx < target_len and use_teacher.any():
+                next_text[use_teacher, 0] = text_target[use_teacher, step_idx]
             # next_text: [B, 1]
 
             finalized_discrete = next_discrete.unsqueeze(1)  # [B, 1, N]

@@ -596,9 +596,33 @@ else:
                 or batch_inputs.text_target is None
             ):
                 return
-            target_len = self._max_target_length(batch_inputs)
+            # Generation logs only one sample; slice and trim by prompt/target lengths to
+            # avoid conditioning on batch-level padding from collate.
+            sample_idx = 0
+            prompt_len = (
+                int(torch.as_tensor(batch_inputs.prompt_lengths)[sample_idx].item())
+                if batch_inputs.prompt_lengths is not None
+                else int(batch_inputs.text_prompt.shape[1])
+            )
+            target_len = (
+                int(torch.as_tensor(batch_inputs.target_lengths)[sample_idx].item())
+                if batch_inputs.target_lengths is not None
+                else int(batch_inputs.text_target.shape[1])
+            )
             if target_len < 1:
                 return
+
+            text_prompt = batch_inputs.text_prompt[sample_idx : sample_idx + 1, :prompt_len]
+            discrete_prompt = self.model._normalize_discrete_tokens(
+                batch_inputs.discrete_prompt[sample_idx : sample_idx + 1],
+                "discrete_prompt",
+            )[:, :prompt_len, :]
+            continuous_prompt = self.model._normalize_continuous_latents(
+                batch_inputs.continuous_prompt[sample_idx : sample_idx + 1],
+                expected_len=int(batch_inputs.text_prompt.shape[1]),
+                name="continuous_prompt",
+            )[:, :prompt_len, :]
+            text_target = batch_inputs.text_target[sample_idx : sample_idx + 1, :target_len]
 
             was_training = self.model.training
             try:
@@ -606,10 +630,12 @@ else:
                     self.model.eval()
                     with torch.no_grad():
                         generation = self.model.generate_with_kv_cache(
-                            text_prompt=batch_inputs.text_prompt,
-                            discrete_prompt=batch_inputs.discrete_prompt,
-                            continuous_prompt=batch_inputs.continuous_prompt,
-                            text_target=batch_inputs.text_target,
+                            text_prompt=text_prompt,
+                            discrete_prompt=discrete_prompt,
+                            continuous_prompt=continuous_prompt,
+                            text_target=text_target,
+                            prompt_lengths=torch.tensor([prompt_len], device=self.device),
+                            target_lengths=torch.tensor([target_len], device=self.device),
                             max_new_blocks=target_len,
                             do_sample=False,
                             return_dict=True,
@@ -621,7 +647,15 @@ else:
             if not self._is_global_zero():
                 return
             self._log_eval_media_to_wandb(
-                batch_inputs=batch_inputs,
+                batch_inputs=PrismBatch(
+                    text_target=batch_inputs.text_target[sample_idx : sample_idx + 1],
+                    continuous_target=(
+                        None
+                        if batch_inputs.continuous_target is None
+                        else batch_inputs.continuous_target[sample_idx : sample_idx + 1]
+                    ),
+                    target_lengths=torch.tensor([target_len], device=self.device),
+                ),
                 generation=generation,
             )
 
