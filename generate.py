@@ -162,8 +162,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--force-silent-special-tokens",
+        dest="force_silent_special_tokens",
         action="store_true",
+        default=True,
         help="Force predicted special discrete blocks (DELAY/EOS/PAD) to zero continuous latents.",
+    )
+    parser.add_argument(
+        "--no-force-silent-special-tokens",
+        dest="force_silent_special_tokens",
+        action="store_false",
+        help="Disable zeroing of continuous latents for special discrete blocks.",
     )
     parser.add_argument(
         "--trim-tail-special-blocks",
@@ -839,6 +847,7 @@ def main() -> None:
     data_cfg = _require_mapping(data_config, "data")
     shared_layout_cfg = _require_mapping(data_cfg, "shared_layout")
     collate_cfg = _require_mapping(data_cfg, "collate")
+    dataset_cfg = _require_mapping(data_cfg, "dataset")
 
     discrete_token_count = int(shared_layout_cfg["discrete_token_count"])
     delay_token_id, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(
@@ -859,7 +868,7 @@ def main() -> None:
         vocab_path=vocab_path,
         text_token_offset=text_token_offset,
         eos_token_id=eos_token_id,
-        append_eos=False,
+        append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
     )
 
     prompt_audio, prompt_sample_rate = _read_wav(args.prompt_audio)
@@ -948,9 +957,14 @@ def main() -> None:
     if max_new_blocks < 1:
         raise ValueError("--max-new-blocks must be >= 1.")
 
-    # Teacher-force only the explicit target text tokens; generation code appends EOS
-    # automatically once target_lengths is exhausted.
-    teacher_target = target_text_tokens.unsqueeze(0)
+    # Mirror training text alignment for target blocks:
+    # [target text..., EOS, PAD...].
+    teacher_target = _build_teacher_forcing_target_text(
+        target_text_tokens=target_text_tokens,
+        eos_token_id=eos_token_id,
+        pad_token_id=text_pad_value,
+        total_blocks=int(max_new_blocks),
+    ).unsqueeze(0)
 
     text_prompt = aligned_text_prompt.unsqueeze(0).to(device=device, dtype=torch.long)
     # Pass [B, N, L] for compatibility with training/inference call-sites.

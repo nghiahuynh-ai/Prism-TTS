@@ -638,7 +638,7 @@ else:
                             target_lengths=torch.tensor([target_len], device=self.device),
                             max_new_blocks=target_len,
                             do_sample=False,
-                            force_silent_special_tokens=False,
+                            force_silent_special_tokens=True,
                             return_dict=True,
                         )
             finally:
