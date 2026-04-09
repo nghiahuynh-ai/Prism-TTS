@@ -209,6 +209,59 @@ class PrismTTS(nn.Module):
             )
         return lengths_tensor
 
+    def _normalize_teacher_forcing_prefix(
+        self,
+        *,
+        teacher_forced_discrete_prefix: Optional[torch.LongTensor],
+        teacher_forced_continuous_prefix: Optional[torch.FloatTensor],
+        batch_size: int,
+        device: torch.device,
+        continuous_dtype: torch.dtype,
+    ) -> tuple[Optional[torch.LongTensor], Optional[torch.FloatTensor]]:
+        if teacher_forced_discrete_prefix is None and teacher_forced_continuous_prefix is None:
+            return None, None
+        if teacher_forced_discrete_prefix is None:
+            raise ValueError(
+                "teacher_forced_discrete_prefix must be provided when "
+                "teacher_forced_continuous_prefix is set."
+            )
+
+        discrete_prefix = self._normalize_discrete_tokens(
+            teacher_forced_discrete_prefix,
+            "teacher_forced_discrete_prefix",
+        )
+        if discrete_prefix.shape[0] != batch_size:
+            raise ValueError(
+                "teacher_forced_discrete_prefix batch size must match prompts."
+            )
+        prefix_len = int(discrete_prefix.shape[1])
+
+        if teacher_forced_continuous_prefix is None:
+            continuous_prefix = torch.zeros(
+                batch_size,
+                prefix_len,
+                self.continuous_latent_size,
+                dtype=continuous_dtype,
+                device=device,
+            )
+        else:
+            continuous_prefix = self._normalize_continuous_latents(
+                teacher_forced_continuous_prefix,
+                expected_len=prefix_len,
+                name="teacher_forced_continuous_prefix",
+            )
+            if continuous_prefix.shape[0] != batch_size:
+                raise ValueError(
+                    "teacher_forced_continuous_prefix batch size must match prompts."
+                )
+            continuous_prefix = continuous_prefix.to(
+                device=device,
+                dtype=continuous_dtype,
+            )
+
+        discrete_prefix = discrete_prefix.to(device=device, dtype=torch.long)
+        return discrete_prefix, continuous_prefix
+
     def _build_target_block_mask(
         self,
         total_blocks: int,
@@ -1005,6 +1058,8 @@ class PrismTTS(nn.Module):
         do_sample: bool = True,
         flow_num_steps: Optional[int] = None,
         force_silent_special_tokens: bool = False,
+        teacher_forced_discrete_prefix: Optional[torch.LongTensor] = None,
+        teacher_forced_continuous_prefix: Optional[torch.FloatTensor] = None,
         return_dict: bool = True,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         # text_prompt: [B, L1]
@@ -1073,6 +1128,21 @@ class PrismTTS(nn.Module):
             max_new_blocks = max(1, int(target_lens.max().item()))
         if max_new_blocks < 1:
             raise ValueError("max_new_blocks must be at least 1.")
+        (
+            normalized_teacher_discrete_prefix,
+            normalized_teacher_continuous_prefix,
+        ) = self._normalize_teacher_forcing_prefix(
+            teacher_forced_discrete_prefix=teacher_forced_discrete_prefix,
+            teacher_forced_continuous_prefix=teacher_forced_continuous_prefix,
+            batch_size=batch_size,
+            device=text_prompt.device,
+            continuous_dtype=continuous_prompt.dtype,
+        )
+        teacher_prefix_len = (
+            0
+            if normalized_teacher_discrete_prefix is None
+            else int(min(max_new_blocks, normalized_teacher_discrete_prefix.shape[1]))
+        )
 
         if text_eos_token_id is None:
             text_eos_token_id = self.backbone.config.eos_token_id
@@ -1140,33 +1210,37 @@ class PrismTTS(nn.Module):
         for step_idx in range(max_new_blocks):
             next_discrete_states = source_block_hidden[:, 1 : 1 + self.num_discrete_tokens, :]
             next_logits = self.discrete_lm_head(next_discrete_states)  # [B, N, V]
-            next_discrete = self._sample_discrete_ids(
-                next_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                do_sample=do_sample,
-            )
-            # next_discrete: [B, N]
-            special_block_mask = self._build_special_block_mask(
-                discrete_tokens=next_discrete,
-                special_token_ids=special_discrete_token_ids,
-            )
-            if special_block_mask.all():
-                next_continuous = torch.zeros(
-                    batch_size,
-                    self.continuous_latent_size,
-                    dtype=cur_continuous.dtype,
-                    device=cur_continuous.device,
-                )
+            if step_idx < teacher_prefix_len:
+                next_discrete = normalized_teacher_discrete_prefix[:, step_idx, :]
+                next_continuous = normalized_teacher_continuous_prefix[:, step_idx, :]
             else:
-                next_continuous = self.sample_continuous_latent(
-                    cond=self._discrete_condition(next_discrete),
-                    num_steps=flow_num_steps,
+                next_discrete = self._sample_discrete_ids(
+                    next_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    do_sample=do_sample,
                 )
-                if special_block_mask.any():
-                    next_continuous = next_continuous.clone()
-                    next_continuous[special_block_mask] = 0.0
+                # next_discrete: [B, N]
+                special_block_mask = self._build_special_block_mask(
+                    discrete_tokens=next_discrete,
+                    special_token_ids=special_discrete_token_ids,
+                )
+                if special_block_mask.all():
+                    next_continuous = torch.zeros(
+                        batch_size,
+                        self.continuous_latent_size,
+                        dtype=cur_continuous.dtype,
+                        device=cur_continuous.device,
+                    )
+                else:
+                    next_continuous = self.sample_continuous_latent(
+                        cond=self._discrete_condition(next_discrete),
+                        num_steps=flow_num_steps,
+                    )
+                    if special_block_mask.any():
+                        next_continuous = next_continuous.clone()
+                        next_continuous[special_block_mask] = 0.0
             # next_continuous: [B, C]
 
             # Match training alignment: EOS appears once at text boundary, then PAD tail.
@@ -1242,6 +1316,8 @@ class PrismTTS(nn.Module):
         do_sample: bool = True,
         flow_num_steps: Optional[int] = None,
         force_silent_special_tokens: bool = False,
+        teacher_forced_discrete_prefix: Optional[torch.LongTensor] = None,
+        teacher_forced_continuous_prefix: Optional[torch.FloatTensor] = None,
         return_dict: bool = True,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         # text_prompt: [B, L1]
@@ -1310,6 +1386,21 @@ class PrismTTS(nn.Module):
             max_new_blocks = max(1, int(target_lens.max().item()))
         if max_new_blocks < 1:
             raise ValueError("max_new_blocks must be at least 1.")
+        (
+            normalized_teacher_discrete_prefix,
+            normalized_teacher_continuous_prefix,
+        ) = self._normalize_teacher_forcing_prefix(
+            teacher_forced_discrete_prefix=teacher_forced_discrete_prefix,
+            teacher_forced_continuous_prefix=teacher_forced_continuous_prefix,
+            batch_size=batch_size,
+            device=text_prompt.device,
+            continuous_dtype=continuous_prompt.dtype,
+        )
+        teacher_prefix_len = (
+            0
+            if normalized_teacher_discrete_prefix is None
+            else int(min(max_new_blocks, normalized_teacher_discrete_prefix.shape[1]))
+        )
 
         if text_eos_token_id is None:
             text_eos_token_id = self.backbone.config.eos_token_id
@@ -1367,33 +1458,37 @@ class PrismTTS(nn.Module):
         for step_idx in range(max_new_blocks):
             source_discrete_states = source_block_hidden[:, 1 : 1 + self.num_discrete_tokens, :]
             next_logits = self.discrete_lm_head(source_discrete_states)  # [B, N, V]
-            next_discrete = self._sample_discrete_ids(
-                next_logits,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                do_sample=do_sample,
-            )
-            # next_discrete: [B, N]
-            special_block_mask = self._build_special_block_mask(
-                discrete_tokens=next_discrete,
-                special_token_ids=special_discrete_token_ids,
-            )
-            if special_block_mask.all():
-                next_continuous = torch.zeros(
-                    batch_size,
-                    self.continuous_latent_size,
-                    dtype=continuous_prompt.dtype,
-                    device=continuous_prompt.device,
-                )
+            if step_idx < teacher_prefix_len:
+                next_discrete = normalized_teacher_discrete_prefix[:, step_idx, :]
+                next_continuous = normalized_teacher_continuous_prefix[:, step_idx, :]
             else:
-                next_continuous = self.sample_continuous_latent(
-                    cond=self._discrete_condition(next_discrete),
-                    num_steps=flow_num_steps,
+                next_discrete = self._sample_discrete_ids(
+                    next_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    do_sample=do_sample,
                 )
-                if special_block_mask.any():
-                    next_continuous = next_continuous.clone()
-                    next_continuous[special_block_mask] = 0.0
+                # next_discrete: [B, N]
+                special_block_mask = self._build_special_block_mask(
+                    discrete_tokens=next_discrete,
+                    special_token_ids=special_discrete_token_ids,
+                )
+                if special_block_mask.all():
+                    next_continuous = torch.zeros(
+                        batch_size,
+                        self.continuous_latent_size,
+                        dtype=continuous_prompt.dtype,
+                        device=continuous_prompt.device,
+                    )
+                else:
+                    next_continuous = self.sample_continuous_latent(
+                        cond=self._discrete_condition(next_discrete),
+                        num_steps=flow_num_steps,
+                    )
+                    if special_block_mask.any():
+                        next_continuous = next_continuous.clone()
+                        next_continuous[special_block_mask] = 0.0
             # next_continuous: [B, C]
 
             # Match training alignment: EOS appears once at text boundary, then PAD tail.

@@ -726,6 +726,83 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             )
         )
 
+    def test_generation_teacher_forced_delay_prefix_is_respected(self) -> None:
+        batch_size = 1
+        prompt_len = 2
+        generated_len = 4
+        delay_prefix_len = 2
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+        delay_token_id = self.discrete_vocab_size - 2
+
+        text_prompt = torch.randint(
+            1,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            1,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+
+        teacher_discrete_prefix = torch.full(
+            (batch_size, self.num_discrete_tokens, delay_prefix_len),
+            fill_value=delay_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        teacher_continuous_prefix = torch.randn(
+            batch_size,
+            delay_prefix_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+
+        for method_name in ("generate", "generate_with_kv_cache"):
+            generation_method = getattr(self.model, method_name)
+            with torch.no_grad():
+                outputs = generation_method(
+                    text_prompt=text_prompt,
+                    discrete_prompt=discrete_prompt,
+                    continuous_prompt=continuous_prompt,
+                    text_target=text_target,
+                    max_new_blocks=generated_len,
+                    do_sample=False,
+                    discrete_eos_token_id=-1,
+                    teacher_forced_discrete_prefix=teacher_discrete_prefix,
+                    teacher_forced_continuous_prefix=teacher_continuous_prefix,
+                    return_dict=True,
+                )
+
+            self.assertTrue(
+                torch.equal(
+                    outputs.discrete_ids[:, :, :delay_prefix_len],
+                    teacher_discrete_prefix,
+                )
+            )
+            self.assertTrue(
+                torch.allclose(
+                    outputs.continuous_latents[:, :delay_prefix_len, :],
+                    teacher_continuous_prefix,
+                    atol=1e-6,
+                    rtol=1e-6,
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
