@@ -3,8 +3,8 @@
 # file_name|duration|transcript|target_npy|prompt_file_name|prompt_duration|prompt_transcript|prompt_npy
 
 data:
-  train_manifest: /astro/nghiahuynh/data/emilia/metadata-600-train.txt
-  val_manifest: /astro/nghiahuynh/data/emilia/metadata-600-val.txt
+  train_manifest: /astro/nghiahuynh/data/emilia/metadata-1000-max20-train.txt
+  val_manifest: /astro/nghiahuynh/data/emilia/metadata-1000-max20-val.txt
   test_manifest: null
   # Keep null to resolve relative paths against the manifest directory.
   manifest_root: null
@@ -33,7 +33,7 @@ data:
       # null -> derive from train_batch_size and a reference sequence-length quantile.
       memory_budget: null
       # Optional direct target in "cost units"; overrides utilization*memory_budget.
-      target_batch_cost: 3300000
+      target_batch_cost: 3000000
       # Quantile used when deriving memory_budget automatically.
       reference_length_quantile: 0.95
       # Upper bound for dynamic batch size (allows adding samples when memory is underused).
