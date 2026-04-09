@@ -949,6 +949,11 @@ class PrismTTS(nn.Module):
         # discrete_prompt normalized to [B, L, N]
         discrete_prompt = self._normalize_discrete_tokens(discrete_prompt, "discrete_prompt")
         prompt_len = text_prompt.shape[1]
+        if prompt_len < 1:
+            raise ValueError(
+                "Generation requires at least one prompt block because discrete prediction "
+                "is one-block autoregressive."
+            )
         continuous_prompt = self._normalize_continuous_latents(
             continuous_prompt,
             expected_len=prompt_len,
@@ -982,12 +987,6 @@ class PrismTTS(nn.Module):
                 text_eos_token_id = self.backbone.config.pad_token_id
             if text_eos_token_id is None:
                 text_eos_token_id = 0
-        discrete_draft_token_id = (
-            discrete_eos_token_id
-            if 0 <= discrete_eos_token_id < self.discrete_vocab_size
-            else 0
-        )
-
         cur_text = text_prompt  # [B, cur_L]
         cur_discrete = discrete_prompt  # [B, cur_L, N]
         cur_continuous = continuous_prompt  # [B, cur_L, C]
@@ -997,53 +996,26 @@ class PrismTTS(nn.Module):
         generated_continuous = []
         collected_logits = []
 
-        for step_idx in range(max_new_blocks):
-            if step_idx < target_len:
-                next_text = text_target[:, step_idx : step_idx + 1]
-            else:
-                next_text = torch.full(
-                    (batch_size, 1),
-                    fill_value=text_eos_token_id,
-                    dtype=cur_text.dtype,
-                    device=cur_text.device,
-                )
-
-            # Put text token into the block before sampling this block.
-            draft_discrete = torch.full(
-                (batch_size, 1, self.num_discrete_tokens),
-                fill_value=discrete_draft_token_id,
-                dtype=cur_discrete.dtype,
-                device=cur_discrete.device,
-            )
-            draft_continuous = torch.zeros(
-                batch_size,
-                1,
-                self.continuous_latent_size,
-                dtype=cur_continuous.dtype,
-                device=cur_continuous.device,
-            )
-            cur_text = torch.cat([cur_text, next_text], dim=1)  # [B, cur_L+1]
-            cur_discrete = torch.cat([cur_discrete, draft_discrete], dim=1)  # [B, cur_L+1, N]
-            cur_continuous = torch.cat([cur_continuous, draft_continuous], dim=1)  # [B, cur_L+1, C]
-
-            total_blocks = cur_text.shape[1]
+        def _last_block_hidden(
+            text_tokens: torch.LongTensor,
+            discrete_tokens: torch.LongTensor,
+            continuous_latents: torch.FloatTensor,
+        ) -> torch.Tensor:
+            total_blocks = text_tokens.shape[1]
             inputs_embeds, _ = self._build_inputs_embeds(
-                text_tokens=cur_text,
-                discrete_tokens=cur_discrete,
-                continuous_latents=cur_continuous,
+                text_tokens=text_tokens,
+                discrete_tokens=discrete_tokens,
+                continuous_latents=continuous_latents,
             )
-            # inputs_embeds: [B, cur_L * block_size, H]
             stream_mask, block_mask = self._build_dual_attention_masks(
                 total_blocks=total_blocks,
                 batch_size=batch_size,
                 device=inputs_embeds.device,
             )
-            # stream_mask enforces same-stream AR, block_mask lets each stream read full past blocks.
             position_embeddings = self._build_two_level_rope_position_embeddings(
                 inputs_embeds=inputs_embeds,
                 total_blocks=total_blocks,
             )
-            # position_embeddings = (cos, sin), each [B, T, head_dim]
             backbone_outputs = self.backbone(
                 inputs_embeds=inputs_embeds,
                 streamwise_attention_mask=stream_mask,
@@ -1051,18 +1023,17 @@ class PrismTTS(nn.Module):
                 position_embeddings=position_embeddings,
                 return_dict=True,
             )
-            # backbone_outputs.last_hidden_state: [B, T, H]
+            return backbone_outputs.last_hidden_state[:, -self.block_size :, :]
 
-            block_hidden = backbone_outputs.last_hidden_state.reshape(
-                batch_size,
-                total_blocks,
-                self.block_size,
-                self.hidden_size,
-            )
-            # block_hidden: [B, cur_L, block_size, H]
-            # Predict this block's discrete tokens from the just-injected block.
-            next_discrete_states = block_hidden[:, -1, 1 : 1 + self.num_discrete_tokens, :]
-            # next_discrete_states: [B, N, H]
+        # Discrete prediction is one-block AR: source is the latest finalized block.
+        source_block_hidden = _last_block_hidden(
+            text_tokens=cur_text,
+            discrete_tokens=cur_discrete,
+            continuous_latents=cur_continuous,
+        )
+
+        for step_idx in range(max_new_blocks):
+            next_discrete_states = source_block_hidden[:, 1 : 1 + self.num_discrete_tokens, :]
             next_logits = self.discrete_lm_head(next_discrete_states)  # [B, N, V]
             next_discrete = self._sample_discrete_ids(
                 next_logits,
@@ -1078,12 +1049,25 @@ class PrismTTS(nn.Module):
             )
             # next_continuous: [B, C]
 
-            cur_discrete[:, -1, :] = next_discrete
-            cur_continuous[:, -1, :] = next_continuous
+            if step_idx < target_len:
+                next_text = text_target[:, step_idx : step_idx + 1]
+            else:
+                next_text = torch.full(
+                    (batch_size, 1),
+                    fill_value=text_eos_token_id,
+                    dtype=cur_text.dtype,
+                    device=cur_text.device,
+                )
+
+            finalized_discrete = next_discrete.unsqueeze(1)  # [B, 1, N]
+            finalized_continuous = next_continuous.unsqueeze(1)  # [B, 1, C]
+            cur_text = torch.cat([cur_text, next_text], dim=1)  # [B, cur_L+1]
+            cur_discrete = torch.cat([cur_discrete, finalized_discrete], dim=1)  # [B, cur_L+1, N]
+            cur_continuous = torch.cat([cur_continuous, finalized_continuous], dim=1)  # [B, cur_L+1, C]
 
             generated_text.append(next_text)
-            generated_discrete.append(next_discrete.unsqueeze(1))  # each: [B, 1, N]
-            generated_continuous.append(next_continuous.unsqueeze(1))  # each: [B, 1, C]
+            generated_discrete.append(finalized_discrete)  # each: [B, 1, N]
+            generated_continuous.append(finalized_continuous)  # each: [B, 1, C]
             collected_logits.append(next_logits)
 
             eos_block = (next_text.squeeze(-1) == text_eos_token_id) & (
@@ -1091,6 +1075,12 @@ class PrismTTS(nn.Module):
             ).all(dim=-1)
             if eos_block.all():
                 break
+
+            source_block_hidden = _last_block_hidden(
+                text_tokens=cur_text,
+                discrete_tokens=cur_discrete,
+                continuous_latents=cur_continuous,
+            )
 
         generated_text = torch.cat(generated_text, dim=1)
         # generated_text: [B, Lgen]
@@ -1131,6 +1121,11 @@ class PrismTTS(nn.Module):
         # discrete_prompt normalized to [B, L1, N]
         discrete_prompt = self._normalize_discrete_tokens(discrete_prompt, "discrete_prompt")
         prompt_len = text_prompt.shape[1]
+        if prompt_len < 1:
+            raise ValueError(
+                "Generation requires at least one prompt block because discrete prediction "
+                "is one-block autoregressive."
+            )
         continuous_prompt = self._normalize_continuous_latents(
             continuous_prompt,
             expected_len=prompt_len,
@@ -1164,40 +1159,35 @@ class PrismTTS(nn.Module):
                 text_eos_token_id = self.backbone.config.pad_token_id
             if text_eos_token_id is None:
                 text_eos_token_id = 0
-        discrete_draft_token_id = (
-            discrete_eos_token_id
-            if 0 <= discrete_eos_token_id < self.discrete_vocab_size
-            else 0
-        )
-
         past_key_values = None
-        if prompt_len > 0:
-            prompt_embeds, _ = self._build_inputs_embeds(
-                text_tokens=text_prompt,
-                discrete_tokens=discrete_prompt,
-                continuous_latents=continuous_prompt,
-            )
-            # prompt_embeds: [B, L1 * block_size, H]
-            prompt_stream_mask, prompt_block_mask = self._build_dual_attention_masks(
-                total_blocks=prompt_len,
-                batch_size=batch_size,
-                device=prompt_embeds.device,
-            )
-            # Prompt prefill uses the same stream/block visibility rules as full forward pass.
-            prompt_position_embeddings = self._build_two_level_rope_position_embeddings(
-                inputs_embeds=prompt_embeds,
-                total_blocks=prompt_len,
-            )
-            # prompt_position_embeddings = (cos, sin), each [B, T1, head_dim]
-            prompt_outputs = self.backbone(
-                inputs_embeds=prompt_embeds,
-                streamwise_attention_mask=prompt_stream_mask,
-                blockwise_attention_mask=prompt_block_mask,
-                position_embeddings=prompt_position_embeddings,
-                use_cache=True,
-                return_dict=True,
-            )
-            past_key_values = prompt_outputs.past_key_values
+        prompt_embeds, _ = self._build_inputs_embeds(
+            text_tokens=text_prompt,
+            discrete_tokens=discrete_prompt,
+            continuous_latents=continuous_prompt,
+        )
+        # prompt_embeds: [B, L1 * block_size, H]
+        prompt_stream_mask, prompt_block_mask = self._build_dual_attention_masks(
+            total_blocks=prompt_len,
+            batch_size=batch_size,
+            device=prompt_embeds.device,
+        )
+        # Prompt prefill uses the same stream/block visibility rules as full forward pass.
+        prompt_position_embeddings = self._build_two_level_rope_position_embeddings(
+            inputs_embeds=prompt_embeds,
+            total_blocks=prompt_len,
+        )
+        # prompt_position_embeddings = (cos, sin), each [B, T1, head_dim]
+        prompt_outputs = self.backbone(
+            inputs_embeds=prompt_embeds,
+            streamwise_attention_mask=prompt_stream_mask,
+            blockwise_attention_mask=prompt_block_mask,
+            position_embeddings=prompt_position_embeddings,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = prompt_outputs.past_key_values
+        # Discrete prediction is one-block AR: source is the latest finalized block.
+        source_block_hidden = prompt_outputs.last_hidden_state[:, -self.block_size :, :]
 
         generated_text = []
         generated_discrete = []
@@ -1205,76 +1195,10 @@ class PrismTTS(nn.Module):
         collected_logits = []
 
         for step_idx in range(max_new_blocks):
-            if step_idx < target_len:
-                next_text = text_target[:, step_idx : step_idx + 1]
-            else:
-                next_text = torch.full(
-                    (batch_size, 1),
-                    fill_value=text_eos_token_id,
-                    dtype=text_prompt.dtype,
-                    device=text_prompt.device,
-                )
-            # next_text: [B, 1]
-
-            draft_discrete = torch.full(
-                (batch_size, 1, self.num_discrete_tokens),
-                fill_value=discrete_draft_token_id,
-                dtype=discrete_prompt.dtype,
-                device=discrete_prompt.device,
-            )
-            # draft_discrete: [B, 1, N]
-            draft_continuous = torch.zeros(
-                batch_size,
-                1,
-                self.continuous_latent_size,
-                dtype=continuous_prompt.dtype,
-                device=continuous_prompt.device,
-            )
-            # draft_continuous: [B, 1, C]
-
-            # Proposal pass to sample discrete tokens for this block.
-            proposal_embeds, _ = self._build_inputs_embeds(
-                text_tokens=next_text,
-                discrete_tokens=draft_discrete,
-                continuous_latents=draft_continuous,
-            )
-            # proposal_embeds: [B, block_size, H]
-            block_idx = prompt_len + step_idx
-            total_blocks = block_idx + 1
-            step_stream_mask, step_block_mask = self._build_step_attention_masks(
-                batch_size=batch_size,
-                total_blocks=total_blocks,
-                block_idx=block_idx,
-                device=proposal_embeds.device,
-            )
-            # Step masks limit queries to current block while preserving full key history.
-            step_position_embeddings = self._build_step_rope_position_embeddings(
-                inputs_embeds=proposal_embeds,
-                block_idx=block_idx,
-            )
-            # step_position_embeddings = (cos, sin), each [B, block_size, head_dim]
-
-            past_seq_len = 0 if past_key_values is None else past_key_values.get_seq_length()
-            proposal_outputs = self.backbone(
-                inputs_embeds=proposal_embeds,
-                streamwise_attention_mask=step_stream_mask,
-                blockwise_attention_mask=step_block_mask,
-                position_embeddings=step_position_embeddings,
-                past_key_values=past_key_values,
-                use_cache=True,
-                return_dict=True,
-            )
-            past_key_values = proposal_outputs.past_key_values
-            # proposal_outputs.last_hidden_state: [B, block_size, H]
-            proposal_discrete_states = proposal_outputs.last_hidden_state[
-                :,
-                1 : 1 + self.num_discrete_tokens,
-                :,
-            ]
-            # proposal_discrete_states: [B, N, H]
-            proposal_logits = self.discrete_lm_head(proposal_discrete_states)  # [B, N, V]
+            source_discrete_states = source_block_hidden[:, 1 : 1 + self.num_discrete_tokens, :]
+            next_logits = self.discrete_lm_head(source_discrete_states)  # [B, N, V]
             next_discrete = self._sample_discrete_ids(
-                proposal_logits,
+                next_logits,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
@@ -1287,9 +1211,16 @@ class PrismTTS(nn.Module):
             )
             # next_continuous: [B, C]
 
-            # Remove drafted KV states, then append finalized block KV states.
-            if past_key_values is not None:
-                past_key_values.crop(past_seq_len)
+            if step_idx < target_len:
+                next_text = text_target[:, step_idx : step_idx + 1]
+            else:
+                next_text = torch.full(
+                    (batch_size, 1),
+                    fill_value=text_eos_token_id,
+                    dtype=text_prompt.dtype,
+                    device=text_prompt.device,
+                )
+            # next_text: [B, 1]
 
             finalized_discrete = next_discrete.unsqueeze(1)  # [B, 1, N]
             finalized_continuous = next_continuous.unsqueeze(1)  # [B, 1, C]
@@ -1299,7 +1230,22 @@ class PrismTTS(nn.Module):
                 continuous_latents=finalized_continuous,
             )
             # finalized_embeds: [B, block_size, H]
-            finalize_outputs = self.backbone(
+            block_idx = prompt_len + step_idx
+            total_blocks = block_idx + 1
+            step_stream_mask, step_block_mask = self._build_step_attention_masks(
+                batch_size=batch_size,
+                total_blocks=total_blocks,
+                block_idx=block_idx,
+                device=finalized_embeds.device,
+            )
+            # Step masks limit queries to current block while preserving full key history.
+            step_position_embeddings = self._build_step_rope_position_embeddings(
+                inputs_embeds=finalized_embeds,
+                block_idx=block_idx,
+            )
+            # step_position_embeddings = (cos, sin), each [B, block_size, head_dim]
+
+            step_outputs = self.backbone(
                 inputs_embeds=finalized_embeds,
                 streamwise_attention_mask=step_stream_mask,
                 blockwise_attention_mask=step_block_mask,
@@ -1308,12 +1254,13 @@ class PrismTTS(nn.Module):
                 use_cache=True,
                 return_dict=True,
             )
-            past_key_values = finalize_outputs.past_key_values
+            past_key_values = step_outputs.past_key_values
+            source_block_hidden = step_outputs.last_hidden_state
 
             generated_text.append(next_text)
             generated_discrete.append(finalized_discrete)  # each: [B, 1, N]
             generated_continuous.append(finalized_continuous)  # each: [B, 1, C]
-            collected_logits.append(proposal_logits)
+            collected_logits.append(next_logits)
 
             eos_block = (next_text.squeeze(-1) == text_eos_token_id) & (
                 next_discrete == discrete_eos_token_id

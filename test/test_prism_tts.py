@@ -383,5 +383,175 @@ class TestPrismTTS(unittest.TestCase):
         )
 
 
+class TestPrismTTSGenerationAlignment(unittest.TestCase):
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        self.device = torch.device("cpu")
+        self.num_discrete_tokens = 3
+        self.discrete_vocab_size = 64
+        self.continuous_latent_size = 8
+        self.model = PrismTTS(
+            llama_config=make_small_config(),
+            num_discrete_tokens=self.num_discrete_tokens,
+            discrete_vocab_size=self.discrete_vocab_size,
+            continuous_latent_size=self.continuous_latent_size,
+            flow_sample_steps=2,
+        ).to(self.device)
+        self.model.eval()
+
+    def test_generate_and_generate_with_kv_cache_match_under_fixed_seed(self) -> None:
+        batch_size = 2
+        prompt_len = 3
+        generated_len = 4
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            torch.manual_seed(123)
+            full_outputs = self.model.generate(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                max_new_blocks=generated_len,
+                do_sample=False,
+                return_dict=True,
+            )
+            torch.manual_seed(123)
+            kv_outputs = self.model.generate_with_kv_cache(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                max_new_blocks=generated_len,
+                do_sample=False,
+                return_dict=True,
+            )
+
+        self.assertTrue(torch.equal(full_outputs.text_ids, kv_outputs.text_ids))
+        self.assertTrue(torch.equal(full_outputs.discrete_ids, kv_outputs.discrete_ids))
+        self.assertTrue(
+            torch.allclose(
+                full_outputs.continuous_latents,
+                kv_outputs.continuous_latents,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertEqual(len(full_outputs.discrete_logits), len(kv_outputs.discrete_logits))
+        for full_logits, kv_logits in zip(full_outputs.discrete_logits, kv_outputs.discrete_logits):
+            self.assertTrue(torch.allclose(full_logits, kv_logits, atol=1e-5, rtol=1e-5))
+
+    def test_generate_first_step_logits_use_last_prompt_block(self) -> None:
+        batch_size = 1
+        prompt_len = 3
+        generated_len = 2
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+
+        normalized_discrete_prompt = self.model._normalize_discrete_tokens(
+            discrete_prompt,
+            "discrete_prompt",
+        )
+        with torch.no_grad():
+            prompt_embeds, _ = self.model._build_inputs_embeds(
+                text_tokens=text_prompt,
+                discrete_tokens=normalized_discrete_prompt,
+                continuous_latents=continuous_prompt,
+            )
+            prompt_stream_mask, prompt_block_mask = self.model._build_dual_attention_masks(
+                total_blocks=prompt_len,
+                batch_size=batch_size,
+                device=prompt_embeds.device,
+            )
+            prompt_position_embeddings = self.model._build_two_level_rope_position_embeddings(
+                inputs_embeds=prompt_embeds,
+                total_blocks=prompt_len,
+            )
+            prompt_outputs = self.model.backbone(
+                inputs_embeds=prompt_embeds,
+                streamwise_attention_mask=prompt_stream_mask,
+                blockwise_attention_mask=prompt_block_mask,
+                position_embeddings=prompt_position_embeddings,
+                return_dict=True,
+            )
+            last_prompt_block_hidden = prompt_outputs.last_hidden_state[
+                :,
+                -self.model.block_size :,
+                :,
+            ]
+            expected_first_logits = self.model.discrete_lm_head(
+                last_prompt_block_hidden[:, 1 : 1 + self.num_discrete_tokens, :]
+            )
+
+            generation = self.model.generate(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                max_new_blocks=generated_len,
+                do_sample=False,
+                return_dict=True,
+            )
+
+        self.assertGreaterEqual(len(generation.discrete_logits), 1)
+        self.assertTrue(
+            torch.allclose(
+                generation.discrete_logits[0],
+                expected_first_logits,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

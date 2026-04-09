@@ -819,15 +819,13 @@ else:
             )
             pred_continuous = generation.continuous_latents
 
-            target_len = min(int(target_continuous.shape[1]), int(pred_continuous.shape[1]))
-            if target_len < 1:
-                return None
-
-            target_continuous = target_continuous[:, :target_len, :]
-            pred_continuous = pred_continuous[:, :target_len, :]
-
             # Keep eval-stage media payload small and deterministic: log exactly one sample.
-            num_samples = min(1, self.max_audio_samples, int(target_continuous.shape[0]))
+            num_samples = min(
+                1,
+                self.max_audio_samples,
+                int(target_continuous.shape[0]),
+                int(pred_continuous.shape[0]),
+            )
             table = wandb.Table(
                 columns=[
                     "sample_id",
@@ -840,8 +838,24 @@ else:
 
             added = 0
             for sample_idx in range(num_samples):
-                target_audio = self._decode_audio(target_continuous[sample_idx])
-                synth_audio = self._decode_audio(pred_continuous[sample_idx])
+                sample_target_len = min(
+                    int(target_continuous.shape[1]),
+                    int(pred_continuous.shape[1]),
+                )
+                if batch_inputs.target_lengths is not None:
+                    target_lengths = torch.as_tensor(batch_inputs.target_lengths, device=self.device)
+                    if target_lengths.dim() == 0:
+                        target_lengths = target_lengths.unsqueeze(0)
+                    if sample_idx < int(target_lengths.shape[0]):
+                        sample_target_len = min(
+                            sample_target_len,
+                            int(target_lengths[sample_idx].item()),
+                        )
+                if sample_target_len < 1:
+                    continue
+
+                target_audio = self._decode_audio(target_continuous[sample_idx, :sample_target_len, :])
+                synth_audio = self._decode_audio(pred_continuous[sample_idx, :sample_target_len, :])
                 if target_audio is None or synth_audio is None:
                     continue
 
