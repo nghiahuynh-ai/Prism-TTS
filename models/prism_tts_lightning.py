@@ -638,6 +638,7 @@ else:
                             target_lengths=torch.tensor([target_len], device=self.device),
                             max_new_blocks=target_len,
                             do_sample=False,
+                            force_silent_special_tokens=False,
                             return_dict=True,
                         )
             finally:
@@ -863,6 +864,10 @@ else:
             table = wandb.Table(
                 columns=[
                     "sample_id",
+                    "pred_special_block_ratio",
+                    "pred_discrete_unique",
+                    "pred_latent_std",
+                    "pred_latent_delta_std",
                     "target_audio",
                     "target_mel_spectrogram",
                     "synthesized_audio",
@@ -888,8 +893,42 @@ else:
                 if sample_target_len < 1:
                     continue
 
-                target_audio = self._decode_audio(target_continuous[sample_idx, :sample_target_len, :])
-                synth_audio = self._decode_audio(pred_continuous[sample_idx, :sample_target_len, :])
+                sample_target_continuous = target_continuous[sample_idx, :sample_target_len, :]
+                sample_pred_continuous = pred_continuous[sample_idx, :sample_target_len, :]
+
+                special_block_ratio = float("nan")
+                discrete_unique = 0
+                pred_discrete = generation.discrete_ids
+                if pred_discrete is not None:
+                    pred_discrete = self.model._normalize_discrete_tokens(
+                        pred_discrete[sample_idx : sample_idx + 1],
+                        "generation.discrete_ids",
+                    )[0, :sample_target_len, :]
+                    discrete_unique = int(torch.unique(pred_discrete).numel())
+
+                    discrete_eos = self.model._resolve_generation_discrete_eos_token_id(None)
+                    special_ids = self.model._infer_special_discrete_token_ids(discrete_eos)
+                    if len(special_ids) > 0:
+                        special_tensor = torch.tensor(
+                            special_ids,
+                            dtype=pred_discrete.dtype,
+                            device=pred_discrete.device,
+                        )
+                        special_blocks = torch.isin(pred_discrete, special_tensor).all(dim=-1)
+                        special_block_ratio = float(special_blocks.float().mean().item())
+
+                pred_latent_std = float(sample_pred_continuous.std(unbiased=False).item())
+                if sample_pred_continuous.shape[0] > 1:
+                    pred_latent_delta_std = float(
+                        (sample_pred_continuous[1:] - sample_pred_continuous[:-1])
+                        .std(unbiased=False)
+                        .item()
+                    )
+                else:
+                    pred_latent_delta_std = 0.0
+
+                target_audio = self._decode_audio(sample_target_continuous)
+                synth_audio = self._decode_audio(sample_pred_continuous)
                 if target_audio is None or synth_audio is None:
                     continue
 
@@ -904,6 +943,10 @@ else:
 
                 table.add_data(
                     sample_idx,
+                    special_block_ratio,
+                    discrete_unique,
+                    pred_latent_std,
+                    pred_latent_delta_std,
                     wandb.Audio(
                         target_audio,
                         sample_rate=self.audio_sample_rate,

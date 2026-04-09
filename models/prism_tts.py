@@ -374,11 +374,16 @@ class PrismTTS(nn.Module):
         text_tokens: torch.LongTensor,
         discrete_tokens: torch.LongTensor,
         continuous_latents: torch.FloatTensor,
+        inject_continuous_noise: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         text_embeds = self.text_embedding(text_tokens).unsqueeze(2)  # [B, L, 1, H]
         discrete_embeds = self.discrete_embedding(discrete_tokens)  # [B, L, N, H]
-        noised_continuous = self._inject_continuous_latent_noise(continuous_latents)
-        continuous_embeds = self.continuous_proj(noised_continuous).unsqueeze(2)  # [B, L, 1, H]
+        continuous_inputs = (
+            self._inject_continuous_latent_noise(continuous_latents)
+            if inject_continuous_noise
+            else continuous_latents
+        )
+        continuous_embeds = self.continuous_proj(continuous_inputs).unsqueeze(2)  # [B, L, 1, H]
 
         block_embeds = torch.cat([text_embeds, discrete_embeds, continuous_embeds], dim=2)
         block_embeds = block_embeds + self.stream_type_embeddings.view(
@@ -917,6 +922,7 @@ class PrismTTS(nn.Module):
             text_tokens=full_text,
             discrete_tokens=full_discrete,
             continuous_latents=full_continuous,
+            inject_continuous_noise=bool(self.training),
         )
         # inputs_embeds: [B, (L1 + L2) * block_size, H]
         stream_mask, block_mask = self._build_dual_attention_masks(
@@ -998,7 +1004,7 @@ class PrismTTS(nn.Module):
         top_p: float = 0.95,
         do_sample: bool = True,
         flow_num_steps: Optional[int] = None,
-        force_silent_special_tokens: bool = True,
+        force_silent_special_tokens: bool = False,
         return_dict: bool = True,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         # text_prompt: [B, L1]
@@ -1074,6 +1080,9 @@ class PrismTTS(nn.Module):
                 text_eos_token_id = self.backbone.config.pad_token_id
             if text_eos_token_id is None:
                 text_eos_token_id = 0
+        text_pad_token_id = self.backbone.config.pad_token_id
+        if text_pad_token_id is None:
+            text_pad_token_id = text_eos_token_id
         discrete_eos_token_id = self._resolve_generation_discrete_eos_token_id(
             discrete_eos_token_id
         )
@@ -1101,6 +1110,7 @@ class PrismTTS(nn.Module):
                 text_tokens=text_tokens,
                 discrete_tokens=discrete_tokens,
                 continuous_latents=continuous_latents,
+                inject_continuous_noise=False,
             )
             stream_mask, block_mask = self._build_dual_attention_masks(
                 total_blocks=total_blocks,
@@ -1159,15 +1169,19 @@ class PrismTTS(nn.Module):
                     next_continuous[special_block_mask] = 0.0
             # next_continuous: [B, C]
 
+            # Match training alignment: EOS appears once at text boundary, then PAD tail.
             next_text = torch.full(
                 (batch_size, 1),
-                fill_value=text_eos_token_id,
+                fill_value=int(text_pad_token_id),
                 dtype=cur_text.dtype,
                 device=cur_text.device,
             )
             use_teacher = step_idx < target_lens
             if step_idx < target_len and use_teacher.any():
                 next_text[use_teacher, 0] = text_target[use_teacher, step_idx]
+            post_teacher_eos = step_idx == target_lens
+            if post_teacher_eos.any():
+                next_text[post_teacher_eos, 0] = int(text_eos_token_id)
 
             finalized_discrete = next_discrete.unsqueeze(1)  # [B, 1, N]
             finalized_continuous = next_continuous.unsqueeze(1)  # [B, 1, C]
@@ -1180,9 +1194,10 @@ class PrismTTS(nn.Module):
             generated_continuous.append(finalized_continuous)  # each: [B, 1, C]
             collected_logits.append(next_logits)
 
-            eos_block = (next_text.squeeze(-1) == text_eos_token_id) & (
-                next_discrete == discrete_eos_token_id
-            ).all(dim=-1)
+            # Discrete EOS marks acoustic stop; text can already be PAD at that point.
+            eos_block = (next_discrete == discrete_eos_token_id).all(dim=-1) & (
+                step_idx >= (target_lens - 1).clamp(min=0)
+            )
             if eos_block.all():
                 break
 
@@ -1226,7 +1241,7 @@ class PrismTTS(nn.Module):
         top_p: float = 0.95,
         do_sample: bool = True,
         flow_num_steps: Optional[int] = None,
-        force_silent_special_tokens: bool = True,
+        force_silent_special_tokens: bool = False,
         return_dict: bool = True,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         # text_prompt: [B, L1]
@@ -1302,6 +1317,9 @@ class PrismTTS(nn.Module):
                 text_eos_token_id = self.backbone.config.pad_token_id
             if text_eos_token_id is None:
                 text_eos_token_id = 0
+        text_pad_token_id = self.backbone.config.pad_token_id
+        if text_pad_token_id is None:
+            text_pad_token_id = text_eos_token_id
         discrete_eos_token_id = self._resolve_generation_discrete_eos_token_id(
             discrete_eos_token_id
         )
@@ -1315,6 +1333,7 @@ class PrismTTS(nn.Module):
             text_tokens=text_prompt,
             discrete_tokens=discrete_prompt,
             continuous_latents=continuous_prompt,
+            inject_continuous_noise=False,
         )
         # prompt_embeds: [B, L1 * block_size, H]
         prompt_stream_mask, prompt_block_mask = self._build_dual_attention_masks(
@@ -1377,15 +1396,19 @@ class PrismTTS(nn.Module):
                     next_continuous[special_block_mask] = 0.0
             # next_continuous: [B, C]
 
+            # Match training alignment: EOS appears once at text boundary, then PAD tail.
             next_text = torch.full(
                 (batch_size, 1),
-                fill_value=text_eos_token_id,
+                fill_value=int(text_pad_token_id),
                 dtype=text_prompt.dtype,
                 device=text_prompt.device,
             )
             use_teacher = step_idx < target_lens
             if step_idx < target_len and use_teacher.any():
                 next_text[use_teacher, 0] = text_target[use_teacher, step_idx]
+            post_teacher_eos = step_idx == target_lens
+            if post_teacher_eos.any():
+                next_text[post_teacher_eos, 0] = int(text_eos_token_id)
             # next_text: [B, 1]
 
             finalized_discrete = next_discrete.unsqueeze(1)  # [B, 1, N]
@@ -1394,6 +1417,7 @@ class PrismTTS(nn.Module):
                 text_tokens=next_text,
                 discrete_tokens=finalized_discrete,
                 continuous_latents=finalized_continuous,
+                inject_continuous_noise=False,
             )
             # finalized_embeds: [B, block_size, H]
             block_idx = prompt_len + step_idx
@@ -1428,9 +1452,10 @@ class PrismTTS(nn.Module):
             generated_continuous.append(finalized_continuous)  # each: [B, 1, C]
             collected_logits.append(next_logits)
 
-            eos_block = (next_text.squeeze(-1) == text_eos_token_id) & (
-                next_discrete == discrete_eos_token_id
-            ).all(dim=-1)
+            # Discrete EOS marks acoustic stop; text can already be PAD at that point.
+            eos_block = (next_discrete == discrete_eos_token_id).all(dim=-1) & (
+                step_idx >= (target_lens - 1).clamp(min=0)
+            )
             if eos_block.all():
                 break
 
