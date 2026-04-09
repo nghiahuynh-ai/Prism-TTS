@@ -629,7 +629,7 @@ else:
                 with self._ema_scope(enabled=self.use_ema_for_periodic_eval):
                     self.model.eval()
                     with torch.no_grad():
-                        generation = self.model.generate_with_kv_cache(
+                        generation = self.model.generate(
                             text_prompt=text_prompt,
                             discrete_prompt=discrete_prompt,
                             continuous_prompt=continuous_prompt,
