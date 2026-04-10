@@ -429,7 +429,9 @@ class PrismTTS(nn.Module):
         self,
         continuous_latents: torch.FloatTensor,
     ) -> torch.FloatTensor:
-        if not self.training:
+        # Keep latent corruption strictly in train-step paths (with gradients).
+        # Inference/generation often uses no_grad() and must preserve raw latents.
+        if not self.training or not torch.is_grad_enabled():
             return continuous_latents
         noise_levels = torch.rand(
             continuous_latents.shape[0],

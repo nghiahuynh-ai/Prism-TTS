@@ -326,6 +326,32 @@ class TestPrismTTS(unittest.TestCase):
         expected = [5.0, 11.0, 12.0, 1.0, 6.0, 21.0, 22.0, 2.0, 7.0, 31.0, 32.0, 3.0]
         self.assertEqual(observed, expected)
 
+    def test_continuous_latent_noise_applies_only_with_grad_enabled(self):
+        model = PrismTTS(
+            llama_config=make_small_config(),
+            num_discrete_tokens=1,
+            discrete_vocab_size=64,
+            continuous_latent_size=4,
+            flow_num_res_blocks=1,
+            flow_sample_steps=2,
+        ).to(self.device)
+
+        continuous = torch.zeros(2, 3, 4, device=self.device)
+
+        model.train()
+        with torch.no_grad():
+            no_grad_out = model._inject_continuous_latent_noise(continuous)
+        self.assertTrue(torch.equal(no_grad_out, continuous))
+
+        with torch.enable_grad():
+            grad_out = model._inject_continuous_latent_noise(continuous)
+        self.assertFalse(torch.equal(grad_out, continuous))
+
+        model.eval()
+        with torch.enable_grad():
+            eval_out = model._inject_continuous_latent_noise(continuous)
+        self.assertTrue(torch.equal(eval_out, continuous))
+
     def test_build_dual_attention_masks_match_expected_layouts(self):
         model = PrismTTS(
             llama_config=make_small_config(),
