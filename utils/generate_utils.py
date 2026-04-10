@@ -38,6 +38,7 @@ __all__ = [
     "safe_tokenize",
     "save_mel_spectrogram_plot",
     "summarize_discrete_generation",
+    "trim_latent_special_blocks",
     "trim_latent_tail_from_special_blocks",
     "write_wav",
 ]
@@ -100,6 +101,12 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
         text_loss_weight=float(prism_cfg.get("text_loss_weight", 0.1)),
+        discrete_regular_token_loss_weight=float(
+            prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
+        ),
+        discrete_special_token_loss_weight=float(
+            prism_cfg.get("discrete_special_token_loss_weight", 1.0)
+        ),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 16)),
     )
 
@@ -645,6 +652,25 @@ def trim_latent_tail_from_special_blocks(
     num_discrete_tokens: int,
     special_token_ids: tuple[int, ...],
 ) -> torch.FloatTensor:
+    return trim_latent_special_blocks(
+        latents=latents,
+        discrete_ids=discrete_ids,
+        num_discrete_tokens=num_discrete_tokens,
+        special_token_ids=special_token_ids,
+        trim_head=False,
+        trim_tail=True,
+    )
+
+
+def trim_latent_special_blocks(
+    *,
+    latents: torch.FloatTensor,
+    discrete_ids: torch.LongTensor,
+    num_discrete_tokens: int,
+    special_token_ids: tuple[int, ...],
+    trim_head: bool = True,
+    trim_tail: bool = True,
+) -> torch.FloatTensor:
     discrete_by_time = _normalize_generated_discrete(
         discrete_ids=discrete_ids,
         expected_stream_count=num_discrete_tokens,
@@ -665,10 +691,11 @@ def trim_latent_tail_from_special_blocks(
     if non_special_indices.numel() == 0:
         return latents
 
-    keep_length = int(non_special_indices[-1].item()) + 1
-    if keep_length <= 0:
+    keep_start = 0 if not trim_head else int(non_special_indices[0].item())
+    keep_end = int(latents.shape[0]) if not trim_tail else int(non_special_indices[-1].item()) + 1
+    if keep_end <= keep_start:
         return latents
-    return latents[:keep_length]
+    return latents[keep_start:keep_end]
 
 
 def safe_tokenize(tokenizer: SharedVocabTokenizer, text: str, field_name: str) -> torch.LongTensor:

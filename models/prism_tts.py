@@ -45,6 +45,8 @@ class PrismTTS(nn.Module):
         flow_model_channels: Optional[int] = None,
         flow_loss_weight: float = 1.0,
         text_loss_weight: float = 0.1,
+        discrete_regular_token_loss_weight: float = 1.0,
+        discrete_special_token_loss_weight: float = 1.0,
         flow_sample_steps: int = 16,
     ):
         super().__init__()
@@ -61,6 +63,18 @@ class PrismTTS(nn.Module):
             raise ValueError("continuous_latent_size must be at least 1.")
         if text_loss_weight < 0.0:
             raise ValueError("text_loss_weight must be >= 0.")
+        if discrete_regular_token_loss_weight < 0.0:
+            raise ValueError("discrete_regular_token_loss_weight must be >= 0.")
+        if discrete_special_token_loss_weight < 0.0:
+            raise ValueError("discrete_special_token_loss_weight must be >= 0.")
+        if (
+            discrete_regular_token_loss_weight == 0.0
+            and discrete_special_token_loss_weight == 0.0
+        ):
+            raise ValueError(
+                "At least one of discrete_regular_token_loss_weight or "
+                "discrete_special_token_loss_weight must be > 0."
+            )
         if flow_sample_steps < 1:
             raise ValueError("flow_sample_steps must be at least 1.")
 
@@ -71,6 +85,8 @@ class PrismTTS(nn.Module):
         self.block_size = num_discrete_tokens + 2  # text + N discrete + continuous
         self.flow_loss_weight = flow_loss_weight
         self.text_loss_weight = text_loss_weight
+        self.discrete_regular_token_loss_weight = float(discrete_regular_token_loss_weight)
+        self.discrete_special_token_loss_weight = float(discrete_special_token_loss_weight)
         self.flow_sample_steps = flow_sample_steps
 
         self.backbone = LlamaBackbone(llama_config)
@@ -89,6 +105,9 @@ class PrismTTS(nn.Module):
             out_channels=continuous_latent_size,
             z_channels=self.hidden_size,
             num_res_blocks=flow_num_res_blocks,
+        )
+        self.training_special_discrete_token_ids = self._infer_special_discrete_token_ids(
+            self._resolve_generation_discrete_eos_token_id(None)
         )
 
         self.reset_parameters()
@@ -578,7 +597,37 @@ class PrismTTS(nn.Module):
 
         if not valid_targets.any():
             return hidden_states.new_zeros(())
-        return F.cross_entropy(discrete_logits[valid_targets], target_discrete_tokens[valid_targets])
+        selected_logits = discrete_logits[valid_targets]
+        selected_targets = target_discrete_tokens[valid_targets]
+        token_losses = F.cross_entropy(
+            selected_logits,
+            selected_targets,
+            reduction="none",
+        )
+
+        regular_weight = float(self.discrete_regular_token_loss_weight)
+        special_weight = float(self.discrete_special_token_loss_weight)
+        if regular_weight == 1.0 and special_weight == 1.0:
+            return token_losses.mean()
+
+        weights = torch.full_like(token_losses, regular_weight)
+        if len(self.training_special_discrete_token_ids) > 0 and special_weight != regular_weight:
+            special_ids = torch.tensor(
+                self.training_special_discrete_token_ids,
+                dtype=selected_targets.dtype,
+                device=selected_targets.device,
+            )
+            is_special = torch.isin(selected_targets, special_ids)
+            weights = torch.where(
+                is_special,
+                torch.full_like(token_losses, special_weight),
+                weights,
+            )
+
+        weight_sum = weights.sum()
+        if float(weight_sum.item()) <= 0.0:
+            return hidden_states.new_zeros(())
+        return (token_losses * weights).sum() / weight_sum
 
     def _compute_text_loss(
         self,

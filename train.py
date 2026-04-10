@@ -403,6 +403,24 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
     text_loss_weight = float(prism_cfg.get("text_loss_weight", 0.1))
     if text_loss_weight < 0.0:
         raise ValueError("model.prism_tts.text_loss_weight must be >= 0.")
+    discrete_regular_token_loss_weight = float(
+        prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
+    )
+    if discrete_regular_token_loss_weight < 0.0:
+        raise ValueError("model.prism_tts.discrete_regular_token_loss_weight must be >= 0.")
+    discrete_special_token_loss_weight = float(
+        prism_cfg.get("discrete_special_token_loss_weight", 1.0)
+    )
+    if discrete_special_token_loss_weight < 0.0:
+        raise ValueError("model.prism_tts.discrete_special_token_loss_weight must be >= 0.")
+    if (
+        discrete_regular_token_loss_weight == 0.0
+        and discrete_special_token_loss_weight == 0.0
+    ):
+        raise ValueError(
+            "At least one of model.prism_tts.discrete_regular_token_loss_weight or "
+            "model.prism_tts.discrete_special_token_loss_weight must be > 0."
+        )
 
     discrete_vocab_size = int(prism_cfg["discrete_vocab_size"])
     if discrete_vocab_size < text_offset:
@@ -460,6 +478,12 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
         text_loss_weight=float(prism_cfg.get("text_loss_weight", 0.1)),
+        discrete_regular_token_loss_weight=float(
+            prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
+        ),
+        discrete_special_token_loss_weight=float(
+            prism_cfg.get("discrete_special_token_loss_weight", 1.0)
+        ),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 16)),
     )
 

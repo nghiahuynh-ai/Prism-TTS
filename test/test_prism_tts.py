@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 from transformers import LlamaConfig
 
 try:
@@ -195,6 +196,93 @@ class TestPrismTTS(unittest.TestCase):
             tuple(outputs.keys()),
             ("loss", "discrete_loss", "flow_loss", "text_loss"),
         )
+
+    def test_discrete_loss_can_downweight_special_tokens(self):
+        class _FixedDiscreteHead(nn.Module):
+            def __init__(self, fixed_logits: torch.Tensor):
+                super().__init__()
+                self.register_buffer("fixed_logits", fixed_logits)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                expected_shape = x.shape[:-1] + (self.fixed_logits.shape[-1],)
+                if expected_shape != self.fixed_logits.shape:
+                    raise ValueError(
+                        f"Expected logits shape {expected_shape}, got {tuple(self.fixed_logits.shape)}."
+                    )
+                return self.fixed_logits
+
+        batch_size = 1
+        total_blocks = 3
+        num_discrete_tokens = 1
+        discrete_vocab_size = 8
+        hidden_size = int(make_small_config().hidden_size)
+        block_size = num_discrete_tokens + 2
+
+        # Block-1 target is special token 0 (easy); block-2 target is regular token 3 (hard).
+        full_discrete_tokens = torch.tensor(
+            [[[7], [0], [3]]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        target_block_mask = torch.tensor(
+            [[False, True, True]],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        hidden_states = torch.zeros(
+            batch_size,
+            total_blocks * block_size,
+            hidden_size,
+            device=self.device,
+        )
+        fixed_logits = torch.tensor(
+            [
+                [
+                    [[6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0]],
+                    [[-6.0, 6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0]],
+                ]
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        model_unweighted = PrismTTS(
+            llama_config=make_small_config(),
+            num_discrete_tokens=num_discrete_tokens,
+            discrete_vocab_size=discrete_vocab_size,
+            continuous_latent_size=1,
+            flow_num_res_blocks=1,
+            discrete_regular_token_loss_weight=1.0,
+            discrete_special_token_loss_weight=1.0,
+            flow_sample_steps=2,
+        ).to(self.device)
+        model_unweighted.discrete_lm_head = _FixedDiscreteHead(fixed_logits)
+        loss_unweighted = model_unweighted._compute_discrete_loss(
+            hidden_states=hidden_states,
+            full_discrete_tokens=full_discrete_tokens,
+            target_block_mask=target_block_mask,
+            block_attention_mask=None,
+        )
+
+        model_weighted = PrismTTS(
+            llama_config=make_small_config(),
+            num_discrete_tokens=num_discrete_tokens,
+            discrete_vocab_size=discrete_vocab_size,
+            continuous_latent_size=1,
+            flow_num_res_blocks=1,
+            discrete_regular_token_loss_weight=1.0,
+            discrete_special_token_loss_weight=0.2,
+            flow_sample_steps=2,
+        ).to(self.device)
+        model_weighted.discrete_lm_head = _FixedDiscreteHead(fixed_logits)
+        loss_weighted = model_weighted._compute_discrete_loss(
+            hidden_states=hidden_states,
+            full_discrete_tokens=full_discrete_tokens,
+            target_block_mask=target_block_mask,
+            block_attention_mask=None,
+        )
+
+        self.assertGreater(float(loss_weighted.item()), float(loss_unweighted.item()))
 
     def test_build_inputs_embeds_uses_block_major_order(self):
         model = PrismTTS(

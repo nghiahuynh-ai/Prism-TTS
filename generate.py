@@ -165,6 +165,19 @@ def parse_args() -> argparse.Namespace:
         help="Disable zeroing of continuous latents for special discrete blocks.",
     )
     parser.add_argument(
+        "--trim-leading-special-blocks",
+        dest="trim_leading_special_blocks",
+        action="store_true",
+        default=True,
+        help="Trim generated leading blocks where all discrete streams are DELAY/EOS/PAD.",
+    )
+    parser.add_argument(
+        "--no-trim-leading-special-blocks",
+        dest="trim_leading_special_blocks",
+        action="store_false",
+        help="Disable special-leading trimming before audio decoding.",
+    )
+    parser.add_argument(
         "--trim-tail-special-blocks",
         dest="trim_tail_special_blocks",
         action="store_true",
@@ -472,6 +485,13 @@ def main() -> None:
             f"special_ratio={discrete_stats['special_ratio']:.3f}, "
             f"longest_run_ratio={discrete_stats['longest_run_ratio']:.3f}"
         )
+    if generation.discrete_ids is not None and generation.discrete_ids.shape[0] > 0:
+        sample_discrete_codes = generation.discrete_ids[0].detach().to(dtype=torch.long).cpu()
+        print(
+            "[generate.py] generated discrete codes "
+            f"(shape={tuple(sample_discrete_codes.shape)}, format=[num_streams, num_blocks]):"
+        )
+        print(sample_discrete_codes.tolist())
 
     predicted_latents = generation.continuous_latents
     if predicted_latents is None or predicted_latents.shape[0] == 0:
@@ -488,13 +508,15 @@ def main() -> None:
         f"std={latent_std:.6f}, delta_std={latent_delta_std:.6f}"
     )
 
-    if args.trim_tail_special_blocks and generation.discrete_ids is not None:
+    if generation.discrete_ids is not None:
         sample_discrete = generation.discrete_ids[0]
-        sample_latents = generate_utils.trim_latent_tail_from_special_blocks(
+        sample_latents = generate_utils.trim_latent_special_blocks(
             latents=sample_latents,
             discrete_ids=sample_discrete,
             num_discrete_tokens=int(model.num_discrete_tokens),
             special_token_ids=special_token_ids,
+            trim_head=bool(args.trim_leading_special_blocks),
+            trim_tail=bool(args.trim_tail_special_blocks),
         )
 
     decoder = MimiPreUpsampleLatentDecoder(

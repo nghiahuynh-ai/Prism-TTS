@@ -16,6 +16,10 @@ model:
     flow_loss_weight: 1.0
     # Auxiliary next-block text CE loss weight.
     text_loss_weight: 0.1
+    # Per-token CE weights for discrete stream training:
+    # regular = codec IDs, special = DELAY/EOS/PAD.
+    discrete_regular_token_loss_weight: 1.0
+    discrete_special_token_loss_weight: 0.1
     flow_sample_steps: 16
 
   llama_config:
