@@ -101,3 +101,21 @@ def test_batch_collate_builds_split_parts_and_lengths_without_delay():
     assert int(out["flat_summary"][0, 8].item()) == len_a
     # stream summary: [text_stream_idx, speech_discrete_start, speech_discrete_end, speech_continuous_idx]
     assert out["flat_summary"][0, 10:14].tolist() == [0, 0, 1, 2]
+
+    # The appended terminal EOS speech block is part of target block ids, so it is mask-eligible.
+    final_block_id = int(out["flat_target_block_counts"][0].item()) - 1
+    target_block_ids = out["flat_target_block_ids"][0]
+    valid_tokens = out["attention_mask"][0]
+    final_block_positions = valid_tokens & (target_block_ids == final_block_id)
+    assert int(final_block_positions.sum().item()) == 3  # N + 1 streams
+
+    final_block_token_types = out["flat_token_type_ids"][0][final_block_positions]
+    final_block_token_ids = out["flat_token_ids"][0][final_block_positions]
+    final_block_continuous = out["flat_continuous_values"][0][final_block_positions]
+
+    # Two discrete EOS ids + one continuous latent row (represented by pad token id and zeros).
+    assert int((final_block_token_types == 1).sum().item()) == 2
+    assert int((final_block_token_types == 2).sum().item()) == 1
+    assert int((final_block_token_ids == eos_token_id).sum().item()) == 2
+    assert int((final_block_token_ids == pad_token_id).sum().item()) == 1
+    assert torch.allclose(final_block_continuous, torch.zeros_like(final_block_continuous))
