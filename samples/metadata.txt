@@ -1,0 +1,1 @@
+Emilia/EN/EN-B000024/EN_B00002_S09994_W000018.wav|10.730|Physique. An instrument or machine for weighing. Scale. Now say the word and hear it in a sentence.|Emilia/processed/EN-B000024/EN_B00002_S09994_W000018.npy|Emilia/EN/EN-B000024/EN_B00002_S09994_W000004.wav|3.837|Treadmill. Suggestions help.|Emilia/processed/EN-B000024/EN_B00002_S09994_W000004.npy|
