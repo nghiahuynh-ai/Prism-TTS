@@ -37,7 +37,7 @@ def _expected_flat_len(text_len: int, speech_len: int, num_discrete_streams: int
 
 def test_batch_collate_builds_split_parts_and_lengths_without_delay():
     collate = BatchCollate(discrete_token_count=100)
-    _, _, pad_token_id, _ = build_shared_token_layout(100)
+    _, eos_token_id, pad_token_id, _ = build_shared_token_layout(100)
 
     sample_a = _make_sample(
         text_prompt=[200, 201, 202],
@@ -62,20 +62,25 @@ def test_batch_collate_builds_split_parts_and_lengths_without_delay():
     assert tuple(out["discrete_prompt"].shape) == (2, 2, 2)
     assert tuple(out["continuous_prompt"].shape) == (2, 2, 1)
     assert tuple(out["text_target"].shape) == (2, 2)
-    assert tuple(out["discrete_target"].shape) == (2, 2, 2)
-    assert tuple(out["continuous_target"].shape) == (2, 2, 1)
+    assert tuple(out["discrete_target"].shape) == (2, 3, 2)
+    assert tuple(out["continuous_target"].shape) == (2, 3, 1)
 
     assert out["text_prompt_lengths"].tolist() == [3, 1]
     assert out["speech_prompt_lengths"].tolist() == [2, 1]
     assert out["text_target_lengths"].tolist() == [2, 1]
-    assert out["speech_target_lengths"].tolist() == [2, 1]
+    assert out["speech_target_lengths"].tolist() == [3, 2]
+    # Terminal EOS speech block was appended to each sample.
+    assert out["discrete_target"][0, 2].tolist() == [eos_token_id, eos_token_id]
+    assert out["discrete_target"][1, 1].tolist() == [eos_token_id, eos_token_id]
+    assert out["continuous_target"][0, 2].tolist() == [0.0]
+    assert out["continuous_target"][1, 1].tolist() == [0.0]
 
     # Padding check for split parts.
     assert out["text_prompt"][1].tolist() == [300, pad_token_id, pad_token_id]
 
     # Flat attention mask follows: prompt_text+EOT+prompt_speech+EOS+target_text+EOT+target_speech+EOS.
-    len_a = _expected_flat_len(3, 2, 2) + _expected_flat_len(2, 2, 2)
-    len_b = _expected_flat_len(1, 1, 2) + _expected_flat_len(1, 1, 2)
+    len_a = _expected_flat_len(3, 2, 2) + _expected_flat_len(2, 3, 2)
+    len_b = _expected_flat_len(1, 1, 2) + _expected_flat_len(1, 2, 2)
     assert tuple(out["attention_mask"].shape) == (2, len_a)
     assert out["attention_mask"][0].tolist() == [True] * len_a
     assert out["attention_mask"][1].tolist() == [True] * len_b + [False] * (len_a - len_b)
@@ -86,7 +91,7 @@ def test_batch_collate_builds_split_parts_and_lengths_without_delay():
     assert tuple(out["flat_speech_stream_ids"].shape) == (2, len_a)
     assert tuple(out["flat_target_block_ids"].shape) == (2, len_a)
     assert tuple(out["flat_continuous_values"].shape) == (2, len_a, 1)
-    assert out["flat_target_block_counts"].tolist() == [2, 1]
+    assert out["flat_target_block_counts"].tolist() == [3, 2]
     assert tuple(out["flat_summary"].shape) == (2, 14)
 
     # Sample A starts with prompt text then EOT.

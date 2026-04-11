@@ -26,7 +26,7 @@ CKPT ?=
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
-WANDB_NAME ?= baseline
+WANDB_NAME ?= masking
 WANDB_SAVE_DIR ?= logs
 WANDB_OFFLINE ?= false
 WANDB_LOG_MODEL ?= false

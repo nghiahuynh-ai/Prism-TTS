@@ -48,4 +48,4 @@ def test_estimate_prism_sample_lengths_from_manifest_metadata():
         dataset,
         codec_frame_rate_hz=12.5,
     )
-    assert lengths == [17, 18]
+    assert lengths == [19, 20]

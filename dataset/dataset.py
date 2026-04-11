@@ -420,7 +420,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
 
 class BatchCollate:
-    """Pad Prism-TTS samples without delay alignment."""
+    """Pad Prism-TTS samples without delay alignment and append target EOS speech blocks."""
 
     def __init__(
         self,
@@ -448,7 +448,8 @@ class BatchCollate:
         if not batch:
             raise ValueError("BatchCollate received an empty batch.")
 
-        samples = [self._validate_collate_sample(item) for item in batch]
+        normalized_samples = [self._validate_collate_sample(item) for item in batch]
+        samples = [self._append_target_eos_block(sample) for sample in normalized_samples]
         text_prompt_lengths = torch.tensor(
             [int(sample["text_prompt"].shape[0]) for sample in samples],
             dtype=torch.long,
@@ -603,6 +604,58 @@ class BatchCollate:
 
         return normalized
 
+    def _has_terminal_target_eos_block(self, sample: Mapping[str, torch.Tensor]) -> bool:
+        discrete_target = sample["discrete_target"]
+        continuous_target = sample["continuous_target"]
+        if int(discrete_target.shape[0]) < 1:
+            return False
+        if not bool(torch.eq(discrete_target[-1], self.eos_token_id).all().item()):
+            return False
+        last_continuous = continuous_target[-1]
+        return bool(torch.le(last_continuous.abs().max(), 1e-8).item())
+
+    def _append_target_eos_block(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """
+        Ensure each target speech sequence ends with one explicit EOS block:
+        - discrete: all streams = eos_token_id
+        - continuous: all-zero latent vector
+        """
+        if self._has_terminal_target_eos_block(sample):
+            return sample
+
+        discrete_target = sample["discrete_target"]
+        continuous_target = sample["continuous_target"]
+
+        eos_discrete = torch.full(
+            (1, int(discrete_target.shape[1])),
+            fill_value=self.eos_token_id,
+            dtype=discrete_target.dtype,
+            device=discrete_target.device,
+        )
+        eos_continuous = torch.zeros(
+            (1, int(continuous_target.shape[1])),
+            dtype=continuous_target.dtype,
+            device=continuous_target.device,
+        )
+
+        extended = dict(sample)
+        extended["discrete_target"] = torch.cat([discrete_target, eos_discrete], dim=0)
+        extended["continuous_target"] = torch.cat([continuous_target, eos_continuous], dim=0)
+
+        flow_timesteps = sample.get("flow_timesteps")
+        if flow_timesteps is not None:
+            extended["flow_timesteps"] = torch.cat(
+                [flow_timesteps, flow_timesteps.new_zeros((1,))],
+                dim=0,
+            )
+
+        noise = sample.get("noise")
+        if noise is not None:
+            eos_noise = noise.new_zeros((1, int(noise.shape[1])))
+            extended["noise"] = torch.cat([noise, eos_noise], dim=0)
+
+        return extended
+
     def _build_flat_attention_mask(self, sample: dict[str, torch.Tensor]) -> torch.BoolTensor:
         prompt_text = int(sample["text_prompt"].shape[0])
         prompt_speech = int(sample["discrete_prompt"].shape[0])
@@ -625,6 +678,7 @@ class BatchCollate:
         """
         Flatten one split Prism sample into:
         text_prompt -> EOT -> speech_prompt -> EOS -> text_target -> EOT -> speech_target -> EOS.
+        `speech_target` is expected to already include the terminal EOS speech block.
 
         Returns core flat tensors plus a compact summary tensor:
         [text_prompt_start, text_prompt_end, speech_prompt_start, speech_prompt_end,

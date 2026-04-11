@@ -34,7 +34,8 @@ def _estimate_concat_sequence_length(
     text_prompt_length = max(1, int(text_prompt_length))
     speech_prompt_length = max(1, int(speech_prompt_length))
     text_target_length = max(1, int(text_target_length))
-    speech_target_length = max(1, int(speech_target_length))
+    # Training collate appends one explicit terminal EOS speech block.
+    speech_target_length = max(1, int(speech_target_length)) + 1
     num_discrete_streams = max(1, int(num_discrete_streams))
     speech_block_size = num_discrete_streams + 1
     return (
