@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         dest="force_silent_special_tokens",
         action="store_true",
         default=True,
-        help="Force predicted special discrete blocks (DELAY/EOS/PAD) to zero continuous latents.",
+        help="Force predicted special discrete blocks (EOS/PAD) to zero continuous latents.",
     )
     parser.add_argument(
         "--no-force-silent-special-tokens",
@@ -169,7 +169,7 @@ def parse_args() -> argparse.Namespace:
         dest="trim_leading_special_blocks",
         action="store_true",
         default=True,
-        help="Trim generated leading blocks where all discrete streams are DELAY/EOS/PAD.",
+        help="Trim generated leading blocks where all discrete streams are EOS/PAD.",
     )
     parser.add_argument(
         "--no-trim-leading-special-blocks",
@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
         dest="trim_tail_special_blocks",
         action="store_true",
         default=True,
-        help="Trim generated tail blocks where all discrete streams are DELAY/EOS/PAD.",
+        help="Trim generated tail blocks where all discrete streams are EOS/PAD.",
     )
     parser.add_argument(
         "--no-trim-tail-special-blocks",
@@ -211,19 +211,12 @@ def main() -> None:
 
     data_cfg = generate_utils.require_mapping(data_config, "data")
     shared_layout_cfg = generate_utils.require_mapping(data_cfg, "shared_layout")
-    collate_cfg = generate_utils.require_mapping(data_cfg, "collate")
     dataset_cfg = generate_utils.require_mapping(data_cfg, "dataset")
 
     discrete_token_count = int(shared_layout_cfg["discrete_token_count"])
-    delay_token_id, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(
+    _, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(
         discrete_token_count
     )
-    shared_delay_tokens = generate_utils.resolve_shared_delay_tokens(collate_cfg)
-    text_pad_raw = collate_cfg.get("text_pad_value")
-    discrete_pad_raw = collate_cfg.get("discrete_pad_value")
-    text_pad_value = pad_token_id if text_pad_raw is None else int(text_pad_raw)
-    discrete_pad_value = pad_token_id if discrete_pad_raw is None else int(discrete_pad_raw)
-    continuous_pad_value = float(collate_cfg.get("continuous_pad_value", 0.0))
 
     vocab_path_raw = data_cfg.get("vocab_path", "dataset/vocab.txt")
     vocab_path = Path(vocab_path_raw)
@@ -297,70 +290,30 @@ def main() -> None:
     if target_text_tokens.numel() == 0:
         raise ValueError("Target text is empty after tokenization.")
 
-    aligned_text_prompt, aligned_discrete_prompt, aligned_continuous_prompt = (
-        generate_utils.align_prompt_streams(
-            text_tokens=prompt_text_tokens,
-            discrete_tokens=raw_prompt_discrete,
-            continuous_latents=raw_prompt_continuous,
-            delay_token_id=delay_token_id,
-            eos_token_id=eos_token_id,
-            text_pad_value=text_pad_value,
-            discrete_pad_value=discrete_pad_value,
-            continuous_pad_value=continuous_pad_value,
-            shared_delay_tokens=shared_delay_tokens,
-        )
-    )
-
     max_new_blocks = args.max_new_blocks
     if max_new_blocks is None:
         max_new_blocks = generate_utils.estimate_max_new_blocks(
             target_text_token_count=int(target_text_tokens.numel()),
             prompt_text_token_count=int(prompt_text_tokens.numel()),
             prompt_frame_count=int(raw_prompt_discrete.shape[0]),
-            shared_delay_tokens=shared_delay_tokens,
             duration_scale=float(args.duration_scale),
             trailing_pad_blocks=int(args.trailing_pad_blocks),
         )
     if max_new_blocks < 1:
         raise ValueError("--max-new-blocks must be >= 1.")
 
-    # Mirror training text alignment for target blocks:
-    # [target text..., EOS, PAD...].
-    teacher_target = generate_utils.build_teacher_forcing_target_text(
-        target_text_tokens=target_text_tokens,
-        eos_token_id=eos_token_id,
-        pad_token_id=text_pad_value,
-        total_blocks=int(max_new_blocks),
-    ).unsqueeze(0)
-    teacher_delay_blocks = min(int(shared_delay_tokens), int(max_new_blocks))
-    teacher_forced_discrete_prefix = None
-    teacher_forced_continuous_prefix = None
-    if teacher_delay_blocks > 0:
-        teacher_forced_discrete_prefix = torch.full(
-            (1, int(model.num_discrete_tokens), teacher_delay_blocks),
-            fill_value=delay_token_id,
-            dtype=torch.long,
-            device=device,
-        )
-        teacher_forced_continuous_prefix = torch.zeros(
-            (1, teacher_delay_blocks, int(model.continuous_latent_size)),
-            dtype=model_dtype,
-            device=device,
-        )
-
-    text_prompt = aligned_text_prompt.unsqueeze(0).to(device=device, dtype=torch.long)
+    text_prompt = prompt_text_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
     # Pass [B, N, L] for compatibility with training/inference call-sites.
-    discrete_prompt = aligned_discrete_prompt.transpose(0, 1).unsqueeze(0).to(
+    discrete_prompt = raw_prompt_discrete.transpose(0, 1).unsqueeze(0).to(
         device=device,
         dtype=torch.long,
     )
-    continuous_prompt = aligned_continuous_prompt.unsqueeze(0).to(
+    continuous_prompt = raw_prompt_continuous.unsqueeze(0).to(
         device=device,
         dtype=model_dtype,
     )
-    text_target = teacher_target.to(device=device, dtype=torch.long)
-    target_lengths = torch.tensor([text_target.shape[1]], device=device, dtype=torch.long)
-    special_token_ids = (delay_token_id, eos_token_id, pad_token_id)
+    text_target = target_text_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
+    special_token_ids = (eos_token_id, pad_token_id)
 
     def _run_generation(
         *,
@@ -375,10 +328,15 @@ def main() -> None:
                 discrete_prompt=discrete_prompt,
                 continuous_prompt=continuous_prompt,
                 text_target=text_target,
-                prompt_lengths=torch.tensor([text_prompt.shape[1]], device=device, dtype=torch.long),
-                target_lengths=target_lengths,
+                text_prompt_lengths=torch.tensor([text_prompt.shape[1]], device=device, dtype=torch.long),
+                speech_prompt_lengths=torch.tensor(
+                    [raw_prompt_discrete.shape[0]],
+                    device=device,
+                    dtype=torch.long,
+                ),
+                text_target_lengths=torch.tensor([text_target.shape[1]], device=device, dtype=torch.long),
+                speech_target_lengths=torch.tensor([int(max_new_blocks)], device=device, dtype=torch.long),
                 max_new_blocks=int(max_new_blocks),
-                text_eos_token_id=eos_token_id,
                 discrete_eos_token_id=eos_token_id,
                 temperature=temperature,
                 top_k=top_k,
@@ -386,8 +344,6 @@ def main() -> None:
                 do_sample=do_sample,
                 flow_num_steps=args.flow_num_steps,
                 force_silent_special_tokens=bool(args.force_silent_special_tokens),
-                teacher_forced_discrete_prefix=teacher_forced_discrete_prefix,
-                teacher_forced_continuous_prefix=teacher_forced_continuous_prefix,
                 return_dict=True,
             )
 

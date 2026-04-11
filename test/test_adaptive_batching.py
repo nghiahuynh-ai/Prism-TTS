@@ -47,6 +47,5 @@ def test_estimate_prism_sample_lengths_from_manifest_metadata():
     lengths = estimate_prism_sample_lengths(
         dataset,
         codec_frame_rate_hz=12.5,
-        shared_delay_tokens=1,
     )
-    assert lengths == [9, 11]
+    assert lengths == [17, 18]

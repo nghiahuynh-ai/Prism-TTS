@@ -45,16 +45,13 @@ data:
     # Discrete ids are [0, discrete_token_count - 1].
     # Special ids are derived by build_shared_token_layout().
     discrete_token_count: 2048
-    delay_token_id: 2048
+    eot_token_id: 2048
     eos_token_id: 2049
     pad_token_id: 2050
     text_token_offset: 2051
 
   dataset:
     # PrismDataset(...) arguments.
-    prompt_length: null
-    min_prompt_length: 1
-    min_target_length: 1
     append_eos_to_text: false
     cache_npy: false
     discrete_stream_count: 1
@@ -66,9 +63,4 @@ data:
     discrete_pad_value: null
     continuous_pad_value: 0.0
     include_attention_mask: true
-    prompt_length: null
-    min_prompt_length: 1
-    min_target_length: 1
-    stream_delay: null
-    discrete_stream_delay_ms: 80.0
     codec_frame_rate_hz: 12.5

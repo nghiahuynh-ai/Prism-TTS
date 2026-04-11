@@ -30,11 +30,10 @@ AudioDecoder = Callable[[torch.FloatTensor], torch.Tensor | np.ndarray]
 
 @dataclass
 class PrismBatch:
-    text: Optional[torch.LongTensor] = None
-    discrete: Optional[torch.LongTensor] = None
-    continuous: Optional[torch.FloatTensor] = None
-    prompt_lengths: Optional[torch.LongTensor] = None
-    target_lengths: Optional[torch.LongTensor] = None
+    text_prompt_lengths: Optional[torch.LongTensor] = None
+    speech_prompt_lengths: Optional[torch.LongTensor] = None
+    text_target_lengths: Optional[torch.LongTensor] = None
+    speech_target_lengths: Optional[torch.LongTensor] = None
     text_target: Optional[torch.LongTensor] = None
     discrete_target: Optional[torch.LongTensor] = None
     continuous_target: Optional[torch.FloatTensor] = None
@@ -42,6 +41,12 @@ class PrismBatch:
     discrete_prompt: Optional[torch.LongTensor] = None
     continuous_prompt: Optional[torch.FloatTensor] = None
     attention_mask: Optional[torch.Tensor] = None
+    flat_token_ids: Optional[torch.LongTensor] = None
+    flat_continuous_values: Optional[torch.FloatTensor] = None
+    flat_token_type_ids: Optional[torch.LongTensor] = None
+    flat_speech_stream_ids: Optional[torch.LongTensor] = None
+    flat_target_block_ids: Optional[torch.LongTensor] = None
+    flat_target_block_counts: Optional[torch.LongTensor] = None
     flow_timesteps: Optional[torch.FloatTensor] = None
     noise: Optional[torch.FloatTensor] = None
 
@@ -198,6 +203,15 @@ else:
                 sync_dist=self.sync_dist_logging,
             )
             self.log(
+                "train/continuous_loss",
+                outputs.continuous_loss,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=self.sync_dist_logging,
+            )
+            self.log(
                 "train/flow_loss",
                 outputs.flow_loss,
                 prog_bar=False,
@@ -206,26 +220,6 @@ else:
                 batch_size=batch_size,
                 sync_dist=self.sync_dist_logging,
             )
-            if outputs.text_loss is not None:
-                self.log(
-                    "train/text_loss",
-                    outputs.text_loss,
-                    prog_bar=False,
-                    on_step=True,
-                    on_epoch=True,
-                    batch_size=batch_size,
-                    sync_dist=self.sync_dist_logging,
-                )
-                text_ppl = torch.exp(outputs.text_loss.detach().clamp(max=20.0))
-                self.log(
-                    "train/text_ppl",
-                    text_ppl,
-                    prog_bar=False,
-                    on_step=True,
-                    on_epoch=False,
-                    batch_size=batch_size,
-                    sync_dist=self.sync_dist_logging,
-                )
 
             discrete_ppl = torch.exp(outputs.discrete_loss.detach().clamp(max=20.0))
             self.log(
@@ -277,6 +271,15 @@ else:
                 sync_dist=self.sync_dist_logging,
             )
             self.log(
+                "val/continuous_loss",
+                outputs.continuous_loss,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=self.sync_dist_logging,
+            )
+            self.log(
                 "val/flow_loss",
                 outputs.flow_loss,
                 prog_bar=False,
@@ -285,16 +288,6 @@ else:
                 batch_size=batch_size,
                 sync_dist=self.sync_dist_logging,
             )
-            if outputs.text_loss is not None:
-                self.log(
-                    "val/text_loss",
-                    outputs.text_loss,
-                    prog_bar=False,
-                    on_step=False,
-                    on_epoch=True,
-                    batch_size=batch_size,
-                    sync_dist=self.sync_dist_logging,
-                )
             return outputs.loss
 
         def on_fit_start(self) -> None:
@@ -360,89 +353,25 @@ else:
 
         def _forward_batch(self, batch_inputs: PrismBatch) -> PrismTTSOutput:
             if (
-                batch_inputs.text is not None
-                and batch_inputs.discrete is not None
-                and batch_inputs.continuous is not None
-            ):
-                return self.model(
-                    text=batch_inputs.text,
-                    discrete=batch_inputs.discrete,
-                    continuous=batch_inputs.continuous,
-                    prompt_lengths=batch_inputs.prompt_lengths,
-                    target_lengths=batch_inputs.target_lengths,
-                    attention_mask=batch_inputs.attention_mask,
-                    flow_timesteps=batch_inputs.flow_timesteps,
-                    noise=batch_inputs.noise,
-                    return_dict=True,
-                )
-
-            if (
-                batch_inputs.text_target is None
-                or batch_inputs.discrete_target is None
-                or batch_inputs.continuous_target is None
-                or batch_inputs.text_prompt is None
-                or batch_inputs.discrete_prompt is None
-                or batch_inputs.continuous_prompt is None
+                batch_inputs.flat_token_ids is None
+                or batch_inputs.flat_continuous_values is None
+                or batch_inputs.flat_token_type_ids is None
+                or batch_inputs.flat_speech_stream_ids is None
+                or batch_inputs.flat_target_block_ids is None
             ):
                 raise ValueError(
-                    "Batch is missing required tensors. Expected either concatenated "
-                    "inputs (text/discrete/continuous/prompt_lengths) or split "
-                    "prompt/target tensors."
-                )
-
-            prompt_len = int(batch_inputs.text_prompt.shape[1])
-            target_len = int(batch_inputs.text_target.shape[1])
-            normalized_discrete_prompt = self.model._normalize_discrete_tokens(
-                batch_inputs.discrete_prompt,
-                "discrete_prompt",
-            )
-            normalized_discrete_target = self.model._normalize_discrete_tokens(
-                batch_inputs.discrete_target,
-                "discrete_target",
-            )
-            normalized_continuous_prompt = self.model._normalize_continuous_latents(
-                batch_inputs.continuous_prompt,
-                expected_len=prompt_len,
-                name="continuous_prompt",
-            )
-            normalized_continuous_target = self.model._normalize_continuous_latents(
-                batch_inputs.continuous_target,
-                expected_len=target_len,
-                name="continuous_target",
-            )
-            full_text = torch.cat([batch_inputs.text_prompt, batch_inputs.text_target], dim=1)
-            full_discrete = torch.cat(
-                [normalized_discrete_prompt, normalized_discrete_target],
-                dim=1,
-            )
-            full_continuous = torch.cat(
-                [normalized_continuous_prompt, normalized_continuous_target],
-                dim=1,
-            )
-            batch_size = int(full_text.shape[0])
-            prompt_lengths = batch_inputs.prompt_lengths
-            if prompt_lengths is None:
-                prompt_lengths = torch.full(
-                    (batch_size,),
-                    prompt_len,
-                    dtype=torch.long,
-                    device=full_text.device,
-                )
-            target_lengths = batch_inputs.target_lengths
-            if target_lengths is None:
-                target_lengths = torch.full(
-                    (batch_size,),
-                    target_len,
-                    dtype=torch.long,
-                    device=full_text.device,
+                    "Batch is missing required pre-flattened tensors: "
+                    "flat_token_ids, flat_continuous_values, flat_token_type_ids, "
+                    "flat_speech_stream_ids, flat_target_block_ids."
                 )
 
             return self.model(
-                text=full_text,
-                discrete=full_discrete,
-                continuous=full_continuous,
-                prompt_lengths=prompt_lengths,
-                target_lengths=target_lengths,
+                flat_token_ids=batch_inputs.flat_token_ids,
+                flat_continuous_values=batch_inputs.flat_continuous_values,
+                flat_token_type_ids=batch_inputs.flat_token_type_ids,
+                flat_speech_stream_ids=batch_inputs.flat_speech_stream_ids,
+                flat_target_block_ids=batch_inputs.flat_target_block_ids,
+                flat_target_block_counts=batch_inputs.flat_target_block_counts,
                 attention_mask=batch_inputs.attention_mask,
                 flow_timesteps=batch_inputs.flow_timesteps,
                 noise=batch_inputs.noise,
@@ -459,30 +388,13 @@ else:
             )
 
         def _parse_mapping_batch(self, batch: Mapping[str, Any]) -> PrismBatch:
-            concatenated_required = (
-                "text",
-                "discrete",
-                "continuous",
-                "prompt_lengths",
+            required_flat = (
+                "flat_token_ids",
+                "flat_continuous_values",
+                "flat_token_type_ids",
+                "flat_speech_stream_ids",
+                "flat_target_block_ids",
             )
-            if all(key in batch for key in concatenated_required):
-                return PrismBatch(
-                    text=batch["text"],
-                    discrete=batch["discrete"],
-                    continuous=batch["continuous"],
-                    prompt_lengths=batch["prompt_lengths"],
-                    target_lengths=batch.get("target_lengths"),
-                    text_target=batch.get("text_target"),
-                    discrete_target=batch.get("discrete_target"),
-                    continuous_target=batch.get("continuous_target"),
-                    text_prompt=batch.get("text_prompt"),
-                    discrete_prompt=batch.get("discrete_prompt"),
-                    continuous_prompt=batch.get("continuous_prompt"),
-                    attention_mask=batch.get("attention_mask"),
-                    flow_timesteps=batch.get("flow_timesteps"),
-                    noise=batch.get("noise"),
-                )
-
             required = (
                 "text_target",
                 "discrete_target",
@@ -499,9 +411,30 @@ else:
                     text_prompt=batch["text_prompt"],
                     discrete_prompt=batch["discrete_prompt"],
                     continuous_prompt=batch["continuous_prompt"],
-                    prompt_lengths=batch.get("prompt_lengths"),
-                    target_lengths=batch.get("target_lengths"),
+                    text_prompt_lengths=batch.get("text_prompt_lengths"),
+                    speech_prompt_lengths=batch.get("speech_prompt_lengths"),
+                    text_target_lengths=batch.get("text_target_lengths"),
+                    speech_target_lengths=batch.get("speech_target_lengths"),
                     attention_mask=batch.get("attention_mask"),
+                    flat_token_ids=batch.get("flat_token_ids"),
+                    flat_continuous_values=batch.get("flat_continuous_values"),
+                    flat_token_type_ids=batch.get("flat_token_type_ids"),
+                    flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
+                    flat_target_block_ids=batch.get("flat_target_block_ids"),
+                    flat_target_block_counts=batch.get("flat_target_block_counts"),
+                    flow_timesteps=batch.get("flow_timesteps"),
+                    noise=batch.get("noise"),
+                )
+
+            if all(key in batch for key in required_flat):
+                return PrismBatch(
+                    attention_mask=batch.get("attention_mask"),
+                    flat_token_ids=batch.get("flat_token_ids"),
+                    flat_continuous_values=batch.get("flat_continuous_values"),
+                    flat_token_type_ids=batch.get("flat_token_type_ids"),
+                    flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
+                    flat_target_block_ids=batch.get("flat_target_block_ids"),
+                    flat_target_block_counts=batch.get("flat_target_block_counts"),
                     flow_timesteps=batch.get("flow_timesteps"),
                     noise=batch.get("noise"),
                 )
@@ -519,8 +452,10 @@ else:
                     text_prompt=prompt["text"],
                     discrete_prompt=prompt["discrete"],
                     continuous_prompt=prompt["continuous"],
-                    prompt_lengths=batch.get("prompt_lengths"),
-                    target_lengths=batch.get("target_lengths"),
+                    text_prompt_lengths=batch.get("text_prompt_lengths"),
+                    speech_prompt_lengths=batch.get("speech_prompt_lengths"),
+                    text_target_lengths=batch.get("text_target_lengths"),
+                    speech_target_lengths=batch.get("speech_target_lengths"),
                     attention_mask=batch.get("attention_mask"),
                     flow_timesteps=batch.get("flow_timesteps"),
                     noise=batch.get("noise"),
@@ -528,9 +463,10 @@ else:
 
             raise KeyError(
                 "Mapping batch is missing PrismTTS keys. Required keys: "
-                "either (text, discrete, continuous, prompt_lengths) or "
                 "(text_target, discrete_target, continuous_target, text_prompt, "
-                "discrete_prompt, continuous_prompt)."
+                "discrete_prompt, continuous_prompt) or "
+                "(flat_token_ids, flat_continuous_values, flat_token_type_ids, "
+                "flat_speech_stream_ids, flat_target_block_ids)."
             )
 
         def _parse_sequence_batch(self, batch: list[Any] | tuple[Any, ...]) -> PrismBatch:
@@ -560,9 +496,9 @@ else:
         @staticmethod
         def _batch_size(batch_inputs: PrismBatch) -> int:
             for tensor in (
-                batch_inputs.text,
                 batch_inputs.text_target,
                 batch_inputs.text_prompt,
+                batch_inputs.flat_token_ids,
             ):
                 if tensor is not None:
                     return int(tensor.shape[0])
@@ -570,8 +506,14 @@ else:
 
         @staticmethod
         def _max_target_length(batch_inputs: PrismBatch) -> int:
-            if batch_inputs.target_lengths is not None:
-                return int(torch.as_tensor(batch_inputs.target_lengths).max().item())
+            if batch_inputs.speech_target_lengths is not None:
+                return int(torch.as_tensor(batch_inputs.speech_target_lengths).max().item())
+            if batch_inputs.flat_target_block_counts is not None:
+                return int(torch.as_tensor(batch_inputs.flat_target_block_counts).max().item())
+            if batch_inputs.discrete_target is not None:
+                normalized = torch.as_tensor(batch_inputs.discrete_target)
+                if normalized.dim() >= 2:
+                    return int(normalized.shape[-2])
             if batch_inputs.text_target is not None:
                 return int(batch_inputs.text_target.shape[1])
             return 0
@@ -599,30 +541,40 @@ else:
             # Generation logs only one sample; slice and trim by prompt/target lengths to
             # avoid conditioning on batch-level padding from collate.
             sample_idx = 0
-            prompt_len = (
-                int(torch.as_tensor(batch_inputs.prompt_lengths)[sample_idx].item())
-                if batch_inputs.prompt_lengths is not None
+            prompt_speech_len = (
+                int(torch.as_tensor(batch_inputs.speech_prompt_lengths)[sample_idx].item())
+                if batch_inputs.speech_prompt_lengths is not None
+                else int(batch_inputs.discrete_prompt.shape[-2])
+            )
+            prompt_text_len = (
+                int(torch.as_tensor(batch_inputs.text_prompt_lengths)[sample_idx].item())
+                if batch_inputs.text_prompt_lengths is not None
                 else int(batch_inputs.text_prompt.shape[1])
             )
-            target_len = (
-                int(torch.as_tensor(batch_inputs.target_lengths)[sample_idx].item())
-                if batch_inputs.target_lengths is not None
+            target_speech_len = (
+                int(torch.as_tensor(batch_inputs.speech_target_lengths)[sample_idx].item())
+                if batch_inputs.speech_target_lengths is not None
+                else int(batch_inputs.discrete_target.shape[-2])
+            )
+            target_text_len = (
+                int(torch.as_tensor(batch_inputs.text_target_lengths)[sample_idx].item())
+                if batch_inputs.text_target_lengths is not None
                 else int(batch_inputs.text_target.shape[1])
             )
-            if target_len < 1:
+            if target_speech_len < 1:
                 return
 
-            text_prompt = batch_inputs.text_prompt[sample_idx : sample_idx + 1, :prompt_len]
+            text_prompt = batch_inputs.text_prompt[sample_idx : sample_idx + 1, :prompt_text_len]
             discrete_prompt = self.model._normalize_discrete_tokens(
                 batch_inputs.discrete_prompt[sample_idx : sample_idx + 1],
                 "discrete_prompt",
-            )[:, :prompt_len, :]
+            )[:, :prompt_speech_len, :]
             continuous_prompt = self.model._normalize_continuous_latents(
                 batch_inputs.continuous_prompt[sample_idx : sample_idx + 1],
-                expected_len=int(batch_inputs.text_prompt.shape[1]),
+                expected_len=int(batch_inputs.discrete_prompt.shape[-2]),
                 name="continuous_prompt",
-            )[:, :prompt_len, :]
-            text_target = batch_inputs.text_target[sample_idx : sample_idx + 1, :target_len]
+            )[:, :prompt_speech_len, :]
+            text_target = batch_inputs.text_target[sample_idx : sample_idx + 1, :target_text_len]
 
             was_training = self.model.training
             try:
@@ -634,9 +586,11 @@ else:
                             discrete_prompt=discrete_prompt,
                             continuous_prompt=continuous_prompt,
                             text_target=text_target,
-                            prompt_lengths=torch.tensor([prompt_len], device=self.device),
-                            target_lengths=torch.tensor([target_len], device=self.device),
-                            max_new_blocks=target_len,
+                            text_prompt_lengths=torch.tensor([prompt_text_len], device=self.device),
+                            speech_prompt_lengths=torch.tensor([prompt_speech_len], device=self.device),
+                            text_target_lengths=torch.tensor([target_text_len], device=self.device),
+                            speech_target_lengths=torch.tensor([target_speech_len], device=self.device),
+                            max_new_blocks=target_speech_len,
                             do_sample=False,
                             force_silent_special_tokens=True,
                             return_dict=True,
@@ -649,13 +603,15 @@ else:
                 return
             self._log_eval_media_to_wandb(
                 batch_inputs=PrismBatch(
-                    text_target=batch_inputs.text_target[sample_idx : sample_idx + 1],
                     continuous_target=(
                         None
                         if batch_inputs.continuous_target is None
                         else batch_inputs.continuous_target[sample_idx : sample_idx + 1]
                     ),
-                    target_lengths=torch.tensor([target_len], device=self.device),
+                    speech_target_lengths=torch.tensor(
+                        [target_speech_len],
+                        device=self.device,
+                    ),
                 ),
                 generation=generation,
             )
@@ -839,7 +795,7 @@ else:
         ) -> Optional[Any]:
             if self.audio_decoder is None:
                 return None
-            if batch_inputs.continuous_target is None or batch_inputs.text_target is None:
+            if batch_inputs.continuous_target is None:
                 return None
 
             try:
@@ -849,7 +805,7 @@ else:
 
             target_continuous = self.model._normalize_continuous_latents(
                 batch_inputs.continuous_target,
-                expected_len=batch_inputs.text_target.shape[1],
+                expected_len=batch_inputs.continuous_target.shape[1],
                 name="continuous_target",
             )
             pred_continuous = generation.continuous_latents
@@ -881,8 +837,11 @@ else:
                     int(target_continuous.shape[1]),
                     int(pred_continuous.shape[1]),
                 )
-                if batch_inputs.target_lengths is not None:
-                    target_lengths = torch.as_tensor(batch_inputs.target_lengths, device=self.device)
+                if batch_inputs.speech_target_lengths is not None:
+                    target_lengths = torch.as_tensor(
+                        batch_inputs.speech_target_lengths,
+                        device=self.device,
+                    )
                     if target_lengths.dim() == 0:
                         target_lengths = target_lengths.unsqueeze(0)
                     if sample_idx < int(target_lengths.shape[0]):

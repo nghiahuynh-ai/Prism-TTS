@@ -24,18 +24,29 @@ def _estimate_discrete_length(duration_seconds: float, codec_frame_rate_hz: floa
     return max(1, int(round(duration_seconds * codec_frame_rate_hz)))
 
 
-def _estimate_aligned_part_length(
-    text_length: int,
-    discrete_length: int,
-    shared_delay_tokens: int,
+def _estimate_concat_sequence_length(
+    text_prompt_length: int,
+    speech_prompt_length: int,
+    text_target_length: int,
+    speech_target_length: int,
+    num_discrete_streams: int,
 ) -> int:
-    text_length = max(1, int(text_length))
-    discrete_length = max(1, int(discrete_length))
-    shared_delay_tokens = max(0, int(shared_delay_tokens))
-
-    extra_delay = max(0, text_length - discrete_length - shared_delay_tokens + 1)
-    effective_delay = shared_delay_tokens + extra_delay
-    return max(text_length + 1, effective_delay + discrete_length + 1)
+    text_prompt_length = max(1, int(text_prompt_length))
+    speech_prompt_length = max(1, int(speech_prompt_length))
+    text_target_length = max(1, int(text_target_length))
+    speech_target_length = max(1, int(speech_target_length))
+    num_discrete_streams = max(1, int(num_discrete_streams))
+    speech_block_size = num_discrete_streams + 1
+    return (
+        text_prompt_length
+        + 1  # EOT after text prompt
+        + speech_prompt_length * speech_block_size
+        + 1  # EOS after speech prompt
+        + text_target_length
+        + 1  # EOT after text target
+        + speech_target_length * speech_block_size
+        + 1  # EOS after speech target
+    )
 
 
 def _safe_1d_length(value: Any, *, field_name: str) -> int:
@@ -68,9 +79,8 @@ def estimate_prism_sample_lengths(
     dataset: Any,
     *,
     codec_frame_rate_hz: float,
-    shared_delay_tokens: int,
 ) -> list[int]:
-    """Estimate collated sequence length for each Prism sample."""
+    """Estimate concatenated sequence length for each Prism sample."""
     if codec_frame_rate_hz <= 0:
         raise ValueError("codec_frame_rate_hz must be > 0.")
 
@@ -86,6 +96,7 @@ def estimate_prism_sample_lengths(
         append_eos = bool(getattr(tokenizer, "append_eos", False))
         if not isinstance(char_to_id, Mapping):
             raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
+        num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
 
         lengths: list[int] = []
         for entry in entries:
@@ -107,17 +118,15 @@ def estimate_prism_sample_lengths(
                 float(getattr(entry, "duration")),
                 codec_frame_rate_hz,
             )
-            prompt_part_len = _estimate_aligned_part_length(
-                text_prompt_len,
-                prompt_discrete_len,
-                shared_delay_tokens,
+            lengths.append(
+                _estimate_concat_sequence_length(
+                    text_prompt_length=text_prompt_len,
+                    speech_prompt_length=prompt_discrete_len,
+                    text_target_length=text_target_len,
+                    speech_target_length=target_discrete_len,
+                    num_discrete_streams=num_discrete_streams,
+                )
             )
-            target_part_len = _estimate_aligned_part_length(
-                text_target_len,
-                target_discrete_len,
-                shared_delay_tokens,
-            )
-            lengths.append(prompt_part_len + target_part_len)
         return lengths
 
     samples = getattr(dataset, "_samples", None)
@@ -139,17 +148,17 @@ def estimate_prism_sample_lengths(
                 sample.get("discrete_target"),
                 field_name="discrete_target",
             )
-            prompt_part_len = _estimate_aligned_part_length(
-                text_prompt_len,
-                prompt_discrete_len,
-                shared_delay_tokens,
+            discrete_prompt = sample.get("discrete_prompt")
+            num_discrete_streams = int(getattr(discrete_prompt, "shape", [1, 1])[1])
+            lengths.append(
+                _estimate_concat_sequence_length(
+                    text_prompt_length=text_prompt_len,
+                    speech_prompt_length=prompt_discrete_len,
+                    text_target_length=text_target_len,
+                    speech_target_length=target_discrete_len,
+                    num_discrete_streams=num_discrete_streams,
+                )
             )
-            target_part_len = _estimate_aligned_part_length(
-                text_target_len,
-                target_discrete_len,
-                shared_delay_tokens,
-            )
-            lengths.append(prompt_part_len + target_part_len)
         return lengths
 
     raise ValueError(

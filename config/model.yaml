@@ -5,19 +5,21 @@ model:
   name: prism_tts
 
   prism_tts:
-    # Number of discrete streams per block: [text, d1..dN, continuous].
+    # Number of discrete streams per speech block.
     num_discrete_tokens: 1
-    # Must cover codec ids + DELAY/EOS/PAD special ids.
+    # Must cover codec ids + EOT/EOS/PAD special ids.
     # For discrete_token_count=2048, minimum valid value is 2051.
     discrete_vocab_size: 2051
     continuous_latent_size: 512
     flow_num_res_blocks: 4
     flow_model_channels: null
+    # Loss weights for masked speech-block reconstruction.
+    continuous_loss_weight: 1.0
     flow_loss_weight: 1.0
-    # Auxiliary next-block text CE loss weight.
-    text_loss_weight: 0.1
+    # Fraction of target speech blocks masked per training sample.
+    mask_ratio: 0.5
     # Per-token CE weights for discrete stream training:
-    # regular = codec IDs, special = DELAY/EOS/PAD.
+    # regular = codec IDs, special = EOT/EOS/PAD.
     discrete_regular_token_loss_weight: 1.0
     discrete_special_token_loss_weight: 0.1
     flow_sample_steps: 16

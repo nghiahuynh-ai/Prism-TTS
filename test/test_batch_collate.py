@@ -30,13 +30,14 @@ def _make_sample(
     }
 
 
-def test_batch_collate_builds_delayed_concat_streams_and_lengths():
-    collate = BatchCollate(
-        discrete_token_count=100,
-        discrete_stream_delay_ms=80.0,
-        codec_frame_rate_hz=12.5,
-    )
-    delay_token_id, eos_token_id, pad_token_id, _ = build_shared_token_layout(100)
+def _expected_flat_len(text_len: int, speech_len: int, num_discrete_streams: int) -> int:
+    num_streams = num_discrete_streams + 1
+    return text_len + 1 + speech_len * num_streams + 1
+
+
+def test_batch_collate_builds_split_parts_and_lengths_without_delay():
+    collate = BatchCollate(discrete_token_count=100)
+    _, _, pad_token_id, _ = build_shared_token_layout(100)
 
     sample_a = _make_sample(
         text_prompt=[200, 201, 202],
@@ -57,55 +58,41 @@ def test_batch_collate_builds_delayed_concat_streams_and_lengths():
 
     out = collate([sample_a, sample_b])
 
-    assert tuple(out["text"].shape) == (2, 9)
-    assert tuple(out["discrete"].shape) == (2, 9, 2)
-    assert tuple(out["continuous"].shape) == (2, 9, 1)
-    assert out["prompt_lengths"].tolist() == [5, 3]
-    assert out["target_lengths"].tolist() == [4, 3]
+    assert tuple(out["text_prompt"].shape) == (2, 3)
+    assert tuple(out["discrete_prompt"].shape) == (2, 2, 2)
+    assert tuple(out["continuous_prompt"].shape) == (2, 2, 1)
+    assert tuple(out["text_target"].shape) == (2, 2)
+    assert tuple(out["discrete_target"].shape) == (2, 2, 2)
+    assert tuple(out["continuous_target"].shape) == (2, 2, 1)
 
-    expected_text_a = [
-        200,
-        201,
-        202,
-        eos_token_id,
-        pad_token_id,
-        210,
-        211,
-        eos_token_id,
-        pad_token_id,
-    ]
-    assert out["text"][0].tolist() == expected_text_a
+    assert out["text_prompt_lengths"].tolist() == [3, 1]
+    assert out["speech_prompt_lengths"].tolist() == [2, 1]
+    assert out["text_target_lengths"].tolist() == [2, 1]
+    assert out["speech_target_lengths"].tolist() == [2, 1]
 
-    expected_d1_a = [
-        delay_token_id,
-        delay_token_id,
-        1,
-        2,
-        eos_token_id,
-        delay_token_id,
-        3,
-        4,
-        eos_token_id,
-    ]
-    expected_d2_a = [
-        delay_token_id,
-        delay_token_id,
-        10,
-        20,
-        eos_token_id,
-        delay_token_id,
-        30,
-        40,
-        eos_token_id,
-    ]
-    assert out["discrete"][0, :, 0].tolist() == expected_d1_a
-    assert out["discrete"][0, :, 1].tolist() == expected_d2_a
+    # Padding check for split parts.
+    assert out["text_prompt"][1].tolist() == [300, pad_token_id, pad_token_id]
 
-    expected_cont_a = [0.0, 0.0, 0.1, 0.2, 0.0, 0.0, 0.3, 0.4, 0.0]
-    torch.testing.assert_close(
-        out["continuous"][0, :, 0],
-        torch.tensor(expected_cont_a, dtype=torch.float32),
-    )
+    # Flat attention mask follows: prompt_text+EOT+prompt_speech+EOS+target_text+EOT+target_speech+EOS.
+    len_a = _expected_flat_len(3, 2, 2) + _expected_flat_len(2, 2, 2)
+    len_b = _expected_flat_len(1, 1, 2) + _expected_flat_len(1, 1, 2)
+    assert tuple(out["attention_mask"].shape) == (2, len_a)
+    assert out["attention_mask"][0].tolist() == [True] * len_a
+    assert out["attention_mask"][1].tolist() == [True] * len_b + [False] * (len_a - len_b)
 
-    assert out["attention_mask"][0].tolist() == [True] * 9
-    assert out["attention_mask"][1].tolist() == [True] * 6 + [False] * 3
+    # Pre-flattened tensors are produced in collate and padded to the same sequence length.
+    assert tuple(out["flat_token_ids"].shape) == (2, len_a)
+    assert tuple(out["flat_token_type_ids"].shape) == (2, len_a)
+    assert tuple(out["flat_speech_stream_ids"].shape) == (2, len_a)
+    assert tuple(out["flat_target_block_ids"].shape) == (2, len_a)
+    assert tuple(out["flat_continuous_values"].shape) == (2, len_a, 1)
+    assert out["flat_target_block_counts"].tolist() == [2, 1]
+    assert tuple(out["flat_summary"].shape) == (2, 14)
+
+    # Sample A starts with prompt text then EOT.
+    assert out["flat_token_ids"][0, :4].tolist() == [200, 201, 202, 100]
+    # [text_prompt_start, text_prompt_end, speech_prompt_start, speech_prompt_end, ...]
+    assert out["flat_summary"][0, :4].tolist() == [0, 3, 4, 10]
+    assert int(out["flat_summary"][0, 8].item()) == len_a
+    # stream summary: [text_stream_idx, speech_discrete_start, speech_discrete_end, speech_continuous_idx]
+    assert out["flat_summary"][0, 10:14].tolist() == [0, 0, 1, 2]

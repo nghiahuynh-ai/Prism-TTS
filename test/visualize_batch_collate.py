@@ -31,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Generate a synthetic batch, run BatchCollate, and save visualizations "
-            "of collated text/discrete/continuous/attention streams."
+            "for split text/speech prompt/target tensors."
         )
     )
     parser.add_argument(
@@ -69,18 +69,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=128,
         help="Number of non-special discrete ids.",
-    )
-    parser.add_argument(
-        "--discrete-stream-delay-ms",
-        type=float,
-        default=80.0,
-        help="Shared delay in ms for all discrete streams and the continuous stream.",
-    )
-    parser.add_argument(
-        "--codec-frame-rate-hz",
-        type=float,
-        default=12.5,
-        help="Codec frame rate used to convert delay ms to frame delays.",
     )
     parser.add_argument(
         "--min-text-len",
@@ -209,11 +197,23 @@ def _make_sample(
     }
 
 
-def _draw_boundaries(ax: Any, prompt_len: int, valid_len: int) -> None:
-    prompt_boundary = prompt_len - 0.5
-    valid_boundary = valid_len - 0.5
-    ax.axvline(prompt_boundary, color="#0b3954", linewidth=1.5, linestyle="--")
-    ax.axvline(valid_boundary, color="#d7263d", linewidth=1.5, linestyle="--")
+def _plot_row(
+    ax: Any,
+    values: torch.Tensor,
+    *,
+    title: str,
+    ylabel: str,
+    cmap: str,
+) -> None:
+    image = ax.imshow(
+        values.numpy(),
+        aspect="auto",
+        interpolation="nearest",
+        cmap=cmap,
+    )
+    ax.set_title(title)
+    ax.set_ylabel(ylabel)
+    plt.colorbar(image, ax=ax, fraction=0.03, pad=0.01)
 
 
 def _save_sample_figure(
@@ -221,65 +221,85 @@ def _save_sample_figure(
     sample_idx: int,
     output_path: Path,
     *,
-    delay_token_id: int,
     eos_token_id: int,
     pad_token_id: int,
     dpi: int,
 ) -> None:
-    text = batch["text"][sample_idx].cpu()
-    discrete = batch["discrete"][sample_idx].transpose(0, 1).cpu()
-    continuous = batch["continuous"][sample_idx].transpose(0, 1).cpu()
+    text_prompt_len = int(batch["text_prompt_lengths"][sample_idx].item())
+    speech_prompt_len = int(batch["speech_prompt_lengths"][sample_idx].item())
+    text_target_len = int(batch["text_target_lengths"][sample_idx].item())
+    speech_target_len = int(batch["speech_target_lengths"][sample_idx].item())
+
+    text_prompt = batch["text_prompt"][sample_idx, :text_prompt_len].cpu().unsqueeze(0)
+    text_target = batch["text_target"][sample_idx, :text_target_len].cpu().unsqueeze(0)
+
+    discrete_prompt = (
+        batch["discrete_prompt"][sample_idx, :speech_prompt_len, :].transpose(0, 1).cpu()
+    )
+    discrete_target = (
+        batch["discrete_target"][sample_idx, :speech_target_len, :].transpose(0, 1).cpu()
+    )
+
+    continuous_prompt = (
+        batch["continuous_prompt"][sample_idx, :speech_prompt_len, :].transpose(0, 1).cpu()
+    )
+    continuous_target = (
+        batch["continuous_target"][sample_idx, :speech_target_len, :].transpose(0, 1).cpu()
+    )
+
     attention = batch["attention_mask"][sample_idx].to(dtype=torch.int32).unsqueeze(0).cpu()
 
-    prompt_len = int(batch["prompt_lengths"][sample_idx].item())
-    target_len = int(batch["target_lengths"][sample_idx].item())
-    valid_len = prompt_len + target_len
-
     fig, axes = plt.subplots(
-        4,
+        7,
         1,
-        figsize=(14, 10),
-        gridspec_kw={"height_ratios": [1.0, 2.0, 2.0, 1.0]},
+        figsize=(14, 14),
+        gridspec_kw={"height_ratios": [1, 1, 2, 2, 2, 2, 1]},
     )
 
-    im_text = axes[0].imshow(
-        text.unsqueeze(0).numpy(),
-        aspect="auto",
-        interpolation="nearest",
+    _plot_row(
+        axes[0],
+        text_prompt,
+        title="Text Prompt",
+        ylabel="text",
         cmap="viridis",
     )
-    axes[0].set_ylabel("text")
-    axes[0].set_yticks([0])
-    axes[0].set_title("Text IDs")
-    fig.colorbar(im_text, ax=axes[0], fraction=0.03, pad=0.01)
-
-    im_discrete = axes[1].imshow(
-        discrete.numpy(),
-        aspect="auto",
-        interpolation="nearest",
+    _plot_row(
+        axes[1],
+        text_target,
+        title=f"Text Target (special: eos={eos_token_id}, pad={pad_token_id})",
+        ylabel="text",
+        cmap="viridis",
+    )
+    _plot_row(
+        axes[2],
+        discrete_prompt,
+        title="Discrete Prompt [N, L2]",
+        ylabel="stream",
         cmap="magma",
     )
-    axes[1].set_ylabel("streams")
-    axes[1].set_yticks(list(range(discrete.shape[0])))
-    axes[1].set_yticklabels([f"D{i}" for i in range(discrete.shape[0])])
-    axes[1].set_title(
-        f"Discrete IDs (delay={delay_token_id}, eos={eos_token_id}, pad={pad_token_id})"
+    _plot_row(
+        axes[3],
+        discrete_target,
+        title="Discrete Target [N, L3]",
+        ylabel="stream",
+        cmap="magma",
     )
-    fig.colorbar(im_discrete, ax=axes[1], fraction=0.03, pad=0.01)
-
-    im_cont = axes[2].imshow(
-        continuous.numpy(),
-        aspect="auto",
-        interpolation="nearest",
+    _plot_row(
+        axes[4],
+        continuous_prompt,
+        title="Continuous Prompt [C, L2]",
+        ylabel="chan",
         cmap="coolwarm",
     )
-    axes[2].set_ylabel("channels")
-    axes[2].set_yticks(list(range(continuous.shape[0])))
-    axes[2].set_yticklabels([f"C{i}" for i in range(continuous.shape[0])])
-    axes[2].set_title("Continuous Latents")
-    fig.colorbar(im_cont, ax=axes[2], fraction=0.03, pad=0.01)
+    _plot_row(
+        axes[5],
+        continuous_target,
+        title="Continuous Target [C, L3]",
+        ylabel="chan",
+        cmap="coolwarm",
+    )
 
-    im_attn = axes[3].imshow(
+    attn_img = axes[6].imshow(
         attention.numpy(),
         aspect="auto",
         interpolation="nearest",
@@ -287,19 +307,17 @@ def _save_sample_figure(
         vmin=0,
         vmax=1,
     )
-    axes[3].set_ylabel("mask")
-    axes[3].set_yticks([0])
-    axes[3].set_yticklabels(["attn"])
-    axes[3].set_title("Attention Mask (1=valid, 0=pad)")
-    fig.colorbar(im_attn, ax=axes[3], fraction=0.03, pad=0.01)
-
-    for ax in axes:
-        _draw_boundaries(ax, prompt_len=prompt_len, valid_len=valid_len)
-        ax.set_xlim(-0.5, float(text.shape[0]) - 0.5)
-    axes[-1].set_xlabel("time steps")
+    axes[6].set_title("Flattened Attention Mask (1=valid, 0=pad)")
+    axes[6].set_ylabel("mask")
+    axes[6].set_xlabel("flattened sequence index")
+    plt.colorbar(attn_img, ax=axes[6], fraction=0.03, pad=0.01)
 
     fig.suptitle(
-        f"Sample {sample_idx} | prompt_len={prompt_len}, target_len={target_len}, total={text.shape[0]}",
+        (
+            f"Sample {sample_idx} | "
+            f"text_prompt={text_prompt_len}, speech_prompt={speech_prompt_len}, "
+            f"text_target={text_target_len}, speech_target={speech_target_len}"
+        ),
         fontsize=12,
     )
     fig.tight_layout()
@@ -314,19 +332,15 @@ def _save_overview_figure(
     *,
     dpi: int,
 ) -> None:
-    text = batch["text"].cpu()
     attention_mask = batch["attention_mask"].to(dtype=torch.int32).cpu()
-    prompt_lengths = batch["prompt_lengths"].cpu()
-    target_lengths = batch["target_lengths"].cpu()
+    text_prompt_lengths = batch["text_prompt_lengths"].cpu()
+    speech_prompt_lengths = batch["speech_prompt_lengths"].cpu()
+    text_target_lengths = batch["text_target_lengths"].cpu()
+    speech_target_lengths = batch["speech_target_lengths"].cpu()
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10), gridspec_kw={"height_ratios": [2, 1, 1]})
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={"height_ratios": [2, 1]})
 
-    im_text = axes[0].imshow(text.numpy(), aspect="auto", interpolation="nearest", cmap="viridis")
-    axes[0].set_title("Batch Text IDs [B, L]")
-    axes[0].set_ylabel("sample")
-    fig.colorbar(im_text, ax=axes[0], fraction=0.03, pad=0.01)
-
-    im_mask = axes[1].imshow(
+    mask_img = axes[0].imshow(
         attention_mask.numpy(),
         aspect="auto",
         interpolation="nearest",
@@ -334,18 +348,21 @@ def _save_overview_figure(
         vmin=0,
         vmax=1,
     )
-    axes[1].set_title("Batch Attention Mask [B, L]")
-    axes[1].set_ylabel("sample")
-    fig.colorbar(im_mask, ax=axes[1], fraction=0.03, pad=0.01)
+    axes[0].set_title("Batch Flattened Attention Mask [B, L]")
+    axes[0].set_ylabel("sample")
+    plt.colorbar(mask_img, ax=axes[0], fraction=0.03, pad=0.01)
 
-    sample_idx = torch.arange(text.shape[0], dtype=torch.long)
-    axes[2].bar(sample_idx.numpy() - 0.15, prompt_lengths.numpy(), width=0.3, label="prompt")
-    axes[2].bar(sample_idx.numpy() + 0.15, target_lengths.numpy(), width=0.3, label="target")
-    axes[2].set_title("Prompt/Target Lengths")
-    axes[2].set_xlabel("sample")
-    axes[2].set_ylabel("length")
-    axes[2].set_xticks(sample_idx.numpy())
-    axes[2].legend(loc="upper right")
+    sample_idx = torch.arange(attention_mask.shape[0], dtype=torch.long)
+    width = 0.2
+    axes[1].bar(sample_idx.numpy() - 1.5 * width, text_prompt_lengths.numpy(), width=width, label="text_prompt")
+    axes[1].bar(sample_idx.numpy() - 0.5 * width, speech_prompt_lengths.numpy(), width=width, label="speech_prompt")
+    axes[1].bar(sample_idx.numpy() + 0.5 * width, text_target_lengths.numpy(), width=width, label="text_target")
+    axes[1].bar(sample_idx.numpy() + 1.5 * width, speech_target_lengths.numpy(), width=width, label="speech_target")
+    axes[1].set_title("Per-sample Split Lengths")
+    axes[1].set_xlabel("sample")
+    axes[1].set_ylabel("length")
+    axes[1].set_xticks(sample_idx.numpy())
+    axes[1].legend(loc="upper right")
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,27 +370,50 @@ def _save_overview_figure(
     plt.close(fig)
 
 
+def _expected_flat_length(sample: dict[str, torch.Tensor], num_discrete_streams: int) -> int:
+    text_prompt_len = int(sample["text_prompt"].shape[0])
+    speech_prompt_len = int(sample["discrete_prompt"].shape[0])
+    text_target_len = int(sample["text_target"].shape[0])
+    speech_target_len = int(sample["discrete_target"].shape[0])
+
+    speech_block_size = num_discrete_streams + 1
+    return (
+        text_prompt_len
+        + 1
+        + speech_prompt_len * speech_block_size
+        + 1
+        + text_target_len
+        + 1
+        + speech_target_len * speech_block_size
+        + 1
+    )
+
+
 def _validate_collated_batch(batch: dict[str, torch.Tensor]) -> None:
-    batch_size, text_len = batch["text"].shape
-    if batch["discrete"].shape[:2] != (batch_size, text_len):
-        raise RuntimeError("discrete shape does not align with text shape.")
-    if batch["continuous"].shape[:2] != (batch_size, text_len):
-        raise RuntimeError("continuous shape does not align with text shape.")
-    if batch["attention_mask"].shape != (batch_size, text_len):
-        raise RuntimeError("attention_mask shape does not align with text shape.")
+    batch_size = int(batch["text_prompt"].shape[0])
+    if batch["discrete_prompt"].shape[0] != batch_size or batch["continuous_prompt"].shape[0] != batch_size:
+        raise RuntimeError("Prompt tensors do not agree on batch dimension.")
+    if batch["discrete_target"].shape[0] != batch_size or batch["continuous_target"].shape[0] != batch_size:
+        raise RuntimeError("Target tensors do not agree on batch dimension.")
+
+    num_discrete_streams = int(batch["discrete_prompt"].shape[2])
 
     for idx in range(batch_size):
-        prompt_len = int(batch["prompt_lengths"][idx].item())
-        target_len = int(batch["target_lengths"][idx].item())
-        valid_len = prompt_len + target_len
-        if valid_len > text_len:
-            raise RuntimeError(
-                f"sample {idx}: prompt_len + target_len ({valid_len}) exceeds padded length {text_len}."
-            )
+        sample = {
+            "text_prompt": batch["text_prompt"][idx, : int(batch["text_prompt_lengths"][idx].item())],
+            "discrete_prompt": batch["discrete_prompt"][
+                idx, : int(batch["speech_prompt_lengths"][idx].item()), :
+            ],
+            "text_target": batch["text_target"][idx, : int(batch["text_target_lengths"][idx].item())],
+            "discrete_target": batch["discrete_target"][
+                idx, : int(batch["speech_target_lengths"][idx].item()), :
+            ],
+        }
+        expected_valid = _expected_flat_length(sample, num_discrete_streams=num_discrete_streams)
         actual_valid = int(batch["attention_mask"][idx].sum().item())
-        if actual_valid != valid_len:
+        if actual_valid != expected_valid:
             raise RuntimeError(
-                f"sample {idx}: attention_mask valid count ({actual_valid}) != expected {valid_len}."
+                f"sample {idx}: attention_mask valid count ({actual_valid}) != expected ({expected_valid})."
             )
 
 
@@ -384,19 +424,20 @@ def _print_batch_summary(batch: dict[str, torch.Tensor]) -> None:
         if isinstance(value, torch.Tensor):
             print(f"  - {key}: shape={tuple(value.shape)}, dtype={value.dtype}")
     print("Per-sample lengths:")
-    for idx in range(int(batch["text"].shape[0])):
-        prompt_len = int(batch["prompt_lengths"][idx].item())
-        target_len = int(batch["target_lengths"][idx].item())
-        print(f"  - sample {idx}: prompt_len={prompt_len}, target_len={target_len}")
+    for idx in range(int(batch["text_prompt"].shape[0])):
+        print(
+            "  - sample "
+            f"{idx}: text_prompt={int(batch['text_prompt_lengths'][idx].item())}, "
+            f"speech_prompt={int(batch['speech_prompt_lengths'][idx].item())}, "
+            f"text_target={int(batch['text_target_lengths'][idx].item())}, "
+            f"speech_target={int(batch['speech_target_lengths'][idx].item())}"
+        )
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    delay_ms = float(args.discrete_stream_delay_ms)
 
-    delay_token_id, eos_token_id, pad_token_id, _ = build_shared_token_layout(
-        args.discrete_token_count
-    )
+    _, eos_token_id, pad_token_id, _ = build_shared_token_layout(args.discrete_token_count)
 
     samples = [
         _make_sample(
@@ -413,11 +454,7 @@ def main() -> None:
         for sample_idx in range(args.batch_size)
     ]
 
-    collate = BatchCollate(
-        discrete_token_count=args.discrete_token_count,
-        discrete_stream_delay_ms=delay_ms,
-        codec_frame_rate_hz=args.codec_frame_rate_hz,
-    )
+    collate = BatchCollate(discrete_token_count=args.discrete_token_count)
     batch = collate(samples)
     _validate_collated_batch(batch)
     _print_batch_summary(batch)
@@ -433,7 +470,6 @@ def main() -> None:
             batch=batch,
             sample_idx=sample_idx,
             output_path=output_path,
-            delay_token_id=delay_token_id,
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
             dpi=args.dpi,

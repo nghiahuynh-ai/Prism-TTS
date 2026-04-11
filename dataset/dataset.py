@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -21,24 +20,27 @@ from utils.dataset_utils import (
 )
 
 DEFAULT_DISCRETE_TOKEN_COUNT = 2048
+TEXT_TOKEN_TYPE = 0
+SPEECH_DISCRETE_TOKEN_TYPE = 1
+SPEECH_CONTINUOUS_TOKEN_TYPE = 2
 
 
 def build_shared_token_layout(discrete_token_count: int) -> tuple[int, int, int, int]:
     """
-    Return (delay_token_id, eos_token_id, pad_token_id, text_token_offset)
+    Return (eot_token_id, eos_token_id, pad_token_id, text_token_offset)
     for a given discrete token count.
     """
     if discrete_token_count < 1:
         raise ValueError("discrete_token_count must be >= 1.")
-    delay_token_id = discrete_token_count
+    eot_token_id = discrete_token_count
     eos_token_id = discrete_token_count + 1
     pad_token_id = discrete_token_count + 2
     text_token_offset = discrete_token_count + 3
-    return delay_token_id, eos_token_id, pad_token_id, text_token_offset
+    return eot_token_id, eos_token_id, pad_token_id, text_token_offset
 
 
 (
-    DEFAULT_DELAY_TOKEN_ID,
+    DEFAULT_EOT_TOKEN_ID,
     DEFAULT_EOS_TOKEN_ID,
     DEFAULT_PAD_TOKEN_ID,
     DEFAULT_TEXT_TOKEN_OFFSET,
@@ -49,7 +51,7 @@ class SharedVocabTokenizer:
     """
     Character-level tokenizer with shared text/discrete id space:
     - [0, discrete_token_count - 1] -> discrete ids
-    - discrete_token_count -> DELAY
+    - discrete_token_count -> EOT (text boundary marker)
     - discrete_token_count + 1 -> EOS
     - discrete_token_count + 2 -> PAD
     - the rest -> text characters from vocab file
@@ -130,7 +132,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
     Shared token-id layout:
     - [0, discrete_token_count - 1]: discrete tokens
-    - discrete_token_count: DELAY
+    - discrete_token_count: EOT
     - discrete_token_count + 1: EOS
     - discrete_token_count + 2: PAD
     - [discrete_token_count + 3, ...]: text tokens from vocab.txt
@@ -144,9 +146,6 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(
         self,
         source: str | Path | Sequence[Mapping[str, Any]],
-        prompt_length: int | None = None,
-        min_prompt_length: int = 1,
-        min_target_length: int = 1,
         vocab_path: str | Path | None = None,
         manifest_root: str | Path | None = None,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
@@ -158,7 +157,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
     ) -> None:
         self.discrete_token_count = int(discrete_token_count)
         (
-            self.delay_token_id,
+            self.eot_token_id,
             self.eos_token_id,
             self.pad_token_id,
             self.text_token_offset,
@@ -191,10 +190,6 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             raise ValueError("discrete_stream_count must be >= 1 when provided.")
         if self.continuous_feature_dim is not None and self.continuous_feature_dim < 1:
             raise ValueError("continuous_feature_dim must be >= 1 when provided.")
-        # Kept for compatibility with older call-sites.
-        self.prompt_length = prompt_length
-        self.min_prompt_length = min_prompt_length
-        self.min_target_length = min_target_length
 
         self._entries: list[ManifestEntry] = []
         self._samples: list[Mapping[str, Any]] = []
@@ -425,7 +420,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
 
 class BatchCollate:
-    """Pad Prism-TTS samples using shared special-token ids across modalities."""
+    """Pad Prism-TTS samples without delay alignment."""
 
     def __init__(
         self,
@@ -434,15 +429,9 @@ class BatchCollate:
         continuous_pad_value: float = 0.0,
         include_attention_mask: bool = True,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
-        prompt_length: int | None = None,
-        min_prompt_length: int = 1,
-        min_target_length: int = 1,
-        stream_delay: int | None = None,
-        discrete_stream_delay_ms: float | None = None,
-        codec_frame_rate_hz: float = 12.5,
     ) -> None:
         (
-            self.delay_token_id,
+            self.eot_token_id,
             self.eos_token_id,
             self.pad_token_id,
             _,
@@ -454,76 +443,89 @@ class BatchCollate:
         self.continuous_pad_value = continuous_pad_value
         self.include_attention_mask = include_attention_mask
         self.discrete_token_count = int(discrete_token_count)
-        # Kept for compatibility with older call-sites.
-        self.prompt_length = prompt_length
-        self.min_prompt_length = min_prompt_length
-        self.min_target_length = min_target_length
-        if stream_delay is not None and discrete_stream_delay_ms is not None:
-            raise ValueError(
-                "Provide either stream_delay (tokens) or "
-                "discrete_stream_delay_ms (milliseconds), not both."
-            )
-        if codec_frame_rate_hz <= 0:
-            raise ValueError("codec_frame_rate_hz must be > 0.")
-        self.codec_frame_rate_hz = float(codec_frame_rate_hz)
-        self.stream_delay = None if stream_delay is None else int(stream_delay)
-        if self.stream_delay is not None and self.stream_delay < 0:
-            raise ValueError("stream_delay must be non-negative.")
-        self.discrete_stream_delay_ms = (
-            None if discrete_stream_delay_ms is None else float(discrete_stream_delay_ms)
-        )
-        if self.discrete_stream_delay_ms is not None and self.discrete_stream_delay_ms < 0:
-            raise ValueError("discrete_stream_delay_ms must be non-negative.")
 
     def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         if not batch:
             raise ValueError("BatchCollate received an empty batch.")
 
         samples = [self._validate_collate_sample(item) for item in batch]
-        prepared = [self._prepare_sample_streams(sample) for sample in samples]
+        text_prompt_lengths = torch.tensor(
+            [int(sample["text_prompt"].shape[0]) for sample in samples],
+            dtype=torch.long,
+        )
+        speech_prompt_lengths = torch.tensor(
+            [int(sample["discrete_prompt"].shape[0]) for sample in samples],
+            dtype=torch.long,
+        )
+        text_target_lengths = torch.tensor(
+            [int(sample["text_target"].shape[0]) for sample in samples],
+            dtype=torch.long,
+        )
+        speech_target_lengths = torch.tensor(
+            [int(sample["discrete_target"].shape[0]) for sample in samples],
+            dtype=torch.long,
+        )
 
         collated: dict[str, torch.Tensor] = {
-            "text": _pad_1d([x["text"] for x in prepared], self.text_pad_value),
-            "discrete": _pad_2d([x["discrete"] for x in prepared], self.discrete_pad_value),
-            "continuous": _pad_2d([x["continuous"] for x in prepared], self.continuous_pad_value),
-            "prompt_lengths": torch.tensor(
-                [int(x["prompt_length"]) for x in prepared],
-                dtype=torch.long,
+            "text_prompt": _pad_1d([sample["text_prompt"] for sample in samples], self.text_pad_value),
+            "discrete_prompt": _pad_2d(
+                [sample["discrete_prompt"] for sample in samples],
+                self.discrete_pad_value,
             ),
-            "target_lengths": torch.tensor(
-                [int(x["target_length"]) for x in prepared],
-                dtype=torch.long,
+            "continuous_prompt": _pad_2d(
+                [sample["continuous_prompt"] for sample in samples],
+                self.continuous_pad_value,
             ),
+            "text_target": _pad_1d([sample["text_target"] for sample in samples], self.text_pad_value),
+            "discrete_target": _pad_2d(
+                [sample["discrete_target"] for sample in samples],
+                self.discrete_pad_value,
+            ),
+            "continuous_target": _pad_2d(
+                [sample["continuous_target"] for sample in samples],
+                self.continuous_pad_value,
+            ),
+            "text_prompt_lengths": text_prompt_lengths,
+            "speech_prompt_lengths": speech_prompt_lengths,
+            "text_target_lengths": text_target_lengths,
+            "speech_target_lengths": speech_target_lengths,
         }
+
+        flat_per_sample = [self._build_flat_sample(sample) for sample in samples]
+        collated["flat_token_ids"] = _pad_1d(
+            [item["token_ids"] for item in flat_per_sample],
+            self.pad_token_id,
+        )
+        collated["flat_token_type_ids"] = _pad_1d(
+            [item["token_type_ids"] for item in flat_per_sample],
+            TEXT_TOKEN_TYPE,
+        )
+        collated["flat_speech_stream_ids"] = _pad_1d(
+            [item["speech_stream_ids"] for item in flat_per_sample],
+            -1,
+        )
+        collated["flat_target_block_ids"] = _pad_1d(
+            [item["target_block_ids"] for item in flat_per_sample],
+            -1,
+        )
+        collated["flat_continuous_values"] = _pad_2d(
+            [item["continuous_values"] for item in flat_per_sample],
+            0.0,
+        )
+        collated["flat_target_block_counts"] = speech_target_lengths
+        collated["flat_summary"] = torch.stack(
+            [item["summary"] for item in flat_per_sample],
+            dim=0,
+        )
+
         if self.include_attention_mask:
             collated["attention_mask"] = _pad_1d(
-                [x["attention_mask"] for x in prepared],
+                [item["attention_mask"] for item in flat_per_sample],
                 False,
             ).to(dtype=torch.bool)
 
-        # Legacy split keys are kept for compatibility with call-sites that still
-        # require explicit prompt/target tensors (e.g., generation utilities).
-        collated["text_prompt"] = _pad_1d([x["text_prompt"] for x in prepared], self.text_pad_value)
-        collated["discrete_prompt"] = _pad_2d(
-            [x["discrete_prompt"] for x in prepared],
-            self.discrete_pad_value,
-        )
-        collated["continuous_prompt"] = _pad_2d(
-            [x["continuous_prompt"] for x in prepared],
-            self.continuous_pad_value,
-        )
-        collated["text_target"] = _pad_1d([x["text_target"] for x in prepared], self.text_pad_value)
-        collated["discrete_target"] = _pad_2d(
-            [x["discrete_target"] for x in prepared],
-            self.discrete_pad_value,
-        )
-        collated["continuous_target"] = _pad_2d(
-            [x["continuous_target"] for x in prepared],
-            self.continuous_pad_value,
-        )
-
-        self._collate_optional_1d(prepared, collated, key="flow_timesteps", pad_value=0.0)
-        self._collate_optional_2d(prepared, collated, key="noise", pad_value=0.0)
+        self._collate_optional_1d(samples, collated, key="flow_timesteps", pad_value=0.0)
+        self._collate_optional_2d(samples, collated, key="noise", pad_value=0.0)
         return collated
 
     def _validate_collate_sample(self, sample: Mapping[str, Any]) -> dict[str, torch.Tensor]:
@@ -582,7 +584,7 @@ class BatchCollate:
         if "attention_mask" in sample and sample["attention_mask"] is not None:
             raise ValueError(
                 "Per-sample attention_mask is not supported in BatchCollate. "
-                "BatchCollate now builds pad-only attention masks from aligned streams."
+                "BatchCollate now builds pad-only attention masks from concatenated parts."
             )
 
         if "flow_timesteps" in sample and sample["flow_timesteps"] is not None:
@@ -601,259 +603,146 @@ class BatchCollate:
 
         return normalized
 
-    def _resolve_shared_delay(self) -> int:
-        if self.stream_delay is not None:
-            return int(self.stream_delay)
-        if self.discrete_stream_delay_ms is not None:
-            return int(math.ceil((self.discrete_stream_delay_ms * self.codec_frame_rate_hz) / 1000.0))
-        return 0
-
-    @staticmethod
-    def _pad_to_length_1d(
-        tensor: torch.Tensor,
-        length: int,
-        pad_value: int | float,
-    ) -> torch.Tensor:
-        if tensor.dim() != 1:
-            raise ValueError(f"Expected 1D tensor, got shape {tuple(tensor.shape)}.")
-        if length < tensor.shape[0]:
-            raise ValueError("Cannot pad to a length smaller than the source tensor.")
-        if length == tensor.shape[0]:
-            return tensor
-        out = torch.full((length,), pad_value, dtype=tensor.dtype, device=tensor.device)
-        out[: tensor.shape[0]] = tensor
-        return out
-
-    @staticmethod
-    def _pad_to_length_2d(
-        tensor: torch.Tensor,
-        length: int,
-        pad_value: int | float,
-    ) -> torch.Tensor:
-        if tensor.dim() != 2:
-            raise ValueError(f"Expected 2D tensor, got shape {tuple(tensor.shape)}.")
-        if length < tensor.shape[0]:
-            raise ValueError("Cannot pad to a length smaller than the source tensor.")
-        if length == tensor.shape[0]:
-            return tensor
-        out = torch.full(
-            (length, tensor.shape[1]),
-            pad_value,
-            dtype=tensor.dtype,
-            device=tensor.device,
+    def _build_flat_attention_mask(self, sample: dict[str, torch.Tensor]) -> torch.BoolTensor:
+        prompt_text = int(sample["text_prompt"].shape[0])
+        prompt_speech = int(sample["discrete_prompt"].shape[0])
+        target_text = int(sample["text_target"].shape[0])
+        target_speech = int(sample["discrete_target"].shape[0])
+        num_streams = int(sample["discrete_target"].shape[1]) + 1
+        total = (
+            prompt_text
+            + 1
+            + prompt_speech * num_streams
+            + 1
+            + target_text
+            + 1
+            + target_speech * num_streams
+            + 1
         )
-        out[: tensor.shape[0], :] = tensor
-        return out
+        return torch.ones(total, dtype=torch.bool)
 
-    def _global_extra_delay(self, text_length: int, discrete_length: int, shared_delay: int) -> int:
-        # Ensure the last text token index is strictly smaller than the last real
-        # discrete/continuous token index in this part.
-        # last_text_idx = text_length - 1
-        # last_discrete_idx = shared_delay + extra + discrete_length - 1
-        # need: last_discrete_idx > last_text_idx
-        required = text_length - discrete_length - shared_delay + 1
-        return max(0, int(required))
+    def _build_flat_sample(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """
+        Flatten one split Prism sample into:
+        text_prompt -> EOT -> speech_prompt -> EOS -> text_target -> EOT -> speech_target -> EOS.
 
-    def _build_aligned_part(
-        self,
-        text_tokens: torch.LongTensor,
-        discrete_tokens: torch.LongTensor,
-        continuous_latents: torch.FloatTensor,
-        shared_delay: int,
-    ) -> dict[str, torch.Tensor]:
-        if text_tokens.dim() != 1:
-            raise ValueError("text_tokens must be 1D.")
-        if discrete_tokens.dim() != 2:
-            raise ValueError("discrete_tokens must be 2D [L, N].")
-        if continuous_latents.dim() != 2:
-            raise ValueError("continuous_latents must be 2D [L, C].")
-        if discrete_tokens.shape[0] != continuous_latents.shape[0]:
-            raise ValueError("discrete_tokens and continuous_latents must share length.")
-        text_length = int(text_tokens.shape[0])
-        discrete_length = int(discrete_tokens.shape[0])
-        extra_delay = self._global_extra_delay(
-            text_length=text_length,
-            discrete_length=discrete_length,
-            shared_delay=shared_delay,
+        Returns core flat tensors plus a compact summary tensor:
+        [text_prompt_start, text_prompt_end, speech_prompt_start, speech_prompt_end,
+         text_target_start, text_target_end, speech_target_start, speech_target_end,
+         sequence_length, num_discrete_streams,
+         text_stream_idx, speech_discrete_stream_start_idx, speech_discrete_stream_end_idx,
+         speech_continuous_stream_idx]
+        where each *_start/*_end boundary is [start, end) in flattened token indices.
+        """
+        prompt_text = sample["text_prompt"].to(dtype=torch.long)
+        prompt_discrete = sample["discrete_prompt"].to(dtype=torch.long)
+        prompt_continuous = sample["continuous_prompt"].to(dtype=torch.float32)
+        target_text = sample["text_target"].to(dtype=torch.long)
+        target_discrete = sample["discrete_target"].to(dtype=torch.long)
+        target_continuous = sample["continuous_target"].to(dtype=torch.float32)
+
+        num_discrete_streams = int(prompt_discrete.shape[1])
+        continuous_dim = int(prompt_continuous.shape[1])
+
+        token_ids: list[int] = []
+        token_type_ids: list[int] = []
+        speech_stream_ids: list[int] = []
+        target_block_ids: list[int] = []
+        continuous_values: list[torch.Tensor] = []
+
+        text_stream_idx = 0
+        speech_discrete_stream_start_idx = 0
+        speech_discrete_stream_end_idx = num_discrete_streams - 1
+        speech_continuous_stream_idx = num_discrete_streams
+
+        zero_cont = torch.zeros(continuous_dim, dtype=torch.float32)
+
+        def append_text(token_id: int) -> None:
+            token_ids.append(int(token_id))
+            token_type_ids.append(TEXT_TOKEN_TYPE)
+            speech_stream_ids.append(text_stream_idx)
+            target_block_ids.append(-1)
+            continuous_values.append(zero_cont)
+
+        def append_discrete(token_id: int, stream_id: int, block_id: int) -> None:
+            token_ids.append(int(token_id))
+            token_type_ids.append(SPEECH_DISCRETE_TOKEN_TYPE)
+            speech_stream_ids.append(int(stream_id))
+            target_block_ids.append(int(block_id))
+            continuous_values.append(zero_cont)
+
+        def append_continuous(value: torch.Tensor, block_id: int) -> None:
+            token_ids.append(self.pad_token_id)
+            token_type_ids.append(SPEECH_CONTINUOUS_TOKEN_TYPE)
+            speech_stream_ids.append(speech_continuous_stream_idx)
+            target_block_ids.append(int(block_id))
+            continuous_values.append(value)
+
+        text_prompt_start = len(token_ids)
+        for token in prompt_text.tolist():
+            append_text(token)
+        text_prompt_end = len(token_ids)
+        append_text(self.eot_token_id)
+
+        speech_prompt_start = len(token_ids)
+        for block_idx in range(int(prompt_discrete.shape[0])):
+            for stream_idx in range(num_discrete_streams):
+                append_discrete(
+                    int(prompt_discrete[block_idx, stream_idx].item()),
+                    stream_idx,
+                    -1,
+                )
+            append_continuous(prompt_continuous[block_idx], -1)
+        speech_prompt_end = len(token_ids)
+        append_text(self.eos_token_id)
+
+        text_target_start = len(token_ids)
+        for token in target_text.tolist():
+            append_text(token)
+        text_target_end = len(token_ids)
+        append_text(self.eot_token_id)
+
+        speech_target_start = len(token_ids)
+        for block_idx in range(int(target_discrete.shape[0])):
+            for stream_idx in range(num_discrete_streams):
+                append_discrete(
+                    int(target_discrete[block_idx, stream_idx].item()),
+                    stream_idx,
+                    block_idx,
+                )
+            append_continuous(target_continuous[block_idx], block_idx)
+        speech_target_end = len(token_ids)
+        append_text(self.eos_token_id)
+
+        seq_len = len(token_ids)
+        summary = torch.tensor(
+            [
+                text_prompt_start,
+                text_prompt_end,
+                speech_prompt_start,
+                speech_prompt_end,
+                text_target_start,
+                text_target_end,
+                speech_target_start,
+                speech_target_end,
+                seq_len,
+                num_discrete_streams,
+                text_stream_idx,
+                speech_discrete_stream_start_idx,
+                speech_discrete_stream_end_idx,
+                speech_continuous_stream_idx,
+            ],
+            dtype=torch.long,
         )
-        effective_delay = int(shared_delay) + extra_delay
-        continuous_delay = effective_delay
-
-        text_eos = text_tokens.new_tensor([self.eos_token_id], dtype=text_tokens.dtype)
-        text_stream = torch.cat([text_tokens, text_eos], dim=0)
-
-        discrete_streams: list[torch.Tensor] = []
-        for stream_idx in range(int(discrete_tokens.shape[1])):
-            prefix = discrete_tokens.new_full((effective_delay,), self.delay_token_id)
-            eos = discrete_tokens.new_full((1,), self.eos_token_id)
-            stream = torch.cat([prefix, discrete_tokens[:, stream_idx], eos], dim=0)
-            discrete_streams.append(stream)
-
-        continuous_channel_count = int(continuous_latents.shape[1])
-        continuous_prefix = continuous_latents.new_zeros(
-            (continuous_delay, continuous_channel_count),
-        )
-        continuous_eos = continuous_latents.new_zeros((1, continuous_channel_count))
-        continuous_stream = torch.cat(
-            [continuous_prefix, continuous_latents, continuous_eos],
-            dim=0,
-        )
-
-        max_stream_len = max(
-            int(text_stream.shape[0]),
-            max(int(stream.shape[0]) for stream in discrete_streams) if discrete_streams else 0,
-            int(continuous_stream.shape[0]),
-        )
-        text_aligned = self._pad_to_length_1d(text_stream, max_stream_len, self.text_pad_value)
-
-        discrete_aligned = discrete_tokens.new_full(
-            (max_stream_len, len(discrete_streams)),
-            self.discrete_pad_value,
-        )
-        for stream_idx, stream in enumerate(discrete_streams):
-            discrete_aligned[: stream.shape[0], stream_idx] = stream
-
-        continuous_aligned = self._pad_to_length_2d(
-            continuous_stream,
-            max_stream_len,
-            self.continuous_pad_value,
-        )
-
         return {
-            "text": text_aligned,
-            "discrete": discrete_aligned,
-            "continuous": continuous_aligned,
+            "token_ids": torch.tensor(token_ids, dtype=torch.long),
+            "continuous_values": torch.stack(continuous_values, dim=0).to(dtype=torch.float32),
+            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
+            "speech_stream_ids": torch.tensor(speech_stream_ids, dtype=torch.long),
+            "target_block_ids": torch.tensor(target_block_ids, dtype=torch.long),
+            "attention_mask": torch.ones(seq_len, dtype=torch.bool),
+            "summary": summary,
         }
-
-    def _maybe_align_flow_timesteps(
-        self,
-        flow_timesteps: torch.Tensor | None,
-        target_continuous_len: int,
-        target_aligned_len: int,
-        target_continuous_delay: int,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if flow_timesteps is None:
-            return None
-        if flow_timesteps.shape[0] != target_continuous_len:
-            raise ValueError(
-                "flow_timesteps length must match raw target continuous length "
-                f"({target_continuous_len})."
-            )
-        aligned = torch.zeros(target_aligned_len, dtype=flow_timesteps.dtype, device=device)
-        start = target_continuous_delay
-        end = start + target_continuous_len
-        aligned[start:end] = flow_timesteps.to(device=device)
-        return aligned
-
-    def _maybe_align_noise(
-        self,
-        noise: torch.Tensor | None,
-        target_continuous_shape: tuple[int, int],
-        target_aligned_len: int,
-        target_continuous_delay: int,
-        device: torch.device,
-    ) -> torch.Tensor | None:
-        if noise is None:
-            return None
-        target_len, channels = target_continuous_shape
-        if noise.shape != (target_len, channels):
-            raise ValueError(
-                "noise must have shape [raw_target_len, continuous_channels]. "
-                f"Expected {(target_len, channels)}, got {tuple(noise.shape)}."
-            )
-        aligned = torch.zeros(
-            target_aligned_len,
-            channels,
-            dtype=noise.dtype,
-            device=device,
-        )
-        start = target_continuous_delay
-        end = start + target_len
-        aligned[start:end, :] = noise.to(device=device)
-        return aligned
-
-    def _prepare_sample_streams(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        shared_delay = self._resolve_shared_delay()
-
-        prompt_part = self._build_aligned_part(
-            text_tokens=sample["text_prompt"],
-            discrete_tokens=sample["discrete_prompt"],
-            continuous_latents=sample["continuous_prompt"],
-            shared_delay=shared_delay,
-        )
-        target_part = self._build_aligned_part(
-            text_tokens=sample["text_target"],
-            discrete_tokens=sample["discrete_target"],
-            continuous_latents=sample["continuous_target"],
-            shared_delay=shared_delay,
-        )
-
-        text = torch.cat([prompt_part["text"], target_part["text"]], dim=0)
-        discrete = torch.cat([prompt_part["discrete"], target_part["discrete"]], dim=0)
-        continuous = torch.cat([prompt_part["continuous"], target_part["continuous"]], dim=0)
-
-        prompt_length = int(prompt_part["text"].shape[0])
-        target_length = int(target_part["text"].shape[0])
-        attention_mask = torch.ones(
-            prompt_length + target_length,
-            dtype=torch.bool,
-            device=text.device,
-        )
-
-        prepared: dict[str, torch.Tensor] = {
-            "text": text,
-            "discrete": discrete,
-            "continuous": continuous,
-            "attention_mask": attention_mask,
-            "text_prompt": prompt_part["text"],
-            "discrete_prompt": prompt_part["discrete"],
-            "continuous_prompt": prompt_part["continuous"],
-            "text_target": target_part["text"],
-            "discrete_target": target_part["discrete"],
-            "continuous_target": target_part["continuous"],
-            "prompt_length": torch.tensor(prompt_length, dtype=torch.long),
-            "target_length": torch.tensor(target_length, dtype=torch.long),
-        }
-
-        if "flow_timesteps" in sample:
-            extra_delay = self._global_extra_delay(
-                text_length=int(sample["text_target"].shape[0]),
-                discrete_length=int(sample["discrete_target"].shape[0]),
-                shared_delay=shared_delay,
-            )
-            target_delay = shared_delay + extra_delay
-            aligned_flow_timesteps = self._maybe_align_flow_timesteps(
-                flow_timesteps=sample["flow_timesteps"],
-                target_continuous_len=int(sample["continuous_target"].shape[0]),
-                target_aligned_len=target_length,
-                target_continuous_delay=target_delay,
-                device=text.device,
-            )
-            if aligned_flow_timesteps is not None:
-                prepared["flow_timesteps"] = aligned_flow_timesteps
-
-        if "noise" in sample:
-            extra_delay = self._global_extra_delay(
-                text_length=int(sample["text_target"].shape[0]),
-                discrete_length=int(sample["discrete_target"].shape[0]),
-                shared_delay=shared_delay,
-            )
-            target_delay = shared_delay + extra_delay
-            aligned_noise = self._maybe_align_noise(
-                noise=sample["noise"],
-                target_continuous_shape=(
-                    int(sample["continuous_target"].shape[0]),
-                    int(sample["continuous_target"].shape[1]),
-                ),
-                target_aligned_len=target_length,
-                target_continuous_delay=target_delay,
-                device=text.device,
-            )
-            if aligned_noise is not None:
-                prepared["noise"] = aligned_noise
-
-        return prepared
 
     @staticmethod
     def _collate_optional_1d(

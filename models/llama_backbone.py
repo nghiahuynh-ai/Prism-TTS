@@ -21,70 +21,44 @@ def _to_additive_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return mask.to(dtype=dtype)
 
     mask = mask.to(dtype=dtype)
-    inverted_mask = 1.0 - mask
-    return inverted_mask.masked_fill(
-        inverted_mask.to(torch.bool), torch.finfo(dtype).min
-    )
+    min_dtype = torch.finfo(dtype).min
+    return (1.0 - mask).masked_fill((1.0 - mask).to(torch.bool), min_dtype)
 
 
-def _prepare_4d_causal_attention_mask(
-    attention_mask: Optional[torch.Tensor],
-    sequence_length: int,
+def _expand_padding_mask_to_4d(
+    attention_mask: torch.Tensor,
+    query_length: int,
     target_length: int,
     dtype: torch.dtype,
     device: torch.device,
-    cache_position: torch.Tensor,
-    batch_size: int,
 ) -> torch.Tensor:
-    if attention_mask is not None and attention_mask.dim() == 4:
-        return _to_additive_mask(attention_mask.to(device=device), dtype)
+    if attention_mask.dim() != 2:
+        raise ValueError("Padding attention_mask must be 2D [batch, key_len].")
 
-    min_dtype = torch.finfo(dtype).min
-    causal_mask = torch.full(
-        (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-    )
-    if sequence_length != 1:
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-    causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-    causal_mask = causal_mask[None, None, :, :].expand(batch_size, 1, -1, -1)
-
-    if attention_mask is not None:
-        causal_mask = causal_mask.clone()
-        mask_length = attention_mask.shape[-1]
-        padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-        padding_mask = padding_mask == 0
-        causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-            padding_mask, min_dtype
+    batch_size, key_len = attention_mask.shape
+    if key_len < target_length:
+        raise ValueError(
+            f"attention_mask key length ({key_len}) is shorter than target_length ({target_length})."
         )
 
-    return causal_mask
+    # Keep only keys; query masking is handled by downstream losses.
+    key_mask = attention_mask[:, :target_length].to(device=device, dtype=dtype)
+    additive = _to_additive_mask(key_mask, dtype=dtype)
+    return additive[:, None, None, :].expand(batch_size, 1, query_length, target_length)
 
 
-class DualAttentionLlamaDecoderLayer(nn.Module):
+class FullAttentionLlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        # Use unique cache slots for the two attention modules inside one layer.
-        self.streamwise_attn = LlamaAttention(config=config, layer_idx=2 * layer_idx)
-        self.blockwise_attn = LlamaAttention(
-            config=config, layer_idx=2 * layer_idx + 1
-        )
-
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(config)
-        self.input_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.pre_blockwise_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = LlamaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def _run_attention(
         self,
-        attn: LlamaAttention,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
         position_ids: Optional[torch.LongTensor],
@@ -96,7 +70,7 @@ class DualAttentionLlamaDecoderLayer(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         try:
-            outputs = attn(
+            outputs = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -107,7 +81,7 @@ class DualAttentionLlamaDecoderLayer(nn.Module):
                 **kwargs,
             )
         except TypeError:
-            outputs = attn(
+            outputs = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
@@ -126,8 +100,7 @@ class DualAttentionLlamaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        streamwise_attention_mask: Optional[torch.Tensor] = None,
-        blockwise_attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
@@ -135,29 +108,12 @@ class DualAttentionLlamaDecoderLayer(nn.Module):
         position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         output_attentions: bool = False,
         **kwargs,
-    ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states, streamwise_attn_weights = self._run_attention(
-            self.streamwise_attn,
+        hidden_states, attn_weights = self._run_attention(
             hidden_states=hidden_states,
-            attention_mask=streamwise_attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            output_attentions=output_attentions,
-            **kwargs,
-        )
-        hidden_states = residual + hidden_states
-
-        residual = hidden_states
-        hidden_states = self.pre_blockwise_layernorm(hidden_states)
-        hidden_states, blockwise_attn_weights = self._run_attention(
-            self.blockwise_attn,
-            hidden_states=hidden_states,
-            attention_mask=blockwise_attention_mask,
+            attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
@@ -174,8 +130,7 @@ class DualAttentionLlamaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         if output_attentions:
-            return hidden_states, (streamwise_attn_weights, blockwise_attn_weights)
-
+            return hidden_states, attn_weights
         return hidden_states
 
 
@@ -187,14 +142,9 @@ class LlamaBackbone(LlamaPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(
-            config.vocab_size, config.hidden_size, self.padding_idx
-        )
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [
-                DualAttentionLlamaDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
+            [FullAttentionLlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
@@ -205,74 +155,29 @@ class LlamaBackbone(LlamaPreTrainedModel):
     def _resolve_attention_mask(
         self,
         attention_mask: Optional[torch.Tensor],
-        custom_attention_mask: Optional[torch.Tensor],
         inputs_embeds: torch.Tensor,
-        cache_position: torch.LongTensor,
         past_key_values: Optional[Cache],
-        position_ids: torch.LongTensor,
     ) -> Optional[torch.Tensor]:
-        past_seen_tokens = (
-            past_key_values.get_seq_length() if past_key_values is not None else 0
-        )
-        sequence_length = inputs_embeds.shape[1]
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        sequence_length = int(inputs_embeds.shape[1])
+        target_length = past_seen_tokens + sequence_length
 
-        if custom_attention_mask is None and attention_mask is None:
-            target_length = past_seen_tokens + sequence_length
-            return _prepare_4d_causal_attention_mask(
-                attention_mask=None,
-                sequence_length=sequence_length,
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() == 2:
+            return _expand_padding_mask_to_4d(
+                attention_mask=attention_mask,
+                query_length=sequence_length,
                 target_length=target_length,
                 dtype=inputs_embeds.dtype,
                 device=inputs_embeds.device,
-                cache_position=cache_position,
-                batch_size=inputs_embeds.shape[0],
             )
-
-        if custom_attention_mask is None:
-            return _prepare_4d_causal_attention_mask(
-                attention_mask=attention_mask,
-                sequence_length=sequence_length,
-                target_length=attention_mask.shape[-1],
-                dtype=inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                cache_position=cache_position,
-                batch_size=inputs_embeds.shape[0],
+        if attention_mask.dim() == 4:
+            return _to_additive_mask(
+                attention_mask.to(device=inputs_embeds.device),
+                inputs_embeds.dtype,
             )
-
-        if custom_attention_mask.dim() == 2:
-            return _prepare_4d_causal_attention_mask(
-                attention_mask=custom_attention_mask,
-                sequence_length=sequence_length,
-                target_length=custom_attention_mask.shape[-1],
-                dtype=inputs_embeds.dtype,
-                device=inputs_embeds.device,
-                cache_position=cache_position,
-                batch_size=inputs_embeds.shape[0],
-            )
-
-        if custom_attention_mask.dim() != 4:
-            raise ValueError(
-                "Custom attention masks must be 2D padding masks or 4D additive masks."
-            )
-
-        custom_attention_mask = _to_additive_mask(
-            custom_attention_mask.to(device=inputs_embeds.device),
-            inputs_embeds.dtype,
-        )
-
-        if attention_mask is None:
-            return custom_attention_mask
-
-        base_attention_mask = _prepare_4d_causal_attention_mask(
-            attention_mask=attention_mask,
-            sequence_length=sequence_length,
-            target_length=attention_mask.shape[-1],
-            dtype=inputs_embeds.dtype,
-            device=inputs_embeds.device,
-            cache_position=cache_position,
-            batch_size=inputs_embeds.shape[0],
-        )
-        return base_attention_mask + custom_attention_mask
+        raise ValueError("attention_mask must be either 2D padding mask or 4D additive mask.")
 
     def forward(
         self,
@@ -284,8 +189,6 @@ class LlamaBackbone(LlamaPreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        streamwise_attention_mask: Optional[torch.Tensor] = None,
-        blockwise_attention_mask: Optional[torch.Tensor] = None,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
         return_dict: bool = True,
@@ -302,32 +205,16 @@ class LlamaBackbone(LlamaPreTrainedModel):
             past_key_values = DynamicCache()
 
         if cache_position is None:
-            past_seen_tokens = (
-                past_key_values.get_seq_length() if past_key_values is not None else 0
-            )
-            cache_position = (
-                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
-                + past_seen_tokens
-            )
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        streamwise_attention_mask = self._resolve_attention_mask(
+        resolved_attention_mask = self._resolve_attention_mask(
             attention_mask=attention_mask,
-            custom_attention_mask=streamwise_attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
-        blockwise_attention_mask = self._resolve_attention_mask(
-            attention_mask=attention_mask,
-            custom_attention_mask=blockwise_attention_mask,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
         )
 
         hidden_states = inputs_embeds
@@ -343,8 +230,7 @@ class LlamaBackbone(LlamaPreTrainedModel):
 
             layer_outputs = decoder_layer(
                 hidden_states=hidden_states,
-                streamwise_attention_mask=streamwise_attention_mask,
-                blockwise_attention_mask=blockwise_attention_mask,
+                attention_mask=resolved_attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,

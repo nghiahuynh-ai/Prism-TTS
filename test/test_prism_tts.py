@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 from transformers import LlamaConfig
 
 try:
@@ -21,10 +20,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.prism_tts import PrismTTS
+from dataset.dataset import BatchCollate
 
 
 MODEL_CONFIG_PATH = PROJECT_ROOT / "config" / "model.yaml"
-MIN_REASONABLE_PARAM_COUNT = 100_000_000
+MIN_REASONABLE_PARAM_COUNT = 90_000_000
 
 
 @lru_cache(maxsize=1)
@@ -152,253 +152,50 @@ class TestPrismTTS(unittest.TestCase):
             batch_size, generated_len, self.continuous_latent_size, device=self.device
         )
 
-        # Generated region mask (prompt region is always valid).
-        attention_mask = torch.tensor(
-            [
-                [1, 1, 1],
-                [1, 1, 0],
-            ],
-            dtype=torch.long,
-            device=self.device,
+        collate = BatchCollate(
+            discrete_token_count=max(1, int(self.discrete_vocab_size) - 3)
         )
-
-        full_text = torch.cat([text_prompt, text_target], dim=1)
-        full_discrete = torch.cat([discrete_prompt, discrete_target], dim=2)
-        full_continuous = torch.cat([continuous_prompt, continuous_target], dim=1)
-        prompt_lengths = torch.full(
-            (batch_size,),
-            prompt_len,
-            dtype=torch.long,
-            device=self.device,
-        )
-        target_lengths = torch.full(
-            (batch_size,),
-            generated_len,
-            dtype=torch.long,
-            device=self.device,
-        )
+        samples = []
+        for sample_idx in range(batch_size):
+            samples.append(
+                {
+                    "text_prompt": text_prompt[sample_idx].detach().cpu(),
+                    "discrete_prompt": discrete_prompt[sample_idx]
+                    .transpose(0, 1)
+                    .contiguous()
+                    .detach()
+                    .cpu(),
+                    "continuous_prompt": continuous_prompt[sample_idx].detach().cpu(),
+                    "text_target": text_target[sample_idx].detach().cpu(),
+                    "discrete_target": discrete_target[sample_idx]
+                    .transpose(0, 1)
+                    .contiguous()
+                    .detach()
+                    .cpu(),
+                    "continuous_target": continuous_target[sample_idx].detach().cpu(),
+                }
+            )
+        flat_batch = collate(samples)
 
         outputs = self.model(
-            text=full_text,
-            discrete=full_discrete,
-            continuous=full_continuous,
-            prompt_lengths=prompt_lengths,
-            target_lengths=target_lengths,
-            attention_mask=attention_mask,
+            flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
+            flat_continuous_values=flat_batch["flat_continuous_values"].to(self.device),
+            flat_token_type_ids=flat_batch["flat_token_type_ids"].to(self.device),
+            flat_speech_stream_ids=flat_batch["flat_speech_stream_ids"].to(self.device),
+            flat_target_block_ids=flat_batch["flat_target_block_ids"].to(self.device),
+            flat_target_block_counts=flat_batch["flat_target_block_counts"].to(self.device),
+            attention_mask=flat_batch["attention_mask"].to(self.device),
             return_dict=True,
         )
 
         self.assertIsNotNone(outputs.loss)
         self.assertIsNotNone(outputs.discrete_loss)
+        self.assertIsNotNone(outputs.continuous_loss)
         self.assertIsNotNone(outputs.flow_loss)
-        self.assertIsNotNone(outputs.text_loss)
         self.assertEqual(
             tuple(outputs.keys()),
-            ("loss", "discrete_loss", "flow_loss", "text_loss"),
+            ("loss", "discrete_loss", "continuous_loss", "flow_loss"),
         )
-
-    def test_discrete_loss_can_downweight_special_tokens(self):
-        class _FixedDiscreteHead(nn.Module):
-            def __init__(self, fixed_logits: torch.Tensor):
-                super().__init__()
-                self.register_buffer("fixed_logits", fixed_logits)
-
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
-                expected_shape = x.shape[:-1] + (self.fixed_logits.shape[-1],)
-                if expected_shape != self.fixed_logits.shape:
-                    raise ValueError(
-                        f"Expected logits shape {expected_shape}, got {tuple(self.fixed_logits.shape)}."
-                    )
-                return self.fixed_logits
-
-        batch_size = 1
-        total_blocks = 3
-        num_discrete_tokens = 1
-        discrete_vocab_size = 8
-        hidden_size = int(make_small_config().hidden_size)
-        block_size = num_discrete_tokens + 2
-
-        # Block-1 target is special token 0 (easy); block-2 target is regular token 3 (hard).
-        full_discrete_tokens = torch.tensor(
-            [[[7], [0], [3]]],
-            dtype=torch.long,
-            device=self.device,
-        )
-        target_block_mask = torch.tensor(
-            [[False, True, True]],
-            dtype=torch.bool,
-            device=self.device,
-        )
-        hidden_states = torch.zeros(
-            batch_size,
-            total_blocks * block_size,
-            hidden_size,
-            device=self.device,
-        )
-        fixed_logits = torch.tensor(
-            [
-                [
-                    [[6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0]],
-                    [[-6.0, 6.0, -6.0, -6.0, -6.0, -6.0, -6.0, -6.0]],
-                ]
-            ],
-            dtype=torch.float32,
-            device=self.device,
-        )
-
-        model_unweighted = PrismTTS(
-            llama_config=make_small_config(),
-            num_discrete_tokens=num_discrete_tokens,
-            discrete_vocab_size=discrete_vocab_size,
-            continuous_latent_size=1,
-            flow_num_res_blocks=1,
-            discrete_regular_token_loss_weight=1.0,
-            discrete_special_token_loss_weight=1.0,
-            flow_sample_steps=2,
-        ).to(self.device)
-        model_unweighted.discrete_lm_head = _FixedDiscreteHead(fixed_logits)
-        loss_unweighted = model_unweighted._compute_discrete_loss(
-            hidden_states=hidden_states,
-            full_discrete_tokens=full_discrete_tokens,
-            target_block_mask=target_block_mask,
-            block_attention_mask=None,
-        )
-
-        model_weighted = PrismTTS(
-            llama_config=make_small_config(),
-            num_discrete_tokens=num_discrete_tokens,
-            discrete_vocab_size=discrete_vocab_size,
-            continuous_latent_size=1,
-            flow_num_res_blocks=1,
-            discrete_regular_token_loss_weight=1.0,
-            discrete_special_token_loss_weight=0.2,
-            flow_sample_steps=2,
-        ).to(self.device)
-        model_weighted.discrete_lm_head = _FixedDiscreteHead(fixed_logits)
-        loss_weighted = model_weighted._compute_discrete_loss(
-            hidden_states=hidden_states,
-            full_discrete_tokens=full_discrete_tokens,
-            target_block_mask=target_block_mask,
-            block_attention_mask=None,
-        )
-
-        self.assertGreater(float(loss_weighted.item()), float(loss_unweighted.item()))
-
-    def test_build_inputs_embeds_uses_block_major_order(self):
-        model = PrismTTS(
-            llama_config=make_small_config(),
-            num_discrete_tokens=2,
-            discrete_vocab_size=256,
-            continuous_latent_size=1,
-            flow_num_res_blocks=1,
-            flow_sample_steps=2,
-        ).to(self.device)
-
-        with torch.no_grad():
-            model.text_embedding.weight.zero_()
-            model.discrete_embedding.weight.zero_()
-            model.continuous_proj.weight.zero_()
-            model.continuous_proj.bias.zero_()
-            model.stream_type_embeddings.zero_()
-
-            model.text_embedding.weight[:, 0] = torch.arange(256, device=self.device)
-            model.discrete_embedding.weight[:, 0] = torch.arange(256, device=self.device)
-            model.continuous_proj.weight[0, 0] = 1.0
-
-        text_tokens = torch.tensor([[5, 6, 7]], dtype=torch.long, device=self.device)
-        # [B, L, N]
-        discrete_tokens = torch.tensor(
-            [[[11, 12], [21, 22], [31, 32]]],
-            dtype=torch.long,
-            device=self.device,
-        )
-        continuous_latents = torch.tensor(
-            [[[1.0], [2.0], [3.0]]],
-            device=self.device,
-        )
-
-        inputs_embeds, _ = model._build_inputs_embeds(
-            text_tokens=text_tokens,
-            discrete_tokens=discrete_tokens,
-            continuous_latents=continuous_latents,
-        )
-        observed = inputs_embeds[0, :, 0].tolist()
-        expected = [5.0, 11.0, 12.0, 1.0, 6.0, 21.0, 22.0, 2.0, 7.0, 31.0, 32.0, 3.0]
-        self.assertEqual(observed, expected)
-
-    def test_continuous_latent_noise_applies_only_with_grad_enabled(self):
-        model = PrismTTS(
-            llama_config=make_small_config(),
-            num_discrete_tokens=1,
-            discrete_vocab_size=64,
-            continuous_latent_size=4,
-            flow_num_res_blocks=1,
-            flow_sample_steps=2,
-        ).to(self.device)
-
-        continuous = torch.zeros(2, 3, 4, device=self.device)
-
-        model.train()
-        with torch.no_grad():
-            no_grad_out = model._inject_continuous_latent_noise(continuous)
-        self.assertTrue(torch.equal(no_grad_out, continuous))
-
-        with torch.enable_grad():
-            grad_out = model._inject_continuous_latent_noise(continuous)
-        self.assertFalse(torch.equal(grad_out, continuous))
-
-        model.eval()
-        with torch.enable_grad():
-            eval_out = model._inject_continuous_latent_noise(continuous)
-        self.assertTrue(torch.equal(eval_out, continuous))
-
-    def test_build_dual_attention_masks_match_expected_layouts(self):
-        model = PrismTTS(
-            llama_config=make_small_config(),
-            num_discrete_tokens=2,
-            discrete_vocab_size=32,
-            continuous_latent_size=1,
-            flow_num_res_blocks=1,
-            flow_sample_steps=2,
-        ).to(self.device)
-
-        stream_mask, block_mask = model._build_dual_attention_masks(
-            total_blocks=2,
-            batch_size=1,
-            device=self.device,
-        )
-
-        expected_stream_mask = torch.tensor(
-            [
-                [1, 0, 0, 0, 0, 0, 0, 0],
-                [0, 1, 0, 0, 0, 0, 0, 0],
-                [0, 0, 1, 0, 0, 0, 0, 0],
-                [0, 0, 0, 1, 0, 0, 0, 0],
-                [1, 0, 0, 0, 1, 0, 0, 0],
-                [0, 1, 0, 0, 0, 1, 0, 0],
-                [0, 0, 1, 0, 0, 0, 1, 0],
-                [0, 0, 0, 1, 0, 0, 0, 1],
-            ],
-            dtype=torch.bool,
-            device=self.device,
-        )
-        expected_block_mask = torch.tensor(
-            [
-                [1, 1, 1, 1, 0, 0, 0, 0],
-                [1, 1, 1, 1, 0, 0, 0, 0],
-                [1, 1, 1, 1, 0, 0, 0, 0],
-                [1, 1, 1, 1, 0, 0, 0, 0],
-                [1, 1, 1, 1, 1, 1, 1, 1],
-                [1, 1, 1, 1, 1, 1, 1, 1],
-                [1, 1, 1, 1, 1, 1, 1, 1],
-                [1, 1, 1, 1, 1, 1, 1, 1],
-            ],
-            dtype=torch.bool,
-            device=self.device,
-        )
-
-        self.assertTrue(torch.equal(stream_mask[0, 0], expected_stream_mask))
-        self.assertTrue(torch.equal(block_mask[0, 0], expected_block_mask))
 
     def test_generate_returns_expected_shapes(self):
         batch_size = 1
@@ -448,55 +245,6 @@ class TestPrismTTS(unittest.TestCase):
             (batch_size, self.num_discrete_tokens, self.discrete_vocab_size),
         )
 
-    def test_generate_with_kv_cache_returns_expected_shapes(self):
-        batch_size = 1
-        prompt_len = 2
-        generated_len = 2
-        text_vocab_upper = max(2, min(200, self.text_vocab_size))
-
-        text_prompt = torch.randint(
-            0, text_vocab_upper, (batch_size, prompt_len), device=self.device
-        )
-        discrete_prompt = torch.randint(
-            0,
-            self.discrete_vocab_size,
-            (batch_size, self.num_discrete_tokens, prompt_len),
-            device=self.device,
-        )
-        continuous_prompt = torch.randn(
-            batch_size, prompt_len, self.continuous_latent_size, device=self.device
-        )
-        text_target = torch.randint(
-            0, text_vocab_upper, (batch_size, generated_len), device=self.device
-        )
-
-        outputs = self.model.generate_with_kv_cache(
-            text_prompt=text_prompt,
-            discrete_prompt=discrete_prompt,
-            continuous_prompt=continuous_prompt,
-            text_target=text_target,
-            max_new_blocks=generated_len,
-            discrete_eos_token_id=-1,
-            do_sample=False,
-            return_dict=True,
-        )
-
-        self.assertEqual(outputs.text_ids.shape, (batch_size, generated_len))
-        self.assertEqual(
-            outputs.discrete_ids.shape,
-            (batch_size, self.num_discrete_tokens, generated_len),
-        )
-        self.assertEqual(
-            outputs.continuous_latents.shape,
-            (batch_size, generated_len, self.continuous_latent_size),
-        )
-        self.assertEqual(len(outputs.discrete_logits), generated_len)
-        self.assertEqual(
-            outputs.discrete_logits[0].shape,
-            (batch_size, self.num_discrete_tokens, self.discrete_vocab_size),
-        )
-
-
 class TestPrismTTSGenerationAlignment(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(0)
@@ -513,7 +261,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         ).to(self.device)
         self.model.eval()
 
-    def test_generate_and_generate_with_kv_cache_match_under_fixed_seed(self) -> None:
+    def test_generate_is_deterministic_under_fixed_seed(self) -> None:
         batch_size = 2
         prompt_len = 3
         generated_len = 4
@@ -556,7 +304,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 return_dict=True,
             )
             torch.manual_seed(123)
-            kv_outputs = self.model.generate_with_kv_cache(
+            second_outputs = self.model.generate(
                 text_prompt=text_prompt,
                 discrete_prompt=discrete_prompt,
                 continuous_prompt=continuous_prompt,
@@ -566,25 +314,29 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 return_dict=True,
             )
 
-        self.assertTrue(torch.equal(full_outputs.text_ids, kv_outputs.text_ids))
-        self.assertTrue(torch.equal(full_outputs.discrete_ids, kv_outputs.discrete_ids))
+        self.assertTrue(torch.equal(full_outputs.text_ids, second_outputs.text_ids))
+        self.assertTrue(torch.equal(full_outputs.discrete_ids, second_outputs.discrete_ids))
         self.assertTrue(
             torch.allclose(
                 full_outputs.continuous_latents,
-                kv_outputs.continuous_latents,
+                second_outputs.continuous_latents,
                 atol=1e-5,
                 rtol=1e-5,
             )
         )
-        self.assertEqual(len(full_outputs.discrete_logits), len(kv_outputs.discrete_logits))
-        for full_logits, kv_logits in zip(full_outputs.discrete_logits, kv_outputs.discrete_logits):
-            self.assertTrue(torch.allclose(full_logits, kv_logits, atol=1e-5, rtol=1e-5))
+        self.assertEqual(len(full_outputs.discrete_logits), len(second_outputs.discrete_logits))
+        for full_logits, second_logits in zip(
+            full_outputs.discrete_logits,
+            second_outputs.discrete_logits,
+        ):
+            self.assertTrue(torch.allclose(full_logits, second_logits, atol=1e-5, rtol=1e-5))
 
-    def test_generate_first_step_logits_use_last_prompt_block(self) -> None:
+    def test_generate_stops_early_when_eos_block_is_sampled(self) -> None:
         batch_size = 1
-        prompt_len = 3
-        generated_len = 2
+        prompt_len = 2
+        max_new_blocks = 6
         text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+        eos_id = int(self.model._resolve_generation_discrete_eos_token_id(None))
 
         text_prompt = torch.randint(
             0,
@@ -607,66 +359,138 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         text_target = torch.randint(
             0,
             text_vocab_upper,
-            (batch_size, generated_len),
+            (batch_size, prompt_len),
             device=self.device,
         )
 
-        normalized_discrete_prompt = self.model._normalize_discrete_tokens(
-            discrete_prompt,
-            "discrete_prompt",
-        )
-        with torch.no_grad():
-            prompt_embeds, _ = self.model._build_inputs_embeds(
-                text_tokens=text_prompt,
-                discrete_tokens=normalized_discrete_prompt,
-                continuous_latents=continuous_prompt,
-            )
-            prompt_stream_mask, prompt_block_mask = self.model._build_dual_attention_masks(
-                total_blocks=prompt_len,
-                batch_size=batch_size,
-                device=prompt_embeds.device,
-            )
-            prompt_position_embeddings = self.model._build_two_level_rope_position_embeddings(
-                inputs_embeds=prompt_embeds,
-                total_blocks=prompt_len,
-            )
-            prompt_outputs = self.model.backbone(
-                inputs_embeds=prompt_embeds,
-                streamwise_attention_mask=prompt_stream_mask,
-                blockwise_attention_mask=prompt_block_mask,
-                position_embeddings=prompt_position_embeddings,
-                return_dict=True,
-            )
-            last_prompt_block_hidden = prompt_outputs.last_hidden_state[
-                :,
-                -self.model.block_size :,
-                :,
-            ]
-            expected_first_logits = self.model.discrete_lm_head(
-                last_prompt_block_hidden[:, 1 : 1 + self.num_discrete_tokens, :]
+        original_sampler = self.model._sample_discrete_ids
+
+        def _always_eos(
+            logits: torch.Tensor,
+            temperature: float = 0.8,
+            top_k: int = 50,
+            top_p: float = 0.95,
+            do_sample: bool = True,
+        ) -> torch.LongTensor:
+            del temperature, top_k, top_p, do_sample
+            return torch.full(
+                logits.shape[:-1],
+                fill_value=eos_id,
+                dtype=torch.long,
+                device=logits.device,
             )
 
-            generation = self.model.generate(
-                text_prompt=text_prompt,
-                discrete_prompt=discrete_prompt,
-                continuous_prompt=continuous_prompt,
-                text_target=text_target,
-                max_new_blocks=generated_len,
+        self.model._sample_discrete_ids = _always_eos
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    text_prompt=text_prompt,
+                    discrete_prompt=discrete_prompt,
+                    continuous_prompt=continuous_prompt,
+                    text_target=text_target,
+                    max_new_blocks=max_new_blocks,
+                    discrete_eos_token_id=eos_id,
+                    do_sample=False,
+                    return_dict=True,
+                )
+        finally:
+            self.model._sample_discrete_ids = original_sampler
+
+        self.assertEqual(outputs.discrete_ids.shape[-1], 1)
+        self.assertEqual(outputs.continuous_latents.shape[1], 1)
+        self.assertEqual(len(outputs.discrete_logits), 1)
+
+    def test_generate_from_raw_accepts_string_and_raw_speech_prompt(self) -> None:
+        eos_id = int(self.model._resolve_generation_discrete_eos_token_id(None))
+
+        def _tokenizer(text: str) -> list[int]:
+            return [5 + (ord(ch) % 13) for ch in text]
+
+        def _speech_encoder(raw_prompt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            frame_count = int(raw_prompt.shape[0])
+            discrete = (
+                torch.arange(
+                    frame_count * self.num_discrete_tokens,
+                    device=raw_prompt.device,
+                    dtype=torch.long,
+                )
+                .view(frame_count, self.num_discrete_tokens)
+                .remainder(self.discrete_vocab_size)
+            )
+            continuous = torch.randn(
+                frame_count,
+                self.continuous_latent_size,
+                device=raw_prompt.device,
+            )
+            return discrete, continuous
+
+        raw_prompt_audio = torch.tensor([0.1, -0.2, 0.3, -0.4], device=self.device)
+        with torch.no_grad():
+            outputs = self.model.generate_from_raw(
+                raw_text_prompt="ab",
+                raw_speech_prompt=raw_prompt_audio,
+                raw_text_target="cd",
+                text_tokenizer=_tokenizer,
+                speech_prompt_encoder=_speech_encoder,
+                max_new_blocks=3,
+                discrete_eos_token_id=eos_id,
                 do_sample=False,
                 return_dict=True,
             )
 
-        self.assertGreaterEqual(len(generation.discrete_logits), 1)
-        self.assertTrue(
-            torch.allclose(
-                generation.discrete_logits[0],
-                expected_first_logits,
-                atol=1e-5,
-                rtol=1e-5,
-            )
-        )
+        self.assertEqual(outputs.text_ids.shape[0], 1)
+        self.assertEqual(outputs.discrete_ids.shape[0], 1)
+        self.assertEqual(outputs.continuous_latents.shape[0], 1)
+        self.assertLessEqual(outputs.discrete_ids.shape[-1], 3)
+        self.assertEqual(len(outputs.discrete_logits), int(outputs.discrete_ids.shape[-1]))
 
-    def test_generate_with_kv_cache_respects_prompt_and_target_lengths(self) -> None:
+    def test_generate_from_raw_supports_batched_inputs(self) -> None:
+        eos_id = int(self.model._resolve_generation_discrete_eos_token_id(None))
+
+        def _tokenizer(text: str) -> list[int]:
+            return [7 + (ord(ch) % 17) for ch in text]
+
+        def _speech_encoder(raw_prompt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            frame_count = int(raw_prompt.shape[0])
+            discrete = (
+                torch.arange(
+                    frame_count * self.num_discrete_tokens,
+                    dtype=torch.long,
+                    device=raw_prompt.device,
+                )
+                .view(frame_count, self.num_discrete_tokens)
+                .remainder(self.discrete_vocab_size)
+            )
+            continuous = torch.randn(
+                frame_count,
+                self.continuous_latent_size,
+                device=raw_prompt.device,
+            )
+            return discrete, continuous
+
+        raw_prompts = [
+            torch.tensor([0.2, 0.1, -0.1], device=self.device),
+            torch.tensor([0.3, -0.3], device=self.device),
+        ]
+        with torch.no_grad():
+            outputs = self.model.generate_from_raw(
+                raw_text_prompt=["hello", "yo"],
+                raw_speech_prompt=raw_prompts,
+                raw_text_target=["world", "ha"],
+                text_tokenizer=_tokenizer,
+                speech_prompt_encoder=_speech_encoder,
+                max_new_blocks=2,
+                discrete_eos_token_id=eos_id,
+                do_sample=False,
+                return_dict=True,
+            )
+
+        self.assertEqual(outputs.text_ids.shape[0], 2)
+        self.assertEqual(outputs.discrete_ids.shape[0], 2)
+        self.assertEqual(outputs.continuous_latents.shape[0], 2)
+        self.assertLessEqual(outputs.discrete_ids.shape[-1], 2)
+
+    def test_generate_respects_prompt_and_target_lengths(self) -> None:
         batch_size = 1
         prompt_len = 3
         padded_prompt_len = 6
@@ -734,7 +558,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
 
         with torch.no_grad():
             torch.manual_seed(77)
-            trimmed_outputs = self.model.generate_with_kv_cache(
+            trimmed_outputs = self.model.generate(
                 text_prompt=text_prompt_trim,
                 discrete_prompt=discrete_prompt_trim,
                 continuous_prompt=continuous_prompt_trim,
@@ -744,13 +568,15 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 return_dict=True,
             )
             torch.manual_seed(77)
-            padded_outputs = self.model.generate_with_kv_cache(
+            padded_outputs = self.model.generate(
                 text_prompt=text_prompt_padded,
                 discrete_prompt=discrete_prompt_padded,
                 continuous_prompt=continuous_prompt_padded,
                 text_target=text_target_padded,
-                prompt_lengths=torch.tensor([prompt_len], device=self.device),
-                target_lengths=torch.tensor([target_len], device=self.device),
+                text_prompt_lengths=torch.tensor([prompt_len], device=self.device),
+                speech_prompt_lengths=torch.tensor([prompt_len], device=self.device),
+                text_target_lengths=torch.tensor([target_len], device=self.device),
+                speech_target_lengths=torch.tensor([target_len], device=self.device),
                 max_new_blocks=target_len,
                 do_sample=False,
                 return_dict=True,
@@ -839,84 +665,6 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 == torch.zeros_like(outputs.continuous_latents)
             )
         )
-
-    def test_generation_teacher_forced_delay_prefix_is_respected(self) -> None:
-        batch_size = 1
-        prompt_len = 2
-        generated_len = 4
-        delay_prefix_len = 2
-        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
-        delay_token_id = self.discrete_vocab_size - 2
-
-        text_prompt = torch.randint(
-            1,
-            text_vocab_upper,
-            (batch_size, prompt_len),
-            device=self.device,
-        )
-        discrete_prompt = torch.randint(
-            0,
-            self.discrete_vocab_size,
-            (batch_size, self.num_discrete_tokens, prompt_len),
-            device=self.device,
-        )
-        continuous_prompt = torch.randn(
-            batch_size,
-            prompt_len,
-            self.continuous_latent_size,
-            device=self.device,
-        )
-        text_target = torch.randint(
-            1,
-            text_vocab_upper,
-            (batch_size, generated_len),
-            device=self.device,
-        )
-
-        teacher_discrete_prefix = torch.full(
-            (batch_size, self.num_discrete_tokens, delay_prefix_len),
-            fill_value=delay_token_id,
-            dtype=torch.long,
-            device=self.device,
-        )
-        teacher_continuous_prefix = torch.randn(
-            batch_size,
-            delay_prefix_len,
-            self.continuous_latent_size,
-            device=self.device,
-        )
-
-        for method_name in ("generate", "generate_with_kv_cache"):
-            generation_method = getattr(self.model, method_name)
-            with torch.no_grad():
-                outputs = generation_method(
-                    text_prompt=text_prompt,
-                    discrete_prompt=discrete_prompt,
-                    continuous_prompt=continuous_prompt,
-                    text_target=text_target,
-                    max_new_blocks=generated_len,
-                    do_sample=False,
-                    discrete_eos_token_id=-1,
-                    teacher_forced_discrete_prefix=teacher_discrete_prefix,
-                    teacher_forced_continuous_prefix=teacher_continuous_prefix,
-                    return_dict=True,
-                )
-
-            self.assertTrue(
-                torch.equal(
-                    outputs.discrete_ids[:, :, :delay_prefix_len],
-                    teacher_discrete_prefix,
-                )
-            )
-            self.assertTrue(
-                torch.allclose(
-                    outputs.continuous_latents[:, :delay_prefix_len, :],
-                    teacher_continuous_prefix,
-                    atol=1e-6,
-                    rtol=1e-6,
-                )
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

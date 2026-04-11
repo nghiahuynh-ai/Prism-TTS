@@ -362,10 +362,10 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
 
     shared_layout = _require_mapping(data_cfg, "shared_layout")
     discrete_token_count = int(shared_layout["discrete_token_count"])
-    delay_id, eos_id, pad_id, text_offset = build_shared_token_layout(discrete_token_count)
+    eot_id, eos_id, pad_id, text_offset = build_shared_token_layout(discrete_token_count)
 
     expected = {
-        "delay_token_id": delay_id,
+        "eot_token_id": eot_id,
         "eos_token_id": eos_id,
         "pad_token_id": pad_id,
         "text_token_offset": text_offset,
@@ -400,9 +400,12 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
                 "model.prism_tts.continuous_latent_size must match "
                 f"data.dataset.continuous_feature_dim ({dataset_continuous_dim})."
             )
-    text_loss_weight = float(prism_cfg.get("text_loss_weight", 0.1))
-    if text_loss_weight < 0.0:
-        raise ValueError("model.prism_tts.text_loss_weight must be >= 0.")
+    continuous_loss_weight = float(prism_cfg.get("continuous_loss_weight", 1.0))
+    if continuous_loss_weight < 0.0:
+        raise ValueError("model.prism_tts.continuous_loss_weight must be >= 0.")
+    mask_ratio = float(prism_cfg.get("mask_ratio", 0.5))
+    if not (0.0 <= mask_ratio <= 1.0):
+        raise ValueError("model.prism_tts.mask_ratio must be in [0, 1].")
     discrete_regular_token_loss_weight = float(
         prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
     )
@@ -477,7 +480,8 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
-        text_loss_weight=float(prism_cfg.get("text_loss_weight", 0.1)),
+        continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
+        mask_ratio=float(prism_cfg.get("mask_ratio", 0.5)),
         discrete_regular_token_loss_weight=float(
             prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
         ),
@@ -738,9 +742,6 @@ def _build_data_objects(
     discrete_token_count = int(shared_layout["discrete_token_count"])
 
     dataset_kwargs: dict[str, Any] = {
-        "prompt_length": dataset_cfg.get("prompt_length"),
-        "min_prompt_length": int(dataset_cfg.get("min_prompt_length", 1)),
-        "min_target_length": int(dataset_cfg.get("min_target_length", 1)),
         "vocab_path": _optional_path(data_cfg.get("vocab_path")),
         "manifest_root": _optional_path(data_cfg.get("manifest_root")),
         "discrete_token_count": discrete_token_count,
@@ -767,12 +768,6 @@ def _build_data_objects(
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
-        prompt_length=collate_cfg.get("prompt_length"),
-        min_prompt_length=int(collate_cfg.get("min_prompt_length", 1)),
-        min_target_length=int(collate_cfg.get("min_target_length", 1)),
-        stream_delay=collate_cfg.get("stream_delay"),
-        discrete_stream_delay_ms=collate_cfg.get("discrete_stream_delay_ms"),
-        codec_frame_rate_hz=float(collate_cfg.get("codec_frame_rate_hz", 12.5)),
     )
 
     num_workers = int(loader_cfg.get("num_workers", 0))
@@ -839,11 +834,9 @@ def _build_data_objects(
                 "data.loader.adaptive_batching.reference_length_quantile must be in (0, 1]."
             )
 
-        shared_delay_tokens = collate._resolve_shared_delay()
         sample_lengths = estimate_prism_sample_lengths(
             train_dataset,
-            codec_frame_rate_hz=float(collate.codec_frame_rate_hz),
-            shared_delay_tokens=int(shared_delay_tokens),
+            codec_frame_rate_hz=float(collate_cfg.get("codec_frame_rate_hz", 12.5)),
         )
 
         reference_length = _length_quantile(sample_lengths, reference_quantile)

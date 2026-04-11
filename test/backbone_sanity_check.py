@@ -522,19 +522,14 @@ def main() -> None:
 
     data_cfg = generate_utils.require_mapping(data_config, "data")
     shared_layout_cfg = generate_utils.require_mapping(data_cfg, "shared_layout")
-    collate_cfg = generate_utils.require_mapping(data_cfg, "collate")
     dataset_cfg = generate_utils.require_mapping(data_cfg, "dataset")
 
     discrete_token_count = int(shared_layout_cfg["discrete_token_count"])
-    delay_token_id, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(
+    _, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(
         discrete_token_count
     )
-    shared_delay_tokens = generate_utils.resolve_shared_delay_tokens(collate_cfg)
-    text_pad_raw = collate_cfg.get("text_pad_value")
-    discrete_pad_raw = collate_cfg.get("discrete_pad_value")
-    text_pad_value = pad_token_id if text_pad_raw is None else int(text_pad_raw)
-    discrete_pad_value = pad_token_id if discrete_pad_raw is None else int(discrete_pad_raw)
-    continuous_pad_value = float(collate_cfg.get("continuous_pad_value", 0.0))
+    text_pad_value = int(pad_token_id)
+    discrete_pad_value = int(pad_token_id)
 
     vocab_path_raw = data_cfg.get("vocab_path", "dataset/vocab.txt")
     vocab_path = Path(vocab_path_raw).expanduser()
@@ -562,30 +557,10 @@ def main() -> None:
     if target_text_tokens.numel() == 0:
         raise ValueError("Target transcript became empty after tokenization.")
 
-    aligned_text_prompt, aligned_discrete_prompt, aligned_continuous_prompt = (
-        generate_utils.align_prompt_streams(
-            text_tokens=prompt_text_tokens,
-            discrete_tokens=prompt_discrete,
-            continuous_latents=prompt_continuous,
-            delay_token_id=delay_token_id,
-            eos_token_id=eos_token_id,
-            text_pad_value=text_pad_value,
-            discrete_pad_value=discrete_pad_value,
-            continuous_pad_value=continuous_pad_value,
-            shared_delay_tokens=shared_delay_tokens,
-        )
-    )
-    _, aligned_discrete_target, _ = generate_utils.align_prompt_streams(
-        text_tokens=target_text_tokens,
-        discrete_tokens=target_discrete,
-        continuous_latents=target_continuous,
-        delay_token_id=delay_token_id,
-        eos_token_id=eos_token_id,
-        text_pad_value=text_pad_value,
-        discrete_pad_value=discrete_pad_value,
-        continuous_pad_value=continuous_pad_value,
-        shared_delay_tokens=shared_delay_tokens,
-    )
+    aligned_text_prompt = prompt_text_tokens
+    aligned_discrete_prompt = prompt_discrete
+    aligned_continuous_prompt = prompt_continuous
+    aligned_discrete_target = target_discrete
 
     max_new_blocks = args.max_new_blocks
     if max_new_blocks is None:
@@ -594,12 +569,7 @@ def main() -> None:
         raise ValueError("--max-new-blocks must be >= 1.")
     max_new_blocks = int(max_new_blocks)
 
-    text_target = generate_utils.build_teacher_forcing_target_text(
-        target_text_tokens=target_text_tokens,
-        eos_token_id=eos_token_id,
-        pad_token_id=text_pad_value,
-        total_blocks=max_new_blocks,
-    ).unsqueeze(0)
+    text_target = target_text_tokens.unsqueeze(0)
 
     text_prompt_tensor = aligned_text_prompt.unsqueeze(0).to(device=device, dtype=torch.long)
     discrete_prompt_tensor = aligned_discrete_prompt.transpose(0, 1).unsqueeze(0).to(
@@ -613,19 +583,28 @@ def main() -> None:
     target_lengths = torch.tensor([text_target.shape[1]], dtype=torch.long, device=device)
 
     with torch.no_grad():
-        generation = model.generate_with_kv_cache(
+        generation = model.generate(
             text_prompt=text_prompt_tensor,
             discrete_prompt=discrete_prompt_tensor,
             continuous_prompt=continuous_prompt_tensor,
             text_target=text_target.to(device=device, dtype=torch.long),
-            prompt_lengths=torch.tensor(
+            text_prompt_lengths=torch.tensor(
                 [text_prompt_tensor.shape[1]],
                 dtype=torch.long,
                 device=device,
             ),
-            target_lengths=target_lengths,
+            speech_prompt_lengths=torch.tensor(
+                [aligned_discrete_prompt.shape[0]],
+                dtype=torch.long,
+                device=device,
+            ),
+            text_target_lengths=torch.tensor(
+                [text_target.shape[1]],
+                dtype=torch.long,
+                device=device,
+            ),
+            speech_target_lengths=target_lengths,
             max_new_blocks=max_new_blocks,
-            text_eos_token_id=eos_token_id,
             discrete_eos_token_id=eos_token_id,
             temperature=1.0,
             top_k=1,
@@ -647,7 +626,7 @@ def main() -> None:
         target_length=max_new_blocks,
         pad_value=discrete_pad_value,
     )
-    special_token_ids = (delay_token_id, eos_token_id, pad_token_id)
+    special_token_ids = (eos_token_id, pad_token_id)
     metrics, mismatch_examples = _compute_discrete_metrics(
         predicted=predicted_discrete,
         groundtruth=groundtruth_discrete,
@@ -691,7 +670,6 @@ def main() -> None:
             "num_discrete_tokens": int(model.num_discrete_tokens),
             "evaluated_discrete_streams": int(predicted_discrete.shape[1]),
             "continuous_latent_size": int(model.continuous_latent_size),
-            "shared_delay_tokens": int(shared_delay_tokens),
         },
         "lengths": {
             "prompt_raw_blocks": int(prompt_discrete.shape[0]),
@@ -702,7 +680,6 @@ def main() -> None:
             "evaluation_target_blocks": int(groundtruth_discrete.shape[0]),
         },
         "special_token_ids": {
-            "delay": int(delay_token_id),
             "eos": int(eos_token_id),
             "pad": int(pad_token_id),
         },

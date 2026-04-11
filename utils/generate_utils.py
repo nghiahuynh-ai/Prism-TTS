@@ -21,9 +21,7 @@ except ModuleNotFoundError as exc:
 
 
 __all__ = [
-    "align_prompt_streams",
     "build_model",
-    "build_teacher_forcing_target_text",
     "discrete_quality_score",
     "estimate_max_new_blocks",
     "is_collapsed_discrete_stats",
@@ -33,7 +31,6 @@ __all__ = [
     "require_mapping",
     "resample_if_needed",
     "resolve_device",
-    "resolve_shared_delay_tokens",
     "resolve_torch_dtype",
     "safe_tokenize",
     "save_mel_spectrogram_plot",
@@ -100,7 +97,8 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
-        text_loss_weight=float(prism_cfg.get("text_loss_weight", 0.1)),
+        continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
+        mask_ratio=float(prism_cfg.get("mask_ratio", 0.5)),
         discrete_regular_token_loss_weight=float(
             prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
         ),
@@ -401,128 +399,11 @@ def resample_if_needed(
     return resampled[0, 0].cpu().numpy().astype(np.float32, copy=False)
 
 
-def resolve_shared_delay_tokens(collate_cfg: dict[str, Any]) -> int:
-    stream_delay = collate_cfg.get("stream_delay")
-    delay_ms = collate_cfg.get("discrete_stream_delay_ms")
-    frame_rate_hz = float(collate_cfg.get("codec_frame_rate_hz", 12.5))
-
-    if stream_delay is not None and delay_ms is not None:
-        raise ValueError(
-            "data.collate.stream_delay and data.collate.discrete_stream_delay_ms cannot both be set."
-        )
-    if frame_rate_hz <= 0:
-        raise ValueError("data.collate.codec_frame_rate_hz must be > 0.")
-    if stream_delay is not None:
-        value = int(stream_delay)
-        if value < 0:
-            raise ValueError("data.collate.stream_delay must be non-negative.")
-        return value
-    if delay_ms is not None:
-        delay_value = float(delay_ms)
-        if delay_value < 0:
-            raise ValueError("data.collate.discrete_stream_delay_ms must be non-negative.")
-        return int(math.ceil((delay_value * frame_rate_hz) / 1000.0))
-    return 0
-
-
-def _pad_1d(tensor: torch.Tensor, length: int, pad_value: int) -> torch.Tensor:
-    if tensor.dim() != 1:
-        raise ValueError(f"Expected 1D tensor, got {tuple(tensor.shape)}.")
-    if length < tensor.shape[0]:
-        raise ValueError("Cannot pad to shorter length.")
-    out = torch.full((length,), pad_value, dtype=tensor.dtype)
-    out[: tensor.shape[0]] = tensor
-    return out
-
-
-def _pad_2d(tensor: torch.Tensor, length: int, pad_value: int | float) -> torch.Tensor:
-    if tensor.dim() != 2:
-        raise ValueError(f"Expected 2D tensor, got {tuple(tensor.shape)}.")
-    if length < tensor.shape[0]:
-        raise ValueError("Cannot pad to shorter length.")
-    out = torch.full((length, tensor.shape[1]), pad_value, dtype=tensor.dtype)
-    out[: tensor.shape[0], :] = tensor
-    return out
-
-
-def align_prompt_streams(
-    *,
-    text_tokens: torch.LongTensor,
-    discrete_tokens: torch.LongTensor,
-    continuous_latents: torch.FloatTensor,
-    delay_token_id: int,
-    eos_token_id: int,
-    text_pad_value: int,
-    discrete_pad_value: int,
-    continuous_pad_value: float,
-    shared_delay_tokens: int,
-) -> tuple[torch.LongTensor, torch.LongTensor, torch.FloatTensor]:
-    if text_tokens.dim() != 1:
-        raise ValueError(f"text_tokens must be 1D, got {tuple(text_tokens.shape)}.")
-    if discrete_tokens.dim() != 2:
-        raise ValueError(f"discrete_tokens must be 2D [L, N], got {tuple(discrete_tokens.shape)}.")
-    if continuous_latents.dim() != 2:
-        raise ValueError(
-            f"continuous_latents must be 2D [L, C], got {tuple(continuous_latents.shape)}."
-        )
-    if discrete_tokens.shape[0] != continuous_latents.shape[0]:
-        raise ValueError(
-            "discrete_tokens and continuous_latents length mismatch: "
-            f"{discrete_tokens.shape[0]} vs {continuous_latents.shape[0]}"
-        )
-
-    text_length = int(text_tokens.shape[0])
-    discrete_length = int(discrete_tokens.shape[0])
-    extra_delay = max(0, text_length - discrete_length - shared_delay_tokens + 1)
-    effective_delay = shared_delay_tokens + extra_delay
-
-    text_eos = torch.tensor([eos_token_id], dtype=torch.long)
-    text_stream = torch.cat([text_tokens.to(dtype=torch.long), text_eos], dim=0)
-
-    discrete_streams: list[torch.Tensor] = []
-    for stream_idx in range(int(discrete_tokens.shape[1])):
-        prefix = torch.full((effective_delay,), delay_token_id, dtype=torch.long)
-        eos = torch.tensor([eos_token_id], dtype=torch.long)
-        stream = torch.cat([prefix, discrete_tokens[:, stream_idx].to(dtype=torch.long), eos], dim=0)
-        discrete_streams.append(stream)
-
-    continuous_prefix = torch.zeros(
-        (effective_delay, int(continuous_latents.shape[1])),
-        dtype=torch.float32,
-    )
-    continuous_eos = torch.zeros((1, int(continuous_latents.shape[1])), dtype=torch.float32)
-    continuous_stream = torch.cat(
-        [continuous_prefix, continuous_latents.to(dtype=torch.float32), continuous_eos],
-        dim=0,
-    )
-
-    max_length = max(
-        int(text_stream.shape[0]),
-        int(continuous_stream.shape[0]),
-        max(int(stream.shape[0]) for stream in discrete_streams) if discrete_streams else 0,
-    )
-
-    text_aligned = _pad_1d(text_stream, max_length, text_pad_value)
-    discrete_aligned = torch.full(
-        (max_length, len(discrete_streams)),
-        discrete_pad_value,
-        dtype=torch.long,
-    )
-    for stream_idx, stream in enumerate(discrete_streams):
-        discrete_aligned[: stream.shape[0], stream_idx] = stream
-    continuous_aligned = _pad_2d(continuous_stream, max_length, continuous_pad_value).to(
-        dtype=torch.float32
-    )
-
-    return text_aligned, discrete_aligned, continuous_aligned
-
-
 def estimate_max_new_blocks(
     *,
     target_text_token_count: int,
     prompt_text_token_count: int,
     prompt_frame_count: int,
-    shared_delay_tokens: int,
     duration_scale: float,
     trailing_pad_blocks: int,
 ) -> int:
@@ -537,32 +418,9 @@ def estimate_max_new_blocks(
     ratio = max(0.5, min(8.0, ratio * duration_scale))
 
     estimated_frames = int(math.ceil(target_text_token_count * ratio))
-    min_blocks = target_text_token_count + 1
-    inferred = max(min_blocks, estimated_frames + shared_delay_tokens + 1)
+    min_blocks = max(1, target_text_token_count)
+    inferred = max(min_blocks, estimated_frames)
     return inferred + max(0, int(trailing_pad_blocks))
-
-
-def build_teacher_forcing_target_text(
-    *,
-    target_text_tokens: torch.LongTensor,
-    eos_token_id: int,
-    pad_token_id: int,
-    total_blocks: int,
-) -> torch.LongTensor:
-    if target_text_tokens.dim() != 1:
-        raise ValueError(f"target_text_tokens must be 1D, got {tuple(target_text_tokens.shape)}.")
-    min_required = int(target_text_tokens.shape[0]) + 1
-    if total_blocks < min_required:
-        raise ValueError(
-            f"total_blocks={total_blocks} is too small, need at least {min_required} "
-            "(text tokens + EOS)."
-        )
-
-    out = torch.full((total_blocks,), pad_token_id, dtype=torch.long)
-    if target_text_tokens.numel() > 0:
-        out[: target_text_tokens.shape[0]] = target_text_tokens
-    out[target_text_tokens.shape[0]] = eos_token_id
-    return out
 
 
 def _normalize_generated_discrete(
