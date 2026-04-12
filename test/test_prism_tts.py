@@ -197,6 +197,108 @@ class TestPrismTTS(unittest.TestCase):
             ("loss", "discrete_loss", "continuous_loss", "flow_loss"),
         )
 
+    def test_forward_samples_mask_ratio_from_zero_to_one_when_unspecified(self):
+        batch_size = 2
+        prompt_len = 2
+        target_len = 3
+        text_vocab_upper = max(2, min(200, self.text_vocab_size))
+
+        text_prompt = torch.randint(
+            0, text_vocab_upper, (batch_size, prompt_len), device=self.device
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size, prompt_len, self.continuous_latent_size, device=self.device
+        )
+
+        text_target = torch.randint(
+            0, text_vocab_upper, (batch_size, target_len), device=self.device
+        )
+        discrete_target = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, target_len),
+            device=self.device,
+        )
+        continuous_target = torch.randn(
+            batch_size, target_len, self.continuous_latent_size, device=self.device
+        )
+
+        collate = BatchCollate(
+            discrete_token_count=max(1, int(self.discrete_vocab_size) - 3)
+        )
+        samples = []
+        for sample_idx in range(batch_size):
+            samples.append(
+                {
+                    "text_prompt": text_prompt[sample_idx].detach().cpu(),
+                    "discrete_prompt": discrete_prompt[sample_idx]
+                    .transpose(0, 1)
+                    .contiguous()
+                    .detach()
+                    .cpu(),
+                    "continuous_prompt": continuous_prompt[sample_idx].detach().cpu(),
+                    "text_target": text_target[sample_idx].detach().cpu(),
+                    "discrete_target": discrete_target[sample_idx]
+                    .transpose(0, 1)
+                    .contiguous()
+                    .detach()
+                    .cpu(),
+                    "continuous_target": continuous_target[sample_idx].detach().cpu(),
+                }
+            )
+        flat_batch = collate(samples)
+
+        captured_ratios: list[float] = []
+        original_sampler = self.model._sample_masked_target_blocks
+
+        def _capture_ratio(
+            target_block_counts: torch.LongTensor,
+            mask_ratio: float,
+            masked_target_blocks: torch.BoolTensor | None,
+        ) -> torch.BoolTensor:
+            captured_ratios.append(float(mask_ratio))
+            return original_sampler(
+                target_block_counts=target_block_counts,
+                mask_ratio=mask_ratio,
+                masked_target_blocks=masked_target_blocks,
+            )
+
+        self.model._sample_masked_target_blocks = _capture_ratio  # type: ignore[method-assign]
+        try:
+            self.model(
+                flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
+                flat_continuous_values=flat_batch["flat_continuous_values"].to(self.device),
+                flat_token_type_ids=flat_batch["flat_token_type_ids"].to(self.device),
+                flat_speech_stream_ids=flat_batch["flat_speech_stream_ids"].to(self.device),
+                flat_target_block_ids=flat_batch["flat_target_block_ids"].to(self.device),
+                flat_target_block_counts=flat_batch["flat_target_block_counts"].to(self.device),
+                attention_mask=flat_batch["attention_mask"].to(self.device),
+                return_dict=True,
+            )
+            self.model(
+                flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
+                flat_continuous_values=flat_batch["flat_continuous_values"].to(self.device),
+                flat_token_type_ids=flat_batch["flat_token_type_ids"].to(self.device),
+                flat_speech_stream_ids=flat_batch["flat_speech_stream_ids"].to(self.device),
+                flat_target_block_ids=flat_batch["flat_target_block_ids"].to(self.device),
+                flat_target_block_counts=flat_batch["flat_target_block_counts"].to(self.device),
+                attention_mask=flat_batch["attention_mask"].to(self.device),
+                return_dict=True,
+            )
+        finally:
+            self.model._sample_masked_target_blocks = original_sampler  # type: ignore[method-assign]
+
+        self.assertEqual(len(captured_ratios), 2)
+        for ratio in captured_ratios:
+            self.assertGreaterEqual(ratio, 0.0)
+            self.assertLess(ratio, 1.0)
+
     def test_generate_returns_expected_shapes(self):
         batch_size = 1
         prompt_len = 2

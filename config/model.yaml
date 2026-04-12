@@ -16,8 +16,9 @@ model:
     # Loss weights for masked speech-block reconstruction.
     continuous_loss_weight: 1.0
     flow_loss_weight: 1.0
-    # Fraction of target speech blocks masked per training sample.
-    mask_ratio: 0.5
+    # Legacy default value; training now samples mask_ratio uniformly in [0, 1)
+    # per forward pass unless an explicit mask_ratio override is provided.
+    mask_ratio: null
     # Per-token CE weights for discrete stream training:
     # regular = codec IDs, special = EOT/EOS/PAD.
     discrete_regular_token_loss_weight: 1.0
