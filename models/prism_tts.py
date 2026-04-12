@@ -67,7 +67,6 @@ class PrismTTS(nn.Module):
         flow_model_channels: Optional[int] = None,
         flow_loss_weight: float = 1.0,
         continuous_loss_weight: float = 1.0,
-        mask_ratio: float = 0.5,
         discrete_regular_token_loss_weight: float = 1.0,
         discrete_special_token_loss_weight: float = 1.0,
         flow_sample_steps: int = 16,
@@ -88,8 +87,6 @@ class PrismTTS(nn.Module):
             raise ValueError("flow_loss_weight must be >= 0.")
         if continuous_loss_weight < 0.0:
             raise ValueError("continuous_loss_weight must be >= 0.")
-        if not (0.0 <= mask_ratio <= 1.0):
-            raise ValueError("mask_ratio must be in [0, 1].")
         if discrete_regular_token_loss_weight < 0.0:
             raise ValueError("discrete_regular_token_loss_weight must be >= 0.")
         if discrete_special_token_loss_weight < 0.0:
@@ -113,7 +110,6 @@ class PrismTTS(nn.Module):
 
         self.flow_loss_weight = float(flow_loss_weight)
         self.continuous_loss_weight = float(continuous_loss_weight)
-        self.mask_ratio = float(mask_ratio)
         self.discrete_regular_token_loss_weight = float(discrete_regular_token_loss_weight)
         self.discrete_special_token_loss_weight = float(discrete_special_token_loss_weight)
         self.flow_sample_steps = int(flow_sample_steps)

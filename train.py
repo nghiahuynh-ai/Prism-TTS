@@ -403,9 +403,6 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
     continuous_loss_weight = float(prism_cfg.get("continuous_loss_weight", 1.0))
     if continuous_loss_weight < 0.0:
         raise ValueError("model.prism_tts.continuous_loss_weight must be >= 0.")
-    mask_ratio = float(prism_cfg.get("mask_ratio", 0.5))
-    if not (0.0 <= mask_ratio <= 1.0):
-        raise ValueError("model.prism_tts.mask_ratio must be in [0, 1].")
     discrete_regular_token_loss_weight = float(
         prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
     )
@@ -481,7 +478,6 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
         continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
-        mask_ratio=float(prism_cfg.get("mask_ratio", 0.5)),
         discrete_regular_token_loss_weight=float(
             prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
         ),
