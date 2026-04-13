@@ -10,7 +10,13 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 
-from models.prism_tts import PrismTTS, PrismTTSGenerationOutput, PrismTTSOutput
+from models.prism_tts import PrismTTS
+from utils.model_utils import (
+    PrismTTSGenerationOutput,
+    PrismTTSOutput,
+    normalize_continuous_latents,
+    normalize_discrete_tokens,
+)
 
 try:
     import lightning.pytorch as pl
@@ -529,6 +535,8 @@ else:
             if eval_batch is None:
                 return
 
+            # Periodic eval should decode exactly one sample, not the full batch.
+            eval_batch = self._slice_batch_to_sample(eval_batch, sample_idx=0)
             eval_batch = self._move_to_device(eval_batch, self.device)
             batch_inputs = self._parse_batch(eval_batch)
             if (
@@ -538,63 +546,74 @@ else:
                 or batch_inputs.text_target is None
             ):
                 return
-            # Generation logs only one sample; slice and trim by prompt/target lengths to
-            # avoid conditioning on batch-level padding from collate.
-            sample_idx = 0
+
             prompt_speech_len = (
-                int(torch.as_tensor(batch_inputs.speech_prompt_lengths)[sample_idx].item())
+                int(torch.as_tensor(batch_inputs.speech_prompt_lengths)[0].item())
                 if batch_inputs.speech_prompt_lengths is not None
                 else int(batch_inputs.discrete_prompt.shape[-2])
             )
             prompt_text_len = (
-                int(torch.as_tensor(batch_inputs.text_prompt_lengths)[sample_idx].item())
+                int(torch.as_tensor(batch_inputs.text_prompt_lengths)[0].item())
                 if batch_inputs.text_prompt_lengths is not None
                 else int(batch_inputs.text_prompt.shape[1])
             )
             target_speech_len = (
-                int(torch.as_tensor(batch_inputs.speech_target_lengths)[sample_idx].item())
+                int(torch.as_tensor(batch_inputs.speech_target_lengths)[0].item())
                 if batch_inputs.speech_target_lengths is not None
                 else int(batch_inputs.discrete_target.shape[-2])
             )
             target_text_len = (
-                int(torch.as_tensor(batch_inputs.text_target_lengths)[sample_idx].item())
+                int(torch.as_tensor(batch_inputs.text_target_lengths)[0].item())
                 if batch_inputs.text_target_lengths is not None
                 else int(batch_inputs.text_target.shape[1])
             )
             if target_speech_len < 1:
                 return
 
-            text_prompt = batch_inputs.text_prompt[sample_idx : sample_idx + 1, :prompt_text_len]
-            discrete_prompt = self.model._normalize_discrete_tokens(
-                batch_inputs.discrete_prompt[sample_idx : sample_idx + 1],
+            text_prompt = batch_inputs.text_prompt[:, :prompt_text_len]
+            discrete_prompt = normalize_discrete_tokens(
+                batch_inputs.discrete_prompt,
                 "discrete_prompt",
+                num_discrete_tokens=self.model.num_discrete_tokens,
             )[:, :prompt_speech_len, :]
-            continuous_prompt = self.model._normalize_continuous_latents(
-                batch_inputs.continuous_prompt[sample_idx : sample_idx + 1],
+            continuous_prompt = normalize_continuous_latents(
+                batch_inputs.continuous_prompt,
                 expected_len=int(batch_inputs.discrete_prompt.shape[-2]),
                 name="continuous_prompt",
+                continuous_latent_size=self.model.continuous_latent_size,
             )[:, :prompt_speech_len, :]
-            text_target = batch_inputs.text_target[sample_idx : sample_idx + 1, :target_text_len]
+            text_target = batch_inputs.text_target[:, :target_text_len]
 
             was_training = self.model.training
             try:
                 with self._ema_scope(enabled=self.use_ema_for_periodic_eval):
                     self.model.eval()
                     with torch.no_grad():
-                        generation = self.model.generate(
-                            text_prompt=text_prompt,
-                            discrete_prompt=discrete_prompt,
-                            continuous_prompt=continuous_prompt,
-                            text_target=text_target,
-                            text_prompt_lengths=torch.tensor([prompt_text_len], device=self.device),
-                            speech_prompt_lengths=torch.tensor([prompt_speech_len], device=self.device),
-                            text_target_lengths=torch.tensor([target_text_len], device=self.device),
-                            speech_target_lengths=torch.tensor([target_speech_len], device=self.device),
-                            max_new_blocks=target_speech_len,
-                            do_sample=False,
-                            force_silent_special_tokens=True,
-                            return_dict=True,
-                        )
+                        generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
+                        for generation_method in ("causal", "parallel"):
+                            generation_outputs[generation_method] = self.model.generate(
+                                text_prompt=text_prompt,
+                                discrete_prompt=discrete_prompt,
+                                continuous_prompt=continuous_prompt,
+                                text_target=text_target,
+                                text_prompt_lengths=torch.tensor(
+                                    [prompt_text_len], device=self.device
+                                ),
+                                speech_prompt_lengths=torch.tensor(
+                                    [prompt_speech_len], device=self.device
+                                ),
+                                text_target_lengths=torch.tensor(
+                                    [target_text_len], device=self.device
+                                ),
+                                speech_target_lengths=torch.tensor(
+                                    [target_speech_len], device=self.device
+                                ),
+                                max_new_blocks=target_speech_len,
+                                do_sample=False,
+                                force_silent_special_tokens=True,
+                                generation_method=generation_method,
+                                return_dict=True,
+                            )
             finally:
                 if was_training:
                     self.model.train()
@@ -603,17 +622,13 @@ else:
                 return
             self._log_eval_media_to_wandb(
                 batch_inputs=PrismBatch(
-                    continuous_target=(
-                        None
-                        if batch_inputs.continuous_target is None
-                        else batch_inputs.continuous_target[sample_idx : sample_idx + 1]
-                    ),
+                    continuous_target=batch_inputs.continuous_target,
                     speech_target_lengths=torch.tensor(
                         [target_speech_len],
                         device=self.device,
                     ),
                 ),
-                generation=generation,
+                generations=generation_outputs,
             )
 
         def _next_eval_batch(self) -> Optional[Any]:
@@ -771,7 +786,7 @@ else:
         def _log_eval_media_to_wandb(
             self,
             batch_inputs: PrismBatch,
-            generation: PrismTTSGenerationOutput,
+            generations: Mapping[str, PrismTTSGenerationOutput],
         ) -> None:
             run = self._wandb_run()
             if run is None:
@@ -782,20 +797,26 @@ else:
             except ModuleNotFoundError:
                 return
 
-            audio_table = self._build_audio_table(batch_inputs, generation)
-            if audio_table is None:
+            audio_table = self._build_audio_table(batch_inputs, generations)
+            mel_table = self._build_mel_table(batch_inputs, generations)
+
+            payload: dict[str, Any] = {}
+            if audio_table is not None:
+                payload["eval/audio_samples"] = audio_table
+            if mel_table is not None:
+                payload["eval/mel_spectrogram_samples"] = mel_table
+            if not payload:
                 return
 
-            run.log({"eval/audio_samples": audio_table}, step=int(self.global_step))
+            run.log(payload, step=int(self.global_step))
 
         def _build_audio_table(
             self,
             batch_inputs: PrismBatch,
-            generation: PrismTTSGenerationOutput,
+            generations: Mapping[str, PrismTTSGenerationOutput],
         ) -> Optional[Any]:
-            if self.audio_decoder is None:
-                return None
-            if batch_inputs.continuous_target is None:
+            media_rows = self._build_eval_media_rows(batch_inputs, generations)
+            if not media_rows:
                 return None
 
             try:
@@ -803,40 +824,133 @@ else:
             except ModuleNotFoundError:
                 return None
 
-            target_continuous = self.model._normalize_continuous_latents(
-                batch_inputs.continuous_target,
-                expected_len=batch_inputs.continuous_target.shape[1],
-                name="continuous_target",
-            )
-            pred_continuous = generation.continuous_latents
-
-            # Keep eval-stage media payload small and deterministic: log exactly one sample.
-            num_samples = min(
-                1,
-                self.max_audio_samples,
-                int(target_continuous.shape[0]),
-                int(pred_continuous.shape[0]),
-            )
+            step = int(self.global_step)
             table = wandb.Table(
                 columns=[
+                    "step",
                     "sample_id",
-                    "pred_special_block_ratio",
-                    "pred_discrete_unique",
-                    "pred_latent_std",
-                    "pred_latent_delta_std",
-                    "target_audio",
-                    "target_mel_spectrogram",
-                    "synthesized_audio",
-                    "synthesized_mel_spectrogram",
+                    "generation_method",
+                    "groundtruth_audio",
+                    "predicted_audio",
+                ]
+            )
+
+            for row in media_rows:
+                sample_idx = int(row["sample_idx"])
+                method = str(row["generation_method"])
+                target_audio = np.asarray(row["target_audio"], dtype=np.float32)
+                pred_audio = np.asarray(row["predicted_audio"], dtype=np.float32)
+                table.add_data(
+                    step,
+                    sample_idx,
+                    method,
+                    wandb.Audio(
+                        target_audio,
+                        sample_rate=self.audio_sample_rate,
+                        caption=f"groundtruth_step_{step}_sample_{sample_idx}",
+                    ),
+                    wandb.Audio(
+                        pred_audio,
+                        sample_rate=self.audio_sample_rate,
+                        caption=f"{method}_pred_step_{step}_sample_{sample_idx}",
+                    ),
+                )
+            return table
+
+        def _build_mel_table(
+            self,
+            batch_inputs: PrismBatch,
+            generations: Mapping[str, PrismTTSGenerationOutput],
+        ) -> Optional[Any]:
+            media_rows = self._build_eval_media_rows(batch_inputs, generations)
+            if not media_rows:
+                return None
+
+            if self.audio_decoder is None:
+                return None
+
+            try:
+                import wandb
+            except ModuleNotFoundError:
+                return None
+
+            step = int(self.global_step)
+            table = wandb.Table(
+                columns=[
+                    "step",
+                    "sample_id",
+                    "generation_method",
+                    "groundtruth_mel_spectrogram",
+                    "predicted_mel_spectrogram",
                 ]
             )
 
             added = 0
-            for sample_idx in range(num_samples):
-                sample_target_len = min(
-                    int(target_continuous.shape[1]),
-                    int(pred_continuous.shape[1]),
+            for row in media_rows:
+                sample_idx = int(row["sample_idx"])
+                method = str(row["generation_method"])
+                target_audio = np.asarray(row["target_audio"], dtype=np.float32)
+                pred_audio = np.asarray(row["predicted_audio"], dtype=np.float32)
+                target_mel = self._build_mel_spectrogram_image(
+                    target_audio,
+                    title=f"Groundtruth Mel (sample {sample_idx}, step {step})",
                 )
+                pred_mel = self._build_mel_spectrogram_image(
+                    pred_audio,
+                    title=f"Predicted Mel ({method}, sample {sample_idx}, step {step})",
+                )
+                if target_mel is None or pred_mel is None:
+                    continue
+
+                table.add_data(
+                    step,
+                    sample_idx,
+                    method,
+                    target_mel,
+                    pred_mel,
+                )
+                added += 1
+
+            return table if added > 0 else None
+
+        def _build_eval_media_rows(
+            self,
+            batch_inputs: PrismBatch,
+            generations: Mapping[str, PrismTTSGenerationOutput],
+        ) -> list[dict[str, Any]]:
+            if self.audio_decoder is None:
+                return []
+            if batch_inputs.continuous_target is None:
+                return []
+
+            target_continuous = normalize_continuous_latents(
+                batch_inputs.continuous_target,
+                expected_len=batch_inputs.continuous_target.shape[1],
+                name="continuous_target",
+                continuous_latent_size=self.model.continuous_latent_size,
+            )
+
+            normalized_generations: list[tuple[str, torch.FloatTensor]] = []
+            for method_name, generation in generations.items():
+                continuous = generation.continuous_latents
+                if continuous is None:
+                    continue
+                normalized = normalize_continuous_latents(
+                    continuous,
+                    expected_len=continuous.shape[1],
+                    name=f"generation[{method_name}].continuous_latents",
+                    continuous_latent_size=self.model.continuous_latent_size,
+                )
+                normalized_generations.append((str(method_name), normalized))
+            if not normalized_generations:
+                return []
+
+            # Keep eval-stage media payload small and deterministic: log exactly one sample.
+            num_samples = min(1, self.max_audio_samples, int(target_continuous.shape[0]))
+            rows: list[dict[str, Any]] = []
+
+            for sample_idx in range(num_samples):
+                sample_target_len = int(target_continuous.shape[1])
                 if batch_inputs.speech_target_lengths is not None:
                     target_lengths = torch.as_tensor(
                         batch_inputs.speech_target_lengths,
@@ -852,76 +966,38 @@ else:
                 if sample_target_len < 1:
                     continue
 
-                sample_target_continuous = target_continuous[sample_idx, :sample_target_len, :]
-                sample_pred_continuous = pred_continuous[sample_idx, :sample_target_len, :]
+                for method, pred_continuous in normalized_generations:
+                    if sample_idx >= int(pred_continuous.shape[0]):
+                        continue
+                    sample_pred_len = min(sample_target_len, int(pred_continuous.shape[1]))
+                    if sample_pred_len < 1:
+                        continue
 
-                special_block_ratio = float("nan")
-                discrete_unique = 0
-                pred_discrete = generation.discrete_ids
-                if pred_discrete is not None:
-                    pred_discrete = self.model._normalize_discrete_tokens(
-                        pred_discrete[sample_idx : sample_idx + 1],
-                        "generation.discrete_ids",
-                    )[0, :sample_target_len, :]
-                    discrete_unique = int(torch.unique(pred_discrete).numel())
+                    sample_target_continuous = target_continuous[
+                        sample_idx : sample_idx + 1,
+                        :sample_pred_len,
+                        :,
+                    ][0]
+                    sample_pred_continuous = pred_continuous[
+                        sample_idx : sample_idx + 1,
+                        :sample_pred_len,
+                        :,
+                    ][0]
+                    target_audio = self._decode_audio(sample_target_continuous)
+                    pred_audio = self._decode_audio(sample_pred_continuous)
+                    if target_audio is None or pred_audio is None:
+                        continue
 
-                    discrete_eos = self.model._resolve_generation_discrete_eos_token_id(None)
-                    special_ids = self.model._infer_special_discrete_token_ids(discrete_eos)
-                    if len(special_ids) > 0:
-                        special_tensor = torch.tensor(
-                            special_ids,
-                            dtype=pred_discrete.dtype,
-                            device=pred_discrete.device,
-                        )
-                        special_blocks = torch.isin(pred_discrete, special_tensor).all(dim=-1)
-                        special_block_ratio = float(special_blocks.float().mean().item())
-
-                pred_latent_std = float(sample_pred_continuous.std(unbiased=False).item())
-                if sample_pred_continuous.shape[0] > 1:
-                    pred_latent_delta_std = float(
-                        (sample_pred_continuous[1:] - sample_pred_continuous[:-1])
-                        .std(unbiased=False)
-                        .item()
+                    rows.append(
+                        {
+                            "sample_idx": sample_idx,
+                            "generation_method": method,
+                            "target_audio": target_audio,
+                            "predicted_audio": pred_audio,
+                        }
                     )
-                else:
-                    pred_latent_delta_std = 0.0
 
-                target_audio = self._decode_audio(sample_target_continuous)
-                synth_audio = self._decode_audio(sample_pred_continuous)
-                if target_audio is None or synth_audio is None:
-                    continue
-
-                target_mel = self._build_mel_spectrogram_image(
-                    target_audio,
-                    title=f"Target Mel Spectrogram (sample {sample_idx})",
-                )
-                synth_mel = self._build_mel_spectrogram_image(
-                    synth_audio,
-                    title=f"Synthesized Mel Spectrogram (sample {sample_idx})",
-                )
-
-                table.add_data(
-                    sample_idx,
-                    special_block_ratio,
-                    discrete_unique,
-                    pred_latent_std,
-                    pred_latent_delta_std,
-                    wandb.Audio(
-                        target_audio,
-                        sample_rate=self.audio_sample_rate,
-                        caption=f"target_sample_{sample_idx}",
-                    ),
-                    target_mel,
-                    wandb.Audio(
-                        synth_audio,
-                        sample_rate=self.audio_sample_rate,
-                        caption=f"synth_sample_{sample_idx}",
-                    ),
-                    synth_mel,
-                )
-                added += 1
-
-            return table if added > 0 else None
+            return rows
 
         def _build_mel_spectrogram_image(self, audio: np.ndarray, *, title: str) -> Optional[Any]:
             try:
@@ -1111,6 +1187,28 @@ else:
             if trainer is None:
                 return True
             return bool(trainer.is_global_zero)
+
+        def _slice_batch_to_sample(self, value: Any, sample_idx: int = 0) -> Any:
+            if torch.is_tensor(value):
+                if value.dim() == 0 or int(value.shape[0]) < 1:
+                    return value
+                sample_idx = max(0, min(sample_idx, int(value.shape[0]) - 1))
+                return value[sample_idx : sample_idx + 1]
+            if isinstance(value, np.ndarray):
+                if value.ndim == 0 or int(value.shape[0]) < 1:
+                    return value
+                sample_idx = max(0, min(sample_idx, int(value.shape[0]) - 1))
+                return value[sample_idx : sample_idx + 1]
+            if isinstance(value, Mapping):
+                return {
+                    key: self._slice_batch_to_sample(item, sample_idx=sample_idx)
+                    for key, item in value.items()
+                }
+            if isinstance(value, tuple):
+                return tuple(self._slice_batch_to_sample(item, sample_idx=sample_idx) for item in value)
+            if isinstance(value, list):
+                return [self._slice_batch_to_sample(item, sample_idx=sample_idx) for item in value]
+            return value
 
         def _move_to_device(self, value: Any, device: torch.device) -> Any:
             if torch.is_tensor(value):

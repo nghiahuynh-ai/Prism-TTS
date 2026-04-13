@@ -19,8 +19,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+import models.prism_tts as prism_tts_module
 from models.prism_tts import PrismTTS
 from dataset.dataset import BatchCollate
+from utils.model_utils import resolve_generation_discrete_eos_token_id
 
 
 MODEL_CONFIG_PATH = PROJECT_ROOT / "config" / "model.yaml"
@@ -255,7 +257,7 @@ class TestPrismTTS(unittest.TestCase):
         flat_batch = collate(samples)
 
         captured_ratios: list[float] = []
-        original_sampler = self.model._sample_masked_target_blocks
+        original_sampler = prism_tts_module.sample_masked_target_blocks
 
         def _capture_ratio(
             target_block_counts: torch.LongTensor,
@@ -269,7 +271,7 @@ class TestPrismTTS(unittest.TestCase):
                 masked_target_blocks=masked_target_blocks,
             )
 
-        self.model._sample_masked_target_blocks = _capture_ratio  # type: ignore[method-assign]
+        prism_tts_module.sample_masked_target_blocks = _capture_ratio
         try:
             self.model(
                 flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
@@ -292,7 +294,7 @@ class TestPrismTTS(unittest.TestCase):
                 return_dict=True,
             )
         finally:
-            self.model._sample_masked_target_blocks = original_sampler  # type: ignore[method-assign]
+            prism_tts_module.sample_masked_target_blocks = original_sampler
 
         self.assertEqual(len(captured_ratios), 2)
         for ratio in captured_ratios:
@@ -438,7 +440,13 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         prompt_len = 2
         max_new_blocks = 6
         text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
-        eos_id = int(self.model._resolve_generation_discrete_eos_token_id(None))
+        eos_id = int(
+            resolve_generation_discrete_eos_token_id(
+                None,
+                backbone_eos_token_id=self.model.backbone.config.eos_token_id,
+                discrete_vocab_size=self.model.discrete_vocab_size,
+            )
+        )
 
         text_prompt = torch.randint(
             0,
@@ -502,8 +510,160 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         self.assertEqual(outputs.continuous_latents.shape[1], 1)
         self.assertEqual(len(outputs.discrete_logits), 1)
 
+    def test_generate_parallel_returns_expected_shapes(self) -> None:
+        batch_size = 1
+        prompt_len = 3
+        generated_len = 4
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                speech_target_lengths=torch.tensor([generated_len], device=self.device),
+                max_new_blocks=generated_len,
+                discrete_eos_token_id=-1,
+                do_sample=False,
+                generation_method="parallel",
+                return_dict=True,
+            )
+
+        self.assertEqual(outputs.text_ids.shape, (batch_size, generated_len))
+        self.assertEqual(
+            outputs.discrete_ids.shape,
+            (batch_size, self.num_discrete_tokens, generated_len),
+        )
+        self.assertEqual(
+            outputs.continuous_latents.shape,
+            (batch_size, generated_len, self.continuous_latent_size),
+        )
+        self.assertGreaterEqual(len(outputs.discrete_logits), 1)
+
+    def test_generate_parallel_estimates_target_lengths_from_prompt_ratio(self) -> None:
+        batch_size = 1
+        prompt_text_len = 4
+        prompt_speech_len = 8
+        target_text_len = 3
+        expected_generated_len = 6
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_text_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_speech_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_speech_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, target_text_len),
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                max_new_blocks=None,
+                discrete_eos_token_id=-1,
+                do_sample=False,
+                generation_method="parallel",
+                return_dict=True,
+            )
+
+        self.assertEqual(outputs.discrete_ids.shape[-1], expected_generated_len)
+        self.assertEqual(outputs.continuous_latents.shape[1], expected_generated_len)
+
+    def test_generate_rejects_unknown_generation_method(self) -> None:
+        batch_size = 1
+        prompt_len = 2
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+
+        with self.assertRaisesRegex(ValueError, "generation_method must be one of"):
+            self.model.generate(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                do_sample=False,
+                generation_method="nonexistent",
+                return_dict=True,
+            )
+
     def test_generate_from_raw_accepts_string_and_raw_speech_prompt(self) -> None:
-        eos_id = int(self.model._resolve_generation_discrete_eos_token_id(None))
+        eos_id = int(
+            resolve_generation_discrete_eos_token_id(
+                None,
+                backbone_eos_token_id=self.model.backbone.config.eos_token_id,
+                discrete_vocab_size=self.model.discrete_vocab_size,
+            )
+        )
 
         def _tokenizer(text: str) -> list[int]:
             return [5 + (ord(ch) % 13) for ch in text]
@@ -547,7 +707,13 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         self.assertEqual(len(outputs.discrete_logits), int(outputs.discrete_ids.shape[-1]))
 
     def test_generate_from_raw_supports_batched_inputs(self) -> None:
-        eos_id = int(self.model._resolve_generation_discrete_eos_token_id(None))
+        eos_id = int(
+            resolve_generation_discrete_eos_token_id(
+                None,
+                backbone_eos_token_id=self.model.backbone.config.eos_token_id,
+                discrete_vocab_size=self.model.discrete_vocab_size,
+            )
+        )
 
         def _tokenizer(text: str) -> list[int]:
             return [7 + (ord(ch) % 17) for ch in text]

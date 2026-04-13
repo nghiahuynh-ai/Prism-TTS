@@ -152,6 +152,13 @@ def parse_args() -> argparse.Namespace:
         help="Override flow sampling steps for continuous latents.",
     )
     parser.add_argument(
+        "--generation-method",
+        type=str,
+        default="causal",
+        choices=("causal", "parallel"),
+        help="Speech block generation strategy.",
+    )
+    parser.add_argument(
         "--force-silent-special-tokens",
         dest="force_silent_special_tokens",
         action="store_true",
@@ -343,6 +350,7 @@ def main() -> None:
                 top_p=top_p,
                 do_sample=do_sample,
                 flow_num_steps=args.flow_num_steps,
+                generation_method=str(args.generation_method),
                 force_silent_special_tokens=bool(args.force_silent_special_tokens),
                 return_dict=True,
             )

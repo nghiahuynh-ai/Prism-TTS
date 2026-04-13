@@ -1,7 +1,8 @@
 from models.flow_head import FlowHead
 from models.llama_backbone import LlamaBackbone
 from models.prism_tts_lightning import PrismTTSLightning
-from models.prism_tts import PrismTTS, PrismTTSGenerationOutput, PrismTTSOutput
+from models.prism_tts import PrismTTS
+from utils.model_utils import PrismTTSGenerationOutput, PrismTTSOutput
 
 __all__ = [
     "FlowHead",

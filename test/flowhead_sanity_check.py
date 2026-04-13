@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from models.mimi_latent_decoder import MimiPreUpsampleLatentDecoder
 from utils import generate_utils
+from utils.model_utils import normalize_discrete_tokens
 
 
 def parse_args() -> argparse.Namespace:
@@ -286,9 +287,10 @@ def main() -> None:
 
     gt_discrete = gt_discrete_raw.unsqueeze(0).to(device=device, dtype=torch.long)
     with torch.no_grad():
-        normalized_gt_discrete = model._normalize_discrete_tokens(
+        normalized_gt_discrete = normalize_discrete_tokens(
             gt_discrete,
             "groundtruth_discrete",
+            num_discrete_tokens=model.num_discrete_tokens,
         )
         cond = model._discrete_condition(normalized_gt_discrete)
         sampled_latents = model.sample_continuous_latent(
