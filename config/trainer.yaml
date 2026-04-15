@@ -51,7 +51,7 @@ trainer:
     min_steps: 0
     gradient_clip_val: 1.0
     # With train_batch_size=2, this keeps effective batch ~= 8.
-    accumulate_grad_batches: 4
+    accumulate_grad_batches: 1
     log_every_n_steps: 10
     val_check_interval: 25000
     num_sanity_val_steps: 2

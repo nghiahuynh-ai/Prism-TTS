@@ -789,14 +789,16 @@ class PrismTTS(nn.Module):
         torch.LongTensor,
         list[torch.Tensor],
     ]:
-        """Autoregressive (causal) block-by-block generation."""
+        """Causal left-to-right generation with a fixed terminal EOS speech block."""
         batch_size = int(text_prompt.shape[0])
+        device = text_prompt.device
         max_target = int(speech_target_lengths.max().item()) if batch_size > 0 else 0
         safe_discrete_fill_id = (
             int(discrete_eos_id)
             if 0 <= int(discrete_eos_id) < self.discrete_vocab_size
             else self.pad_token_id
         )
+        terminal_discrete_id = safe_discrete_fill_id
 
         predicted_discrete = discrete_prompt.new_full(
             (batch_size, max_target, self.num_discrete_tokens),
@@ -808,35 +810,41 @@ class PrismTTS(nn.Module):
         generated_lengths = torch.zeros(
             batch_size,
             dtype=torch.long,
-            device=text_prompt.device,
+            device=device,
         )
-        finished = speech_target_lengths <= 0
         collected_logits: list[torch.Tensor] = []
+        if max_target <= 0:
+            return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
 
-        while True:
-            can_generate = (~finished) & (generated_lengths < speech_target_lengths)
-            if not bool(can_generate.any().item()):
+        valid_target_mask = (
+            torch.arange(max_target, device=device).unsqueeze(0)
+            < speech_target_lengths.unsqueeze(1)
+        )
+        maskable_target_mask = valid_target_mask.clone()
+        has_target = speech_target_lengths > 0
+        if has_target.any():
+            eos_sample_idx = torch.nonzero(has_target, as_tuple=False).squeeze(1)
+            eos_block_idx = speech_target_lengths[eos_sample_idx] - 1
+            predicted_discrete[eos_sample_idx, eos_block_idx, :] = terminal_discrete_id
+            predicted_continuous[eos_sample_idx, eos_block_idx, :] = 0.0
+            maskable_target_mask[eos_sample_idx, eos_block_idx] = False
+
+        step_indices = torch.arange(max_target, device=device).view(max_target, 1, 1)
+        block_indices = torch.arange(max_target, device=device).view(1, 1, max_target)
+        left_to_right_masks = block_indices >= step_indices
+        mask_schedule = maskable_target_mask.unsqueeze(0) & left_to_right_masks
+
+        maskable_lengths = torch.clamp(speech_target_lengths - 1, min=0)
+        finished = maskable_lengths <= 0
+        for step_idx in range(max_target):
+            masked_blocks = mask_schedule[step_idx] & (~finished).unsqueeze(1)
+            if not bool(masked_blocks.any().item()):
                 break
 
-            current_target_lengths = generated_lengths + can_generate.to(dtype=torch.long)
-            max_current_target = int(current_target_lengths.max().item())
-            if max_current_target <= 0:
-                break
-
-            current_discrete = predicted_discrete[:, :max_current_target, :].clone()
-            current_continuous = predicted_continuous[:, :max_current_target, :].clone()
-            masked_blocks = torch.zeros(
-                (batch_size, max_current_target),
-                dtype=torch.bool,
-                device=text_prompt.device,
-            )
-
-            for sample_idx in range(batch_size):
-                generated_count = int(generated_lengths[sample_idx].item())
-                if bool(can_generate[sample_idx].item()):
-                    masked_blocks[sample_idx, generated_count] = True
-                    current_discrete[sample_idx, generated_count, :] = self.pad_token_id
-                    current_continuous[sample_idx, generated_count, :] = 0.0
+            current_discrete = predicted_discrete.clone()
+            current_continuous = predicted_continuous.clone()
+            current_discrete[masked_blocks] = self.pad_token_id
+            current_continuous[masked_blocks] = 0.0
 
             flat = assemble_flat_batch(
                 text_prompt=text_prompt,
@@ -848,7 +856,7 @@ class PrismTTS(nn.Module):
                 text_prompt_lengths=text_prompt_lengths,
                 speech_prompt_lengths=speech_prompt_lengths,
                 text_target_lengths=text_target_lengths,
-                speech_target_lengths=current_target_lengths,
+                speech_target_lengths=speech_target_lengths,
                 attention_mask=None,
                 pad_token_id=self.pad_token_id,
                 eos_token_id=self.eos_token_id,
@@ -861,10 +869,11 @@ class PrismTTS(nn.Module):
                 masked_target_blocks=masked_blocks,
             )
             batch_indices = (
-                torch.arange(batch_size, device=text_prompt.device)
+                torch.arange(batch_size, device=device)
                 .unsqueeze(1)
                 .expand(batch_size, hidden_states.shape[1])
             )
+            step_target_mask = flat.target_block_ids == step_idx
 
             step_logits = torch.full(
                 (batch_size, self.num_discrete_tokens, self.discrete_vocab_size),
@@ -872,9 +881,11 @@ class PrismTTS(nn.Module):
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
+            active_step_samples = (~finished) & (maskable_lengths > step_idx)
 
-            if masked_discrete_positions.any():
-                discrete_hidden = hidden_states[masked_discrete_positions]
+            step_discrete_positions = masked_discrete_positions & step_target_mask
+            if step_discrete_positions.any():
+                discrete_hidden = hidden_states[step_discrete_positions]
                 discrete_logits = self.discrete_lm_head(discrete_hidden)
                 sampled_discrete = self._sample_discrete_ids(
                     discrete_logits,
@@ -883,27 +894,26 @@ class PrismTTS(nn.Module):
                     top_p=top_p,
                     do_sample=do_sample,
                 )
-                discrete_batch_idx = batch_indices[masked_discrete_positions]
-                discrete_block_idx = flat.target_block_ids[masked_discrete_positions]
-                discrete_stream_idx = flat.speech_stream_ids[masked_discrete_positions]
-                predicted_discrete[discrete_batch_idx, discrete_block_idx, discrete_stream_idx] = (
+                discrete_batch_idx = batch_indices[step_discrete_positions]
+                discrete_stream_idx = flat.speech_stream_ids[step_discrete_positions]
+                predicted_discrete[discrete_batch_idx, step_idx, discrete_stream_idx] = (
                     sampled_discrete
                 )
                 step_logits[discrete_batch_idx, discrete_stream_idx, :] = discrete_logits
 
-            if masked_continuous_positions.any():
-                continuous_hidden = hidden_states[masked_continuous_positions]
+            step_continuous_positions = masked_continuous_positions & step_target_mask
+            if step_continuous_positions.any():
+                continuous_hidden = hidden_states[step_continuous_positions]
                 prior_prediction = self.continuous_prior_head(continuous_hidden)
                 sampled_continuous = self.sample_continuous_latent(
                     cond=prior_prediction,
                     num_steps=flow_num_steps,
                 )
-                continuous_batch_idx = batch_indices[masked_continuous_positions]
-                continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
-                predicted_continuous[continuous_batch_idx, continuous_block_idx, :] = sampled_continuous
+                continuous_batch_idx = batch_indices[step_continuous_positions]
+                predicted_continuous[continuous_batch_idx, step_idx, :] = sampled_continuous
 
                 if len(special_discrete_token_ids) > 0:
-                    step_discrete = predicted_discrete[continuous_batch_idx, continuous_block_idx, :]
+                    step_discrete = predicted_discrete[continuous_batch_idx, step_idx, :]
                     special_step_mask = build_special_block_mask(
                         discrete_tokens=step_discrete,
                         special_token_ids=special_discrete_token_ids,
@@ -911,23 +921,21 @@ class PrismTTS(nn.Module):
                     if special_step_mask.any():
                         predicted_continuous[
                             continuous_batch_idx[special_step_mask],
-                            continuous_block_idx[special_step_mask],
+                            step_idx,
                             :,
                         ] = 0.0
 
-            active_sample_idx = torch.nonzero(can_generate, as_tuple=False).squeeze(1)
-            active_block_idx = generated_lengths[active_sample_idx]
-            new_discrete_blocks = predicted_discrete[active_sample_idx, active_block_idx, :]
-            reached_eos = torch.eq(new_discrete_blocks, discrete_eos_id).all(dim=-1)
-
-            generated_lengths[active_sample_idx] = active_block_idx + 1
-            finished[active_sample_idx] = reached_eos | (
-                generated_lengths[active_sample_idx] >= speech_target_lengths[active_sample_idx]
-            )
+            active_sample_idx = torch.nonzero(active_step_samples, as_tuple=False).squeeze(1)
+            if active_sample_idx.numel() > 0:
+                generated_lengths[active_sample_idx] = step_idx + 1
+                finished[active_sample_idx] = (
+                    generated_lengths[active_sample_idx] >= maskable_lengths[active_sample_idx]
+                )
             collected_logits.append(step_logits)
 
+        generated_lengths = speech_target_lengths.clone()
         return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
-    
+
     @torch.no_grad()
     def generate_parallel(
         self,
@@ -954,10 +962,11 @@ class PrismTTS(nn.Module):
         list[torch.Tensor],
     ]:
         """
-        Block-parallel generation with confidence remasking.
+        Block-parallel generation with confidence remasking and fixed terminal EOS block.
 
-        We decode all masked blocks in parallel, score each block by discrete-token confidence,
-        and remask only low-confidence blocks according to a cosine schedule.
+        We decode masked non-terminal blocks in parallel, score each block by
+        discrete-token confidence, and remask only low-confidence blocks according
+        to a cosine schedule.
         """
         batch_size = int(text_prompt.shape[0])
         device = text_prompt.device
@@ -967,6 +976,7 @@ class PrismTTS(nn.Module):
             if 0 <= int(discrete_eos_id) < self.discrete_vocab_size
             else self.pad_token_id
         )
+        terminal_discrete_id = safe_discrete_fill_id
 
         predicted_discrete = discrete_prompt.new_full(
             (batch_size, max_target, self.num_discrete_tokens),
@@ -987,7 +997,16 @@ class PrismTTS(nn.Module):
             torch.arange(max_target, device=device).unsqueeze(0)
             < speech_target_lengths.unsqueeze(1)
         )
-        masked_blocks = valid_target_mask.clone()
+        maskable_target_mask = valid_target_mask.clone()
+        has_target = speech_target_lengths > 0
+        if has_target.any():
+            eos_sample_idx = torch.nonzero(has_target, as_tuple=False).squeeze(1)
+            eos_block_idx = speech_target_lengths[eos_sample_idx] - 1
+            predicted_discrete[eos_sample_idx, eos_block_idx, :] = terminal_discrete_id
+            predicted_continuous[eos_sample_idx, eos_block_idx, :] = 0.0
+            maskable_target_mask[eos_sample_idx, eos_block_idx] = False
+
+        masked_blocks = maskable_target_mask.clone()
         block_confidence = torch.full(
             (batch_size, max_target),
             fill_value=-1e9,
@@ -1129,15 +1148,16 @@ class PrismTTS(nn.Module):
             )
             for sample_idx in range(batch_size):
                 target_len = int(speech_target_lengths[sample_idx].item())
-                if target_len <= 0:
+                maskable_len = max(0, target_len - 1)
+                if maskable_len <= 0:
                     continue
 
-                next_mask_count = int(round(remaining_ratio * float(target_len)))
-                next_mask_count = min(target_len, max(0, next_mask_count))
+                next_mask_count = int(round(remaining_ratio * float(maskable_len)))
+                next_mask_count = min(maskable_len, max(0, next_mask_count))
                 if next_mask_count <= 0:
                     continue
 
-                sample_confidence = block_confidence[sample_idx, :target_len]
+                sample_confidence = block_confidence[sample_idx, :maskable_len]
                 low_confidence_blocks = torch.topk(
                     sample_confidence,
                     k=next_mask_count,
@@ -1146,20 +1166,9 @@ class PrismTTS(nn.Module):
                 ).indices
                 next_masked_blocks[sample_idx, low_confidence_blocks] = True
 
-            masked_blocks = next_masked_blocks & valid_target_mask
+            masked_blocks = next_masked_blocks & maskable_target_mask
 
         generated_lengths = speech_target_lengths.clone()
-        for sample_idx in range(batch_size):
-            target_len = int(speech_target_lengths[sample_idx].item())
-            if target_len <= 0:
-                generated_lengths[sample_idx] = 0
-                continue
-            sample_discrete = predicted_discrete[sample_idx, :target_len, :]
-            eos_mask = torch.eq(sample_discrete, discrete_eos_id).all(dim=-1)
-            eos_positions = torch.nonzero(eos_mask, as_tuple=False)
-            if eos_positions.numel() > 0:
-                generated_lengths[sample_idx] = int(eos_positions[0, 0].item()) + 1
-
         return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
 
 

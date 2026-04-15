@@ -6,7 +6,7 @@ model:
 
   prism_tts:
     # Number of discrete streams per speech block.
-    num_discrete_tokens: 4
+    num_discrete_tokens: 1
     # Must cover codec ids + EOT/EOS/PAD special ids.
     # For discrete_token_count=2048, minimum valid value is 2051.
     discrete_vocab_size: 2051

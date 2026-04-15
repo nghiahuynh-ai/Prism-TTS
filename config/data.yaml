@@ -54,7 +54,7 @@ data:
     # PrismDataset(...) arguments.
     append_eos_to_text: false
     cache_npy: false
-    discrete_stream_count: 4
+    discrete_stream_count: 1
     continuous_feature_dim: 512
 
   collate:

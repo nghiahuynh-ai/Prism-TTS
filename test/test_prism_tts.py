@@ -343,7 +343,7 @@ class TestPrismTTS(unittest.TestCase):
             outputs.continuous_latents.shape,
             (batch_size, generated_len, self.continuous_latent_size),
         )
-        self.assertEqual(len(outputs.discrete_logits), generated_len)
+        self.assertEqual(len(outputs.discrete_logits), max(0, generated_len - 1))
         self.assertEqual(
             outputs.discrete_logits[0].shape,
             (batch_size, self.num_discrete_tokens, self.discrete_vocab_size),
@@ -435,7 +435,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         ):
             self.assertTrue(torch.allclose(full_logits, second_logits, atol=1e-5, rtol=1e-5))
 
-    def test_generate_stops_early_when_eos_block_is_sampled(self) -> None:
+    def test_generate_uses_explicit_terminal_eos_block(self) -> None:
         batch_size = 1
         prompt_len = 2
         max_new_blocks = 6
@@ -447,6 +447,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 discrete_vocab_size=self.model.discrete_vocab_size,
             )
         )
+        content_id = 0 if eos_id != 0 else 1
 
         text_prompt = torch.randint(
             0,
@@ -475,7 +476,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
 
         original_sampler = self.model._sample_discrete_ids
 
-        def _always_eos(
+        def _always_non_eos(
             logits: torch.Tensor,
             temperature: float = 0.8,
             top_k: int = 50,
@@ -485,12 +486,12 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             del temperature, top_k, top_p, do_sample
             return torch.full(
                 logits.shape[:-1],
-                fill_value=eos_id,
+                fill_value=content_id,
                 dtype=torch.long,
                 device=logits.device,
             )
 
-        self.model._sample_discrete_ids = _always_eos
+        self.model._sample_discrete_ids = _always_non_eos
         try:
             with torch.no_grad():
                 outputs = self.model.generate(
@@ -506,9 +507,22 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         finally:
             self.model._sample_discrete_ids = original_sampler
 
-        self.assertEqual(outputs.discrete_ids.shape[-1], 1)
-        self.assertEqual(outputs.continuous_latents.shape[1], 1)
-        self.assertEqual(len(outputs.discrete_logits), 1)
+        self.assertEqual(outputs.discrete_ids.shape[-1], max_new_blocks)
+        self.assertEqual(outputs.continuous_latents.shape[1], max_new_blocks)
+        self.assertEqual(len(outputs.discrete_logits), max(0, max_new_blocks - 1))
+        self.assertTrue(
+            torch.eq(outputs.discrete_ids[0, :, max_new_blocks - 1], eos_id).all()
+        )
+        if max_new_blocks > 1:
+            self.assertTrue(
+                torch.eq(outputs.discrete_ids[0, :, : max_new_blocks - 1], content_id).all()
+            )
+        self.assertTrue(
+            torch.eq(
+                outputs.continuous_latents[0, max_new_blocks - 1, :],
+                0.0,
+            ).all()
+        )
 
     def test_generate_parallel_returns_expected_shapes(self) -> None:
         batch_size = 1
@@ -704,7 +718,10 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         self.assertEqual(outputs.discrete_ids.shape[0], 1)
         self.assertEqual(outputs.continuous_latents.shape[0], 1)
         self.assertLessEqual(outputs.discrete_ids.shape[-1], 3)
-        self.assertEqual(len(outputs.discrete_logits), int(outputs.discrete_ids.shape[-1]))
+        self.assertEqual(
+            len(outputs.discrete_logits),
+            max(0, int(outputs.discrete_ids.shape[-1]) - 1),
+        )
 
     def test_generate_from_raw_supports_batched_inputs(self) -> None:
         eos_id = int(
