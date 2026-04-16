@@ -184,6 +184,7 @@ class PrismTTS(nn.Module):
         self,
         flat: FlatBatch,
         masked_target_blocks: torch.BoolTensor,
+        inject_continuous_noise: bool = False,
     ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
         """Build model input embeddings and masks for masked discrete/continuous targets."""
         batch_size, seq_len = flat.token_ids.shape
@@ -205,7 +206,10 @@ class PrismTTS(nn.Module):
         masked_continuous_positions = masked_target_token_mask & is_continuous
 
         token_embeds = self.discrete_embedding(flat.token_ids)
-        continuous_embeds = self.continuous_proj(flat.continuous_values)
+        continuous_values = flat.continuous_values
+        if inject_continuous_noise:
+            continuous_values = self._inject_continuous_backbone_noise(continuous_values)
+        continuous_embeds = self.continuous_proj(continuous_values)
         base_embeds = torch.where(
             is_continuous.unsqueeze(-1),
             continuous_embeds,
@@ -252,6 +256,19 @@ class PrismTTS(nn.Module):
             masked_continuous_positions,
             masked_target_token_mask,
         )
+
+    def _inject_continuous_backbone_noise(
+        self,
+        clean_latents: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        """Inject random noise into continuous latents before backbone conditioning."""
+        k = torch.rand(
+            (*clean_latents.shape[:-1], 1),
+            device=clean_latents.device,
+            dtype=clean_latents.dtype,
+        )
+        e = torch.randn_like(clean_latents)
+        return torch.sqrt(k) * e + torch.sqrt(1.0 - k) * clean_latents
 
     def _sample_flow_training_inputs(
         self,
@@ -419,6 +436,7 @@ class PrismTTS(nn.Module):
         self,
         flat: FlatBatch,
         masked_target_blocks: torch.BoolTensor,
+        inject_continuous_noise: bool = False,
     ) -> tuple[
         torch.FloatTensor,
         torch.BoolTensor,
@@ -430,6 +448,7 @@ class PrismTTS(nn.Module):
             self._build_inputs_embeds(
                 flat=flat,
                 masked_target_blocks=masked_target_blocks,
+                inject_continuous_noise=inject_continuous_noise,
             )
         )
         position_embeddings = build_two_level_rope_position_embeddings(
@@ -498,6 +517,7 @@ class PrismTTS(nn.Module):
         ) = self._encode(
             flat=flat,
             masked_target_blocks=masked_blocks,
+            inject_continuous_noise=True,
         )
 
         discrete_loss, _ = self._compute_discrete_loss(
