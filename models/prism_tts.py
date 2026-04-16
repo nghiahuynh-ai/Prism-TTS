@@ -57,7 +57,8 @@ class PrismTTS(nn.Module):
         continuous_loss_weight: float = 1.0,
         discrete_regular_token_loss_weight: float = 1.0,
         discrete_special_token_loss_weight: float = 1.0,
-        flow_sample_steps: int = 16,
+        flow_sample_steps: int = 64,
+        parallel_sample_steps: int = 64,
     ):
         """Initialize model modules, embeddings, loss weights, and special-token ids."""
         super().__init__()
@@ -89,6 +90,8 @@ class PrismTTS(nn.Module):
             )
         if flow_sample_steps < 1:
             raise ValueError("flow_sample_steps must be at least 1.")
+        if parallel_sample_steps < 1:
+            raise ValueError("parallel_sample_steps must be at least 1.")
 
         self.hidden_size = int(llama_config.hidden_size)
         self.num_discrete_tokens = int(num_discrete_tokens)
@@ -101,6 +104,7 @@ class PrismTTS(nn.Module):
         self.discrete_regular_token_loss_weight = float(discrete_regular_token_loss_weight)
         self.discrete_special_token_loss_weight = float(discrete_special_token_loss_weight)
         self.flow_sample_steps = int(flow_sample_steps)
+        self.parallel_sample_steps = int(parallel_sample_steps)
 
         self.backbone = LlamaBackbone(llama_config)
         self.discrete_lm_head = nn.Linear(self.hidden_size, self.discrete_vocab_size, bias=False)
@@ -546,6 +550,7 @@ class PrismTTS(nn.Module):
         force_silent_special_tokens: bool = False,
         return_dict: bool = True,
         generation_method: str = "causal",
+        parallel_num_steps: Optional[int] = None,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         """Generate target speech blocks conditioned on text/speech prompt and target text."""
         text_prompt = normalize_text_tokens(text_prompt, "text_prompt")
@@ -583,6 +588,7 @@ class PrismTTS(nn.Module):
             top_p=top_p,
             do_sample=do_sample,
             flow_num_steps=flow_num_steps,
+            parallel_num_steps=parallel_num_steps,
             force_silent_special_tokens=force_silent_special_tokens,
             return_dict=return_dict,
             generation_method=generation_method,
@@ -610,12 +616,20 @@ class PrismTTS(nn.Module):
         force_silent_special_tokens: bool = False,
         return_dict: bool = True,
         generation_method: str = "causal",
+        parallel_num_steps: Optional[int] = None,
     ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         """Generate from already-prepared tensor inputs, routed by generation method."""
         batch_size = int(text_prompt.shape[0])
 
         if max_new_blocks is not None and int(max_new_blocks) < 0:
             raise ValueError("max_new_blocks must be >= 0 when provided.")
+        if parallel_num_steps is not None and int(parallel_num_steps) < 1:
+            raise ValueError("parallel_num_steps must be >= 1 when provided.")
+        resolved_parallel_num_steps = (
+            self.parallel_sample_steps
+            if parallel_num_steps is None
+            else int(parallel_num_steps)
+        )
         generation_method_normalized = str(generation_method).strip().lower()
         if generation_method_normalized not in ("causal", "parallel"):
             raise ValueError("generation_method must be one of {'causal', 'parallel'}.")
@@ -748,6 +762,7 @@ class PrismTTS(nn.Module):
             top_p=top_p,
             do_sample=do_sample,
             flow_num_steps=flow_num_steps,
+            parallel_num_steps=resolved_parallel_num_steps,
             special_discrete_token_ids=special_discrete_token_ids,
         )
 
@@ -782,6 +797,7 @@ class PrismTTS(nn.Module):
         top_p: float,
         do_sample: bool,
         flow_num_steps: Optional[int],
+        parallel_num_steps: int,
         special_discrete_token_ids: tuple[int, ...],
     ) -> tuple[
         torch.LongTensor,
@@ -790,6 +806,7 @@ class PrismTTS(nn.Module):
         list[torch.Tensor],
     ]:
         """Causal left-to-right generation with a fixed terminal EOS speech block."""
+        del parallel_num_steps
         batch_size = int(text_prompt.shape[0])
         device = text_prompt.device
         max_target = int(speech_target_lengths.max().item()) if batch_size > 0 else 0
@@ -954,6 +971,7 @@ class PrismTTS(nn.Module):
         top_p: float,
         do_sample: bool,
         flow_num_steps: Optional[int],
+        parallel_num_steps: int,
         special_discrete_token_ids: tuple[int, ...],
     ) -> tuple[
         torch.LongTensor,
@@ -1016,7 +1034,7 @@ class PrismTTS(nn.Module):
         collected_logits: list[torch.Tensor] = []
 
         # Schedule: progressively shrink masked set to zero.
-        num_parallel_steps = max(1, int(math.ceil(math.log2(max_target + 1))))
+        num_parallel_steps = int(parallel_num_steps)
         for step_idx in range(num_parallel_steps):
             if not bool(masked_blocks.any().item()):
                 break

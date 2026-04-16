@@ -98,14 +98,14 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
         continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
-        mask_ratio=float(prism_cfg.get("mask_ratio", 0.5)),
         discrete_regular_token_loss_weight=float(
             prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
         ),
         discrete_special_token_loss_weight=float(
             prism_cfg.get("discrete_special_token_loss_weight", 1.0)
         ),
-        flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 16)),
+        flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
+        parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 64)),
     )
 
 
