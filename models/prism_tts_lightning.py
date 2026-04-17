@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -55,6 +55,16 @@ class PrismBatch:
     flat_target_block_counts: Optional[torch.LongTensor] = None
     flow_timesteps: Optional[torch.FloatTensor] = None
     noise: Optional[torch.FloatTensor] = None
+
+
+@dataclass
+class PeriodicEvalSample:
+    sample_source: str
+    batch_inputs: PrismBatch
+    generations: Mapping[str, PrismTTSGenerationOutput]
+    text_prompt: str
+    text_target: str
+    synthesized_text_by_method: Mapping[str, str]
 
 
 if pl is None:
@@ -133,6 +143,9 @@ else:
 
             self._eval_loader_ref: Optional[Any] = None
             self._eval_loader_iter: Optional[Iterator[Any]] = None
+            self._train_loader_ref: Optional[Any] = None
+            self._train_loader_iter: Optional[Iterator[Any]] = None
+            self._cached_text_id_to_char: Optional[dict[int, str]] = None
             self._periodic_eval_active = False
             self._ema_state: dict[str, torch.Tensor] = {}
             self._ema_updates = 0
@@ -300,7 +313,7 @@ else:
             self._initialize_ema_if_needed()
 
         def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
-            del outputs, batch, batch_idx
+            del outputs, batch_idx
             self._maybe_update_ema()
             if self._periodic_eval_active:
                 return
@@ -314,7 +327,7 @@ else:
 
             self._periodic_eval_active = True
             try:
-                self._run_periodic_eval()
+                self._run_periodic_eval(train_batch=batch)
             finally:
                 self._periodic_eval_active = False
 
@@ -530,22 +543,61 @@ else:
                 return None
             return float(trainer.optimizers[0].param_groups[0]["lr"])
 
-        def _run_periodic_eval(self) -> None:
+        def _run_periodic_eval(self, train_batch: Optional[Any] = None) -> None:
             eval_batch = self._next_eval_batch()
-            if eval_batch is None:
-                return
+            if train_batch is None:
+                train_batch = self._next_train_batch()
 
-            # Periodic eval should decode exactly one sample, not the full batch.
-            eval_batch = self._slice_batch_to_sample(eval_batch, sample_idx=0)
-            eval_batch = self._move_to_device(eval_batch, self.device)
-            batch_inputs = self._parse_batch(eval_batch)
+            periodic_samples: list[PeriodicEvalSample] = []
+            was_training = self.model.training
+            try:
+                with self._ema_scope(enabled=self.use_ema_for_periodic_eval):
+                    self.model.eval()
+                    with torch.no_grad():
+                        eval_sample = self._synthesize_periodic_eval_sample(
+                            eval_batch,
+                            sample_source="validation",
+                        )
+                        if eval_sample is not None:
+                            periodic_samples.append(eval_sample)
+
+                        train_sample = self._synthesize_periodic_eval_sample(
+                            train_batch,
+                            sample_source="train",
+                        )
+                        if train_sample is not None:
+                            periodic_samples.append(train_sample)
+            finally:
+                if was_training:
+                    self.model.train()
+
+            if not periodic_samples:
+                return
+            if not self._is_global_zero():
+                return
+            self._log_eval_media_to_wandb(periodic_samples)
+
+        def _synthesize_periodic_eval_sample(
+            self,
+            batch: Optional[Any],
+            *,
+            sample_source: str,
+        ) -> Optional[PeriodicEvalSample]:
+            if batch is None:
+                return None
+
+            batch = self._slice_batch_to_sample(batch, sample_idx=0)
+            batch = self._move_to_device(batch, self.device)
+            batch_inputs = self._parse_batch(batch)
             if (
                 batch_inputs.text_prompt is None
                 or batch_inputs.discrete_prompt is None
                 or batch_inputs.continuous_prompt is None
                 or batch_inputs.text_target is None
+                or batch_inputs.discrete_target is None
+                or batch_inputs.continuous_target is None
             ):
-                return
+                return None
 
             prompt_speech_len = (
                 int(torch.as_tensor(batch_inputs.speech_prompt_lengths)[0].item())
@@ -568,7 +620,7 @@ else:
                 else int(batch_inputs.text_target.shape[1])
             )
             if target_speech_len < 1:
-                return
+                return None
 
             text_prompt = batch_inputs.text_prompt[:, :prompt_text_len]
             discrete_prompt = normalize_discrete_tokens(
@@ -584,51 +636,46 @@ else:
             )[:, :prompt_speech_len, :]
             text_target = batch_inputs.text_target[:, :target_text_len]
 
-            was_training = self.model.training
-            try:
-                with self._ema_scope(enabled=self.use_ema_for_periodic_eval):
-                    self.model.eval()
-                    with torch.no_grad():
-                        generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
-                        for generation_method in ("causal", "parallel"):
-                            generation_outputs[generation_method] = self.model.generate(
-                                text_prompt=text_prompt,
-                                discrete_prompt=discrete_prompt,
-                                continuous_prompt=continuous_prompt,
-                                text_target=text_target,
-                                text_prompt_lengths=torch.tensor(
-                                    [prompt_text_len], device=self.device
-                                ),
-                                speech_prompt_lengths=torch.tensor(
-                                    [prompt_speech_len], device=self.device
-                                ),
-                                text_target_lengths=torch.tensor(
-                                    [target_text_len], device=self.device
-                                ),
-                                speech_target_lengths=torch.tensor(
-                                    [target_speech_len], device=self.device
-                                ),
-                                max_new_blocks=target_speech_len,
-                                do_sample=False,
-                                force_silent_special_tokens=True,
-                                generation_method=generation_method,
-                                return_dict=True,
-                            )
-            finally:
-                if was_training:
-                    self.model.train()
+            generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
+            for generation_method in ("causal", "parallel"):
+                generation_outputs[generation_method] = self.model.generate(
+                    text_prompt=text_prompt,
+                    discrete_prompt=discrete_prompt,
+                    continuous_prompt=continuous_prompt,
+                    text_target=text_target,
+                    text_prompt_lengths=torch.tensor([prompt_text_len], device=self.device),
+                    speech_prompt_lengths=torch.tensor([prompt_speech_len], device=self.device),
+                    text_target_lengths=torch.tensor([target_text_len], device=self.device),
+                    speech_target_lengths=torch.tensor([target_speech_len], device=self.device),
+                    max_new_blocks=target_speech_len,
+                    do_sample=False,
+                    force_silent_special_tokens=True,
+                    generation_method=generation_method,
+                    return_dict=True,
+                )
 
-            if not self._is_global_zero():
-                return
-            self._log_eval_media_to_wandb(
+            text_prompt_str = self._decode_text_tokens(text_prompt[0], length=prompt_text_len)
+            text_target_str = self._decode_text_tokens(text_target[0], length=target_text_len)
+            synthesized_text_by_method: dict[str, str] = {}
+            for generation_method, generation in generation_outputs.items():
+                generated_text = ""
+                if generation.text_ids is not None and int(generation.text_ids.shape[0]) > 0:
+                    generated_text = self._decode_text_tokens(
+                        generation.text_ids[0],
+                        length=int(generation.text_ids.shape[1]),
+                    )
+                synthesized_text_by_method[generation_method] = generated_text or text_target_str
+
+            return PeriodicEvalSample(
+                sample_source=str(sample_source),
                 batch_inputs=PrismBatch(
                     continuous_target=batch_inputs.continuous_target,
-                    speech_target_lengths=torch.tensor(
-                        [target_speech_len],
-                        device=self.device,
-                    ),
+                    speech_target_lengths=torch.tensor([target_speech_len], device=self.device),
                 ),
                 generations=generation_outputs,
+                text_prompt=text_prompt_str,
+                text_target=text_target_str,
+                synthesized_text_by_method=synthesized_text_by_method,
             )
 
         def _next_eval_batch(self) -> Optional[Any]:
@@ -651,6 +698,48 @@ else:
                     return next(self._eval_loader_iter)
                 except StopIteration:
                     return None
+
+        def _next_train_batch(self) -> Optional[Any]:
+            train_loader = self._primary_train_loader()
+            if train_loader is None:
+                return None
+
+            if self._train_loader_ref is not train_loader:
+                self._train_loader_ref = train_loader
+                self._train_loader_iter = iter(train_loader)
+
+            if self._train_loader_iter is None:
+                self._train_loader_iter = iter(train_loader)
+
+            try:
+                return next(self._train_loader_iter)
+            except StopIteration:
+                self._train_loader_iter = iter(train_loader)
+                try:
+                    return next(self._train_loader_iter)
+                except StopIteration:
+                    return None
+
+        def _primary_train_loader(self) -> Optional[Any]:
+            trainer = self.trainer
+            if trainer is None:
+                return None
+
+            train_loader = getattr(trainer, "train_dataloader", None)
+            if train_loader is None:
+                return None
+            if callable(train_loader) and not isinstance(train_loader, (list, tuple, Mapping)):
+                try:
+                    train_loader = train_loader()
+                except TypeError:
+                    return None
+            if isinstance(train_loader, (list, tuple)):
+                return train_loader[0] if len(train_loader) > 0 else None
+            if isinstance(train_loader, Mapping):
+                for loader in train_loader.values():
+                    return loader
+                return None
+            return train_loader
 
         def _primary_val_loader(self) -> Optional[Any]:
             trainer = self.trainer
@@ -785,26 +874,25 @@ else:
 
         def _log_eval_media_to_wandb(
             self,
-            batch_inputs: PrismBatch,
-            generations: Mapping[str, PrismTTSGenerationOutput],
+            periodic_samples: Sequence[PeriodicEvalSample],
         ) -> None:
+            if not periodic_samples:
+                return
             run = self._wandb_run()
             if run is None:
                 return
 
-            try:
-                import wandb
-            except ModuleNotFoundError:
-                return
-
-            audio_table = self._build_audio_table(batch_inputs, generations)
-            mel_table = self._build_mel_table(batch_inputs, generations)
+            audio_table = self._build_audio_table(periodic_samples)
+            mel_table = self._build_mel_table(periodic_samples)
+            text_table = self._build_text_table(periodic_samples)
 
             payload: dict[str, Any] = {}
             if audio_table is not None:
                 payload["eval/audio_samples"] = audio_table
             if mel_table is not None:
                 payload["eval/mel_spectrogram_samples"] = mel_table
+            if text_table is not None:
+                payload["eval/synthesized_text_samples"] = text_table
             if not payload:
                 return
 
@@ -812,10 +900,9 @@ else:
 
         def _build_audio_table(
             self,
-            batch_inputs: PrismBatch,
-            generations: Mapping[str, PrismTTSGenerationOutput],
+            periodic_samples: Sequence[PeriodicEvalSample],
         ) -> Optional[Any]:
-            media_rows = self._build_eval_media_rows(batch_inputs, generations)
+            media_rows = self._build_eval_media_rows(periodic_samples)
             if not media_rows:
                 return None
 
@@ -828,6 +915,7 @@ else:
             table = wandb.Table(
                 columns=[
                     "step",
+                    "sample_source",
                     "sample_id",
                     "generation_method",
                     "groundtruth_audio",
@@ -836,33 +924,38 @@ else:
             )
 
             for row in media_rows:
-                sample_idx = int(row["sample_idx"])
+                sample_source = str(row["sample_source"])
+                sample_idx = int(row["sample_id"])
                 method = str(row["generation_method"])
                 target_audio = np.asarray(row["target_audio"], dtype=np.float32)
                 pred_audio = np.asarray(row["predicted_audio"], dtype=np.float32)
                 table.add_data(
                     step,
+                    sample_source,
                     sample_idx,
                     method,
                     wandb.Audio(
                         target_audio,
                         sample_rate=self.audio_sample_rate,
-                        caption=f"groundtruth_step_{step}_sample_{sample_idx}",
+                        caption=(
+                            f"{sample_source}_groundtruth_step_{step}_sample_{sample_idx}"
+                        ),
                     ),
                     wandb.Audio(
                         pred_audio,
                         sample_rate=self.audio_sample_rate,
-                        caption=f"{method}_pred_step_{step}_sample_{sample_idx}",
+                        caption=(
+                            f"{sample_source}_{method}_pred_step_{step}_sample_{sample_idx}"
+                        ),
                     ),
                 )
             return table
 
         def _build_mel_table(
             self,
-            batch_inputs: PrismBatch,
-            generations: Mapping[str, PrismTTSGenerationOutput],
+            periodic_samples: Sequence[PeriodicEvalSample],
         ) -> Optional[Any]:
-            media_rows = self._build_eval_media_rows(batch_inputs, generations)
+            media_rows = self._build_eval_media_rows(periodic_samples)
             if not media_rows:
                 return None
 
@@ -878,6 +971,7 @@ else:
             table = wandb.Table(
                 columns=[
                     "step",
+                    "sample_source",
                     "sample_id",
                     "generation_method",
                     "groundtruth_mel_spectrogram",
@@ -887,23 +981,30 @@ else:
 
             added = 0
             for row in media_rows:
-                sample_idx = int(row["sample_idx"])
+                sample_source = str(row["sample_source"])
+                sample_idx = int(row["sample_id"])
                 method = str(row["generation_method"])
                 target_audio = np.asarray(row["target_audio"], dtype=np.float32)
                 pred_audio = np.asarray(row["predicted_audio"], dtype=np.float32)
                 target_mel = self._build_mel_spectrogram_image(
                     target_audio,
-                    title=f"Groundtruth Mel (sample {sample_idx}, step {step})",
+                    title=(
+                        f"Groundtruth Mel ({sample_source}, sample {sample_idx}, step {step})"
+                    ),
                 )
                 pred_mel = self._build_mel_spectrogram_image(
                     pred_audio,
-                    title=f"Predicted Mel ({method}, sample {sample_idx}, step {step})",
+                    title=(
+                        "Predicted Mel "
+                        f"({sample_source}, {method}, sample {sample_idx}, step {step})"
+                    ),
                 )
                 if target_mel is None or pred_mel is None:
                     continue
 
                 table.add_data(
                     step,
+                    sample_source,
                     sample_idx,
                     method,
                     target_mel,
@@ -913,43 +1014,79 @@ else:
 
             return table if added > 0 else None
 
+        def _build_text_table(
+            self,
+            periodic_samples: Sequence[PeriodicEvalSample],
+        ) -> Optional[Any]:
+            try:
+                import wandb
+            except ModuleNotFoundError:
+                return None
+
+            step = int(self.global_step)
+            table = wandb.Table(
+                columns=[
+                    "step",
+                    "sample_source",
+                    "sample_id",
+                    "generation_method",
+                    "text_prompt",
+                    "text_target",
+                    "synthesized_text",
+                ]
+            )
+
+            added = 0
+            for sample_idx, sample in enumerate(periodic_samples):
+                for method_name, synthesized_text in sample.synthesized_text_by_method.items():
+                    table.add_data(
+                        step,
+                        str(sample.sample_source),
+                        sample_idx,
+                        str(method_name),
+                        sample.text_prompt,
+                        sample.text_target,
+                        str(synthesized_text),
+                    )
+                    added += 1
+
+            return table if added > 0 else None
+
         def _build_eval_media_rows(
             self,
-            batch_inputs: PrismBatch,
-            generations: Mapping[str, PrismTTSGenerationOutput],
+            periodic_samples: Sequence[PeriodicEvalSample],
         ) -> list[dict[str, Any]]:
             if self.audio_decoder is None:
                 return []
-            if batch_inputs.continuous_target is None:
-                return []
-
-            target_continuous = normalize_continuous_latents(
-                batch_inputs.continuous_target,
-                expected_len=batch_inputs.continuous_target.shape[1],
-                name="continuous_target",
-                continuous_latent_size=self.model.continuous_latent_size,
-            )
-
-            normalized_generations: list[tuple[str, torch.FloatTensor]] = []
-            for method_name, generation in generations.items():
-                continuous = generation.continuous_latents
-                if continuous is None:
+            rows: list[dict[str, Any]] = []
+            for sample_idx, sample in enumerate(periodic_samples):
+                batch_inputs = sample.batch_inputs
+                generations = sample.generations
+                if batch_inputs.continuous_target is None:
                     continue
-                normalized = normalize_continuous_latents(
-                    continuous,
-                    expected_len=continuous.shape[1],
-                    name=f"generation[{method_name}].continuous_latents",
+
+                target_continuous = normalize_continuous_latents(
+                    batch_inputs.continuous_target,
+                    expected_len=batch_inputs.continuous_target.shape[1],
+                    name="continuous_target",
                     continuous_latent_size=self.model.continuous_latent_size,
                 )
-                normalized_generations.append((str(method_name), normalized))
-            if not normalized_generations:
-                return []
 
-            # Keep eval-stage media payload small and deterministic: log exactly one sample.
-            num_samples = min(1, self.max_audio_samples, int(target_continuous.shape[0]))
-            rows: list[dict[str, Any]] = []
+                normalized_generations: list[tuple[str, torch.FloatTensor]] = []
+                for method_name, generation in generations.items():
+                    continuous = generation.continuous_latents
+                    if continuous is None:
+                        continue
+                    normalized = normalize_continuous_latents(
+                        continuous,
+                        expected_len=continuous.shape[1],
+                        name=f"generation[{method_name}].continuous_latents",
+                        continuous_latent_size=self.model.continuous_latent_size,
+                    )
+                    normalized_generations.append((str(method_name), normalized))
+                if not normalized_generations:
+                    continue
 
-            for sample_idx in range(num_samples):
                 sample_target_len = int(target_continuous.shape[1])
                 if batch_inputs.speech_target_lengths is not None:
                     target_lengths = torch.as_tensor(
@@ -958,31 +1095,20 @@ else:
                     )
                     if target_lengths.dim() == 0:
                         target_lengths = target_lengths.unsqueeze(0)
-                    if sample_idx < int(target_lengths.shape[0]):
-                        sample_target_len = min(
-                            sample_target_len,
-                            int(target_lengths[sample_idx].item()),
-                        )
+                    if int(target_lengths.shape[0]) > 0:
+                        sample_target_len = min(sample_target_len, int(target_lengths[0].item()))
                 if sample_target_len < 1:
                     continue
 
                 for method, pred_continuous in normalized_generations:
-                    if sample_idx >= int(pred_continuous.shape[0]):
+                    if int(pred_continuous.shape[0]) < 1:
                         continue
                     sample_pred_len = min(sample_target_len, int(pred_continuous.shape[1]))
                     if sample_pred_len < 1:
                         continue
 
-                    sample_target_continuous = target_continuous[
-                        sample_idx : sample_idx + 1,
-                        :sample_pred_len,
-                        :,
-                    ][0]
-                    sample_pred_continuous = pred_continuous[
-                        sample_idx : sample_idx + 1,
-                        :sample_pred_len,
-                        :,
-                    ][0]
+                    sample_target_continuous = target_continuous[0, :sample_pred_len, :]
+                    sample_pred_continuous = pred_continuous[0, :sample_pred_len, :]
                     target_audio = self._decode_audio(sample_target_continuous)
                     pred_audio = self._decode_audio(sample_pred_continuous)
                     if target_audio is None or pred_audio is None:
@@ -990,7 +1116,8 @@ else:
 
                     rows.append(
                         {
-                            "sample_idx": sample_idx,
+                            "sample_source": str(sample.sample_source),
+                            "sample_id": sample_idx,
                             "generation_method": method,
                             "target_audio": target_audio,
                             "predicted_audio": pred_audio,
@@ -1156,6 +1283,105 @@ else:
             if peak > 0.0:
                 decoded = decoded / peak
             return decoded.astype(np.float32)
+
+        def _decode_text_tokens(
+            self,
+            text_tokens: Optional[torch.Tensor],
+            *,
+            length: Optional[int] = None,
+        ) -> str:
+            if text_tokens is None:
+                return ""
+            tokens = torch.as_tensor(text_tokens, dtype=torch.long).detach().cpu().reshape(-1)
+            if length is not None:
+                tokens = tokens[: max(0, int(length))]
+            if tokens.numel() == 0:
+                return ""
+
+            token_to_char = self._text_id_to_char()
+            pad_token_id = int(getattr(self.model, "pad_token_id", -1))
+            eos_token_id = int(getattr(self.model, "eos_token_id", -1))
+            eot_token_id = int(getattr(self.model, "eot_token_id", -1))
+
+            decoded_chars: list[str] = []
+            fallback_token_ids: list[str] = []
+            for token_id in (int(item) for item in tokens.tolist()):
+                if token_id in (pad_token_id, eos_token_id, eot_token_id):
+                    continue
+                char = token_to_char.get(token_id)
+                if char is not None:
+                    decoded_chars.append(char)
+                else:
+                    fallback_token_ids.append(str(token_id))
+
+            if decoded_chars:
+                return "".join(decoded_chars)
+            if fallback_token_ids:
+                return " ".join(fallback_token_ids)
+            return ""
+
+        def _text_id_to_char(self) -> dict[int, str]:
+            if self._cached_text_id_to_char is not None:
+                return self._cached_text_id_to_char
+
+            tokenizer = self._resolve_text_tokenizer()
+            if tokenizer is None:
+                self._cached_text_id_to_char = {}
+                return self._cached_text_id_to_char
+
+            char_to_id = getattr(tokenizer, "char_to_id", None)
+            text_token_offset = getattr(tokenizer, "text_token_offset", None)
+            if not isinstance(char_to_id, Mapping) or text_token_offset is None:
+                self._cached_text_id_to_char = {}
+                return self._cached_text_id_to_char
+
+            token_to_char: dict[int, str] = {}
+            for char, local_id in char_to_id.items():
+                try:
+                    token_to_char[int(text_token_offset) + int(local_id)] = str(char)
+                except Exception:
+                    continue
+            self._cached_text_id_to_char = token_to_char
+            return token_to_char
+
+        def _resolve_text_tokenizer(self) -> Optional[Any]:
+            for loader in (self._primary_train_loader(), self._primary_val_loader()):
+                tokenizer = self._extract_tokenizer_from_loader(loader)
+                if tokenizer is not None:
+                    return tokenizer
+            return None
+
+        def _extract_tokenizer_from_loader(self, value: Any) -> Optional[Any]:
+            if value is None:
+                return None
+
+            dataset = getattr(value, "dataset", None)
+            if dataset is not None:
+                tokenizer = getattr(dataset, "tokenizer", None)
+                if tokenizer is not None:
+                    return tokenizer
+
+            for attr_name in ("iterables", "loaders"):
+                nested = getattr(value, attr_name, None)
+                tokenizer = self._extract_tokenizer_from_loader(nested)
+                if tokenizer is not None:
+                    return tokenizer
+
+            if isinstance(value, Mapping):
+                for nested in value.values():
+                    tokenizer = self._extract_tokenizer_from_loader(nested)
+                    if tokenizer is not None:
+                        return tokenizer
+                return None
+
+            if isinstance(value, (list, tuple)):
+                for nested in value:
+                    tokenizer = self._extract_tokenizer_from_loader(nested)
+                    if tokenizer is not None:
+                        return tokenizer
+                return None
+
+            return None
 
         def _wandb_run(self) -> Optional[Any]:
             loggers = self._available_loggers()
