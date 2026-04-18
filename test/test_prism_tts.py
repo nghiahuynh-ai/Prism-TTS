@@ -580,6 +580,62 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         )
         self.assertGreaterEqual(len(outputs.discrete_logits), 1)
 
+    def test_generate_parallel_stable_returns_expected_shapes(self) -> None:
+        batch_size = 1
+        prompt_len = 3
+        generated_len = 4
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                speech_target_lengths=torch.tensor([generated_len], device=self.device),
+                max_new_blocks=generated_len,
+                discrete_eos_token_id=-1,
+                do_sample=False,
+                generation_method="parallel_stable",
+                return_dict=True,
+            )
+
+        self.assertEqual(outputs.text_ids.shape, (batch_size, generated_len))
+        self.assertEqual(
+            outputs.discrete_ids.shape,
+            (batch_size, self.num_discrete_tokens, generated_len),
+        )
+        self.assertEqual(
+            outputs.continuous_latents.shape,
+            (batch_size, generated_len, self.continuous_latent_size),
+        )
+        self.assertGreaterEqual(len(outputs.discrete_logits), 1)
+
     def test_generate_parallel_estimates_target_lengths_from_prompt_ratio(self) -> None:
         batch_size = 1
         prompt_text_len = 4
@@ -671,6 +727,55 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 max_new_blocks=generated_len,
                 do_sample=False,
                 generation_method="parallel",
+                parallel_num_steps=parallel_steps,
+                return_dict=True,
+            )
+
+        self.assertGreaterEqual(len(outputs.discrete_logits), 1)
+        self.assertLessEqual(len(outputs.discrete_logits), parallel_steps)
+
+    def test_generate_parallel_stable_respects_parallel_num_steps(self) -> None:
+        batch_size = 1
+        prompt_len = 3
+        generated_len = 16
+        parallel_steps = 2
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                speech_target_lengths=torch.tensor([generated_len], device=self.device),
+                max_new_blocks=generated_len,
+                do_sample=False,
+                generation_method="parallel_stable",
                 parallel_num_steps=parallel_steps,
                 return_dict=True,
             )

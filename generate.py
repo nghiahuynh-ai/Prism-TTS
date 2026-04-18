@@ -161,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         "--generation-method",
         type=str,
         default="causal",
-        choices=("causal", "parallel"),
+        choices=("causal", "parallel", "parallel_stable"),
         help="Speech block generation strategy.",
     )
     parser.add_argument(

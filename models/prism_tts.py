@@ -400,6 +400,84 @@ class PrismTTS(nn.Module):
         samples = torch.multinomial(probs.reshape(-1, probs.shape[-1]), num_samples=1)
         return samples.reshape(*sample_shape)
 
+    def _get_time_shifted_steps(
+        self,
+        *,
+        num_steps: int,
+        t_shift: float,
+        device: torch.device,
+    ) -> torch.FloatTensor:
+        """Build [0, 1] time steps using time-shift transform."""
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1.")
+        if t_shift <= 0.0:
+            raise ValueError("t_shift must be > 0.")
+        base = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
+        return t_shift * base / (1.0 + (t_shift - 1.0) * base)
+
+    def _build_parallel_stable_unmask_schedule(
+        self,
+        *,
+        maskable_lengths: torch.LongTensor,
+        num_steps: int,
+        t_shift: float,
+    ) -> torch.LongTensor:
+        """
+        Build per-sample unmask counts for stable parallel decoding.
+
+        The schedule mirrors iterative unmasking:
+        k_n = r_n - r_{n-1} with time-shifted cumulative ratio r_n.
+        """
+        if num_steps < 1:
+            raise ValueError("num_steps must be >= 1.")
+
+        batch_size = int(maskable_lengths.shape[0])
+        device = maskable_lengths.device
+        schedule = torch.zeros(batch_size, num_steps, dtype=torch.long, device=device)
+        if batch_size <= 0:
+            return schedule
+
+        time_steps = self._get_time_shifted_steps(
+            num_steps=num_steps,
+            t_shift=t_shift,
+            device=device,
+        )
+        time_deltas = time_steps[1:] - time_steps[:-1]
+
+        for sample_idx in range(batch_size):
+            total_maskable = max(0, int(maskable_lengths[sample_idx].item()))
+            if total_maskable <= 0:
+                continue
+
+            remaining = total_maskable
+            for step_idx in range(num_steps):
+                if remaining <= 0:
+                    break
+                if step_idx >= num_steps - 1:
+                    step_unmask = remaining
+                else:
+                    delta = float(time_deltas[step_idx].item())
+                    step_unmask = int(math.ceil(float(total_maskable) * delta))
+                    step_unmask = min(remaining, max(0, step_unmask))
+                schedule[sample_idx, step_idx] = int(step_unmask)
+                remaining -= int(step_unmask)
+
+        return schedule
+
+    def _gumbel_sample_scores(
+        self,
+        scores: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        """Apply temperature-scaled Gumbel perturbation for position selection."""
+        if temperature <= 0.0:
+            return scores
+        scaled_scores = scores / temperature
+        uniform = torch.rand_like(scaled_scores)
+        uniform = uniform.clamp(min=1e-10, max=1.0 - 1e-10)
+        gumbel_noise = -torch.log(-torch.log(uniform))
+        return scaled_scores + gumbel_noise
+
     def sample_continuous_latent(
         self,
         cond: torch.FloatTensor,
@@ -651,8 +729,10 @@ class PrismTTS(nn.Module):
             else int(parallel_num_steps)
         )
         generation_method_normalized = str(generation_method).strip().lower()
-        if generation_method_normalized not in ("causal", "parallel"):
-            raise ValueError("generation_method must be one of {'causal', 'parallel'}.")
+        if generation_method_normalized not in ("causal", "parallel", "parallel_stable"):
+            raise ValueError(
+                "generation_method must be one of {'causal', 'parallel', 'parallel_stable'}."
+            )
 
         text_prompt_lengths = normalize_lengths(
             lengths=text_prompt_lengths,
@@ -682,7 +762,7 @@ class PrismTTS(nn.Module):
         text_ids_out = text_target[:, :max_text_target]
 
         if speech_target_lengths is None:
-            if generation_method_normalized == "parallel":
+            if generation_method_normalized in ("parallel", "parallel_stable"):
                 speech_target_lengths = estimate_parallel_speech_target_lengths(
                     text_prompt_lengths=text_prompt_lengths,
                     speech_prompt_lengths=speech_prompt_lengths,
@@ -757,11 +837,12 @@ class PrismTTS(nn.Module):
             if force_silent_special_tokens
             else tuple()
         )
-        generation_fn = (
-            self.generate_parallel
-            if generation_method_normalized == "parallel"
-            else self.generate_causal
-        )
+        if generation_method_normalized == "parallel":
+            generation_fn = self.generate_parallel
+        elif generation_method_normalized == "parallel_stable":
+            generation_fn = self.generate_parallel_stable
+        else:
+            generation_fn = self.generate_causal
         (
             predicted_discrete,
             predicted_continuous,
@@ -1203,6 +1284,255 @@ class PrismTTS(nn.Module):
                     dim=-1,
                 ).indices
                 next_masked_blocks[sample_idx, low_confidence_blocks] = True
+
+            masked_blocks = next_masked_blocks & maskable_target_mask
+
+        generated_lengths = speech_target_lengths.clone()
+        return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
+
+    @torch.no_grad()
+    def generate_parallel_stable(
+        self,
+        *,
+        text_prompt: torch.LongTensor,
+        discrete_prompt: torch.LongTensor,
+        continuous_prompt: torch.FloatTensor,
+        text_target: torch.LongTensor,
+        text_prompt_lengths: torch.LongTensor,
+        speech_prompt_lengths: torch.LongTensor,
+        text_target_lengths: torch.LongTensor,
+        speech_target_lengths: torch.LongTensor,
+        discrete_eos_id: int,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        do_sample: bool,
+        flow_num_steps: Optional[int],
+        parallel_num_steps: int,
+        special_discrete_token_ids: tuple[int, ...],
+    ) -> tuple[
+        torch.LongTensor,
+        torch.FloatTensor,
+        torch.LongTensor,
+        list[torch.Tensor],
+    ]:
+        """
+        Stable block-parallel decoding with monotonic unmasking.
+
+        Compared to `generate_parallel`, this method does not remask already
+        committed blocks. Instead, it progressively unmasks high-confidence
+        blocks using a time-shifted schedule inspired by OmniVoice.
+        """
+        batch_size = int(text_prompt.shape[0])
+        device = text_prompt.device
+        max_target = int(speech_target_lengths.max().item()) if batch_size > 0 else 0
+        safe_discrete_fill_id = (
+            int(discrete_eos_id)
+            if 0 <= int(discrete_eos_id) < self.discrete_vocab_size
+            else self.pad_token_id
+        )
+        terminal_discrete_id = safe_discrete_fill_id
+
+        predicted_discrete = discrete_prompt.new_full(
+            (batch_size, max_target, self.num_discrete_tokens),
+            safe_discrete_fill_id,
+        )
+        predicted_continuous = continuous_prompt.new_zeros(
+            (batch_size, max_target, self.continuous_latent_size)
+        )
+        if max_target <= 0:
+            return (
+                predicted_discrete,
+                predicted_continuous,
+                speech_target_lengths.new_zeros(batch_size),
+                [],
+            )
+
+        valid_target_mask = (
+            torch.arange(max_target, device=device).unsqueeze(0)
+            < speech_target_lengths.unsqueeze(1)
+        )
+        maskable_target_mask = valid_target_mask.clone()
+        has_target = speech_target_lengths > 0
+        if has_target.any():
+            eos_sample_idx = torch.nonzero(has_target, as_tuple=False).squeeze(1)
+            eos_block_idx = speech_target_lengths[eos_sample_idx] - 1
+            predicted_discrete[eos_sample_idx, eos_block_idx, :] = terminal_discrete_id
+            predicted_continuous[eos_sample_idx, eos_block_idx, :] = 0.0
+            maskable_target_mask[eos_sample_idx, eos_block_idx] = False
+
+        masked_blocks = maskable_target_mask.clone()
+        maskable_lengths = torch.clamp(speech_target_lengths - 1, min=0)
+        num_parallel_steps = int(parallel_num_steps)
+        unmask_schedule = self._build_parallel_stable_unmask_schedule(
+            maskable_lengths=maskable_lengths,
+            num_steps=num_parallel_steps,
+            t_shift=0.1,
+        )
+        position_temperature = 5.0
+
+        collected_logits: list[torch.Tensor] = []
+        for step_idx in range(num_parallel_steps):
+            if not bool(masked_blocks.any().item()):
+                break
+
+            current_discrete = predicted_discrete.clone()
+            current_continuous = predicted_continuous.clone()
+            current_discrete[masked_blocks] = self.pad_token_id
+            current_continuous[masked_blocks] = 0.0
+
+            flat = assemble_flat_batch(
+                text_prompt=text_prompt,
+                discrete_prompt=discrete_prompt,
+                continuous_prompt=continuous_prompt,
+                text_target=text_target,
+                discrete_target=current_discrete,
+                continuous_target=current_continuous,
+                text_prompt_lengths=text_prompt_lengths,
+                speech_prompt_lengths=speech_prompt_lengths,
+                text_target_lengths=text_target_lengths,
+                speech_target_lengths=speech_target_lengths,
+                attention_mask=None,
+                pad_token_id=self.pad_token_id,
+                eos_token_id=self.eos_token_id,
+                eot_token_id=self.eot_token_id,
+                continuous_latent_size=self.continuous_latent_size,
+                num_discrete_tokens=self.num_discrete_tokens,
+            )
+            hidden_states, masked_discrete_positions, masked_continuous_positions, _ = self._encode(
+                flat=flat,
+                masked_target_blocks=masked_blocks,
+            )
+            batch_indices = (
+                torch.arange(batch_size, device=device)
+                .unsqueeze(1)
+                .expand(batch_size, hidden_states.shape[1])
+            )
+
+            candidate_discrete = predicted_discrete.clone()
+            candidate_continuous = predicted_continuous.clone()
+            block_conf_sum = torch.zeros((batch_size, max_target), dtype=torch.float32, device=device)
+            block_conf_count = torch.zeros((batch_size, max_target), dtype=torch.float32, device=device)
+
+            if masked_discrete_positions.any():
+                discrete_hidden = hidden_states[masked_discrete_positions]
+                discrete_logits = self.discrete_lm_head(discrete_hidden)
+                sampled_discrete = self._sample_discrete_ids(
+                    discrete_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                )
+                discrete_batch_idx = batch_indices[masked_discrete_positions]
+                discrete_block_idx = flat.target_block_ids[masked_discrete_positions]
+                discrete_stream_idx = flat.speech_stream_ids[masked_discrete_positions]
+                candidate_discrete[discrete_batch_idx, discrete_block_idx, discrete_stream_idx] = (
+                    sampled_discrete
+                )
+
+                sampled_log_probs = F.log_softmax(discrete_logits, dim=-1).gather(
+                    -1,
+                    sampled_discrete.unsqueeze(-1),
+                ).squeeze(-1)
+                block_conf_sum.index_put_(
+                    (discrete_batch_idx, discrete_block_idx),
+                    sampled_log_probs.to(dtype=torch.float32),
+                    accumulate=True,
+                )
+                block_conf_count.index_put_(
+                    (discrete_batch_idx, discrete_block_idx),
+                    torch.ones_like(sampled_log_probs, dtype=torch.float32),
+                    accumulate=True,
+                )
+                collected_logits.append(discrete_logits)
+            else:
+                collected_logits.append(
+                    torch.empty(
+                        0,
+                        self.discrete_vocab_size,
+                        dtype=hidden_states.dtype,
+                        device=device,
+                    )
+                )
+
+            if masked_continuous_positions.any():
+                continuous_hidden = hidden_states[masked_continuous_positions]
+                prior_prediction = self.continuous_prior_head(continuous_hidden)
+                sampled_continuous = self.sample_continuous_latent(
+                    cond=prior_prediction,
+                    num_steps=flow_num_steps,
+                )
+                continuous_batch_idx = batch_indices[masked_continuous_positions]
+                continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
+                candidate_continuous[continuous_batch_idx, continuous_block_idx, :] = sampled_continuous
+
+                if len(special_discrete_token_ids) > 0:
+                    step_discrete = candidate_discrete[continuous_batch_idx, continuous_block_idx, :]
+                    special_step_mask = build_special_block_mask(
+                        discrete_tokens=step_discrete,
+                        special_token_ids=special_discrete_token_ids,
+                    )
+                    if special_step_mask.any():
+                        candidate_continuous[
+                            continuous_batch_idx[special_step_mask],
+                            continuous_block_idx[special_step_mask],
+                            :,
+                        ] = 0.0
+
+            block_confidence = torch.full(
+                (batch_size, max_target),
+                fill_value=-float("inf"),
+                dtype=torch.float32,
+                device=device,
+            )
+            has_confidence = block_conf_count > 0
+            block_confidence[has_confidence] = (
+                block_conf_sum[has_confidence] / block_conf_count[has_confidence]
+            )
+
+            next_masked_blocks = masked_blocks.clone()
+            for sample_idx in range(batch_size):
+                unmask_k = int(unmask_schedule[sample_idx, step_idx].item())
+                if unmask_k <= 0:
+                    continue
+
+                sample_masked_blocks = torch.nonzero(
+                    masked_blocks[sample_idx] & maskable_target_mask[sample_idx],
+                    as_tuple=False,
+                ).squeeze(1)
+                if sample_masked_blocks.numel() == 0:
+                    continue
+
+                unmask_k = min(unmask_k, int(sample_masked_blocks.numel()))
+                if unmask_k <= 0:
+                    continue
+
+                sample_scores = block_confidence[sample_idx, sample_masked_blocks]
+                if do_sample and position_temperature > 0.0:
+                    sample_scores = self._gumbel_sample_scores(
+                        sample_scores,
+                        temperature=position_temperature,
+                    )
+
+                if unmask_k >= int(sample_masked_blocks.numel()):
+                    selected_blocks = sample_masked_blocks
+                else:
+                    selected_rel_idx = torch.topk(
+                        sample_scores,
+                        k=unmask_k,
+                        largest=True,
+                        dim=-1,
+                    ).indices
+                    selected_blocks = sample_masked_blocks[selected_rel_idx]
+
+                predicted_discrete[sample_idx, selected_blocks, :] = candidate_discrete[
+                    sample_idx, selected_blocks, :
+                ]
+                predicted_continuous[sample_idx, selected_blocks, :] = candidate_continuous[
+                    sample_idx, selected_blocks, :
+                ]
+                next_masked_blocks[sample_idx, selected_blocks] = False
 
             masked_blocks = next_masked_blocks & maskable_target_mask
 

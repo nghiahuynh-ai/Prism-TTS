@@ -637,7 +637,7 @@ else:
             text_target = batch_inputs.text_target[:, :target_text_len]
 
             generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
-            for generation_method in ("causal", "parallel"):
+            for generation_method in ("causal", "parallel", "parallel_stable"):
                 generation_outputs[generation_method] = self.model.generate(
                     text_prompt=text_prompt,
                     discrete_prompt=discrete_prompt,
