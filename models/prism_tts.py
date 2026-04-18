@@ -12,7 +12,7 @@ from transformers import LlamaConfig
 
 from models.flow_head import FlowHead
 from models.llama_backbone import LlamaBackbone
-import utils.model_utils as MU
+from utils import model_utils as MU
 
 
 class PrismTTS(nn.Module):
