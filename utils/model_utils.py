@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import math
+import wave
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Optional
-from transformers.utils import ModelOutput
+from pathlib import Path
+from typing import Any, Optional
 
+import numpy as np
 import torch
+import torch.nn.functional as F
+from transformers.utils import ModelOutput
 
 
 TEXT_TOKEN_TYPE = 0
@@ -146,6 +151,252 @@ def normalize_lengths(
             f"min={int(lengths_tensor.min().item())}, max={int(lengths_tensor.max().item())}."
         )
     return lengths_tensor
+
+
+def normalize_raw_text_batch(
+    value: str | Sequence[str],
+    name: str,
+) -> list[str]:
+    """Normalize a raw text input to a non-empty list of strings."""
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, Sequence):
+        raise ValueError(f"{name} must be a string or sequence of strings.")
+    out = list(value)
+    if len(out) == 0:
+        raise ValueError(f"{name} must not be empty.")
+    if not all(isinstance(item, str) for item in out):
+        raise ValueError(f"{name} sequence must contain only strings.")
+    return out
+
+
+def read_wav_mono(path_like: str | Path) -> tuple[np.ndarray, int]:
+    """Read a WAV file and return mono float32 audio in [-1, 1] and sample rate."""
+    resolved = Path(path_like).expanduser()
+    if not resolved.is_absolute():
+        resolved = Path.cwd() / resolved
+    resolved = resolved.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Audio file not found: {resolved}")
+
+    with wave.open(str(resolved), "rb") as handle:
+        channels = int(handle.getnchannels())
+        sample_width = int(handle.getsampwidth())
+        sample_rate = int(handle.getframerate())
+        num_frames = int(handle.getnframes())
+        raw = handle.readframes(num_frames)
+
+    if num_frames <= 0:
+        raise ValueError(f"Audio file is empty: {resolved}")
+
+    if sample_width == 1:
+        audio = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+        audio = (audio - 128.0) / 128.0
+    elif sample_width == 2:
+        audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+    elif sample_width == 3:
+        packed = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        values = (
+            packed[:, 0].astype(np.int32)
+            | (packed[:, 1].astype(np.int32) << 8)
+            | (packed[:, 2].astype(np.int32) << 16)
+        )
+        sign_bit = 1 << 23
+        values = (values ^ sign_bit) - sign_bit
+        audio = values.astype(np.float32) / float(1 << 23)
+    elif sample_width == 4:
+        audio = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / float(1 << 31)
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes.")
+
+    if channels > 1:
+        audio = audio.reshape(-1, channels).mean(axis=1)
+    return audio.astype(np.float32, copy=False), sample_rate
+
+
+def to_mono_audio_array(
+    audio_like: Any,
+    *,
+    name: str,
+) -> np.ndarray:
+    """Convert arbitrary waveform-like input to finite mono float32 numpy array."""
+    if torch.is_tensor(audio_like):
+        array = audio_like.detach().to(dtype=torch.float32, device="cpu").numpy()
+    else:
+        array = np.asarray(audio_like, dtype=np.float32)
+    if array.size <= 0:
+        raise ValueError(f"{name} waveform must not be empty.")
+    if array.ndim == 1:
+        mono = array
+    elif array.ndim == 2:
+        axis = 0 if array.shape[0] <= array.shape[1] else 1
+        mono = array.mean(axis=axis)
+    else:
+        mono = array.reshape(-1)
+    mono = np.nan_to_num(mono.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    if mono.size <= 0:
+        raise ValueError(f"{name} waveform must not be empty.")
+    return mono
+
+
+def extract_audio_with_sample_rate(
+    raw_prompt: Any,
+    *,
+    name: str,
+) -> tuple[np.ndarray, int | None]:
+    """Parse raw prompt input into (mono_waveform, optional_sample_rate)."""
+    if isinstance(raw_prompt, (str, Path)):
+        return read_wav_mono(raw_prompt)
+    if (
+        isinstance(raw_prompt, tuple)
+        and len(raw_prompt) == 2
+        and isinstance(raw_prompt[1], (int, np.integer))
+    ):
+        waveform = to_mono_audio_array(raw_prompt[0], name=name)
+        sample_rate = int(raw_prompt[1])
+        if sample_rate <= 0:
+            raise ValueError(f"{name} sample rate must be > 0.")
+        return waveform, sample_rate
+    return to_mono_audio_array(raw_prompt, name=name), None
+
+
+def resample_audio_if_needed(
+    waveform: np.ndarray,
+    source_rate: int,
+    target_rate: int,
+) -> np.ndarray:
+    """Resample mono waveform with linear interpolation when rates differ."""
+    if source_rate == target_rate:
+        return waveform
+    if source_rate <= 0 or target_rate <= 0:
+        raise ValueError("Resampling rates must be > 0.")
+    src = torch.from_numpy(waveform).view(1, 1, -1)
+    target_length = max(1, int(round(float(waveform.shape[0]) * target_rate / source_rate)))
+    dst = F.interpolate(
+        src,
+        size=target_length,
+        mode="linear",
+        align_corners=False,
+    )
+    return dst[0, 0].cpu().numpy().astype(np.float32, copy=False)
+
+
+def build_default_mimi_speech_encoder(
+    *,
+    num_discrete_tokens: int,
+    device: torch.device,
+    continuous_dtype: torch.dtype,
+    mimi_model_name_or_path: str,
+    mimi_revision: str,
+    mimi_token: str | bool | None,
+    mimi_local_files_only: bool,
+    raw_prompt_name: str = "raw_speech_prompt",
+) -> Callable[[Any], tuple[torch.Tensor, torch.Tensor]]:
+    """Build a Mimi-backed speech encoder returning (discrete_codes, pre-upsample_latents)."""
+    try:
+        from transformers import AutoFeatureExtractor, MimiModel
+    except ModuleNotFoundError as exc:
+        raise ImportError(
+            "Default generate_e2e Mimi encoder requires transformers with Mimi support."
+        ) from exc
+
+    feature_extractor = AutoFeatureExtractor.from_pretrained(
+        mimi_model_name_or_path,
+        revision=mimi_revision,
+        token=mimi_token,
+        local_files_only=bool(mimi_local_files_only),
+    )
+    mimi_sample_rate = int(getattr(feature_extractor, "sampling_rate", 24_000))
+    mimi_model = MimiModel.from_pretrained(
+        mimi_model_name_or_path,
+        revision=mimi_revision,
+        token=mimi_token,
+        local_files_only=bool(mimi_local_files_only),
+    )
+    mimi_model.to(device=device)
+    mimi_model.eval()
+
+    def _default_speech_encoder(raw_prompt: Any) -> tuple[torch.Tensor, torch.Tensor]:
+        prompt_audio, prompt_sample_rate = extract_audio_with_sample_rate(
+            raw_prompt,
+            name=raw_prompt_name,
+        )
+        if prompt_sample_rate is None:
+            prompt_sample_rate = mimi_sample_rate
+        if prompt_sample_rate != mimi_sample_rate:
+            prompt_audio = resample_audio_if_needed(
+                prompt_audio,
+                source_rate=prompt_sample_rate,
+                target_rate=mimi_sample_rate,
+            )
+
+        features = feature_extractor(
+            raw_audio=prompt_audio,
+            sampling_rate=mimi_sample_rate,
+            return_tensors="pt",
+        )
+        input_values = features["input_values"]
+        if input_values.dim() == 2:
+            input_values = input_values.unsqueeze(1)
+        if input_values.dim() != 3:
+            raise ValueError(f"Unexpected Mimi input shape: {tuple(input_values.shape)}")
+        input_values = input_values.to(device=device)
+
+        padding_mask = features.get("padding_mask")
+        if padding_mask is not None:
+            if padding_mask.dim() == 2:
+                padding_mask = padding_mask.unsqueeze(1)
+            if padding_mask.dim() != 3:
+                raise ValueError(f"Unexpected Mimi padding_mask shape: {tuple(padding_mask.shape)}")
+            padding_mask = padding_mask.to(device=device)
+
+        encoded = mimi_model.encode(
+            input_values=input_values,
+            padding_mask=padding_mask,
+            num_quantizers=int(num_discrete_tokens),
+            return_dict=True,
+        )
+        prompt_codes = encoded.audio_codes
+        if prompt_codes is None:
+            raise RuntimeError("Mimi encode did not return audio_codes.")
+        prompt_latents = mimi_model.quantizer.decode(prompt_codes)
+
+        discrete = prompt_codes[0].transpose(0, 1).to(dtype=torch.long)
+        continuous = prompt_latents[0].transpose(0, 1).to(dtype=continuous_dtype)
+        return discrete, continuous
+
+    return _default_speech_encoder
+
+
+def build_lazy_mimi_speech_decoder(
+    *,
+    device: torch.device,
+    continuous_dtype: torch.dtype,
+    mimi_model_name_or_path: str,
+    mimi_revision: str,
+    mimi_token: str | bool | None,
+    mimi_local_files_only: bool,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Build a lazily initialized Mimi decoder from pre-upsample latents to waveform."""
+    decoder_state: dict[str, Any] = {}
+
+    def _default_speech_decoder(latents: torch.Tensor) -> torch.Tensor:
+        decoder = decoder_state.get("decoder")
+        if decoder is None:
+            from models.mimi_latent_decoder import MimiPreUpsampleLatentDecoder
+
+            decoder = MimiPreUpsampleLatentDecoder(
+                pretrained_model_name_or_path=mimi_model_name_or_path,
+                device=str(device),
+                dtype=continuous_dtype,
+                local_files_only=bool(mimi_local_files_only),
+                revision=mimi_revision,
+                token=mimi_token,
+            )
+            decoder_state["decoder"] = decoder
+        return decoder(latents)
+
+    return _default_speech_decoder
 
 
 def assemble_flat_batch(
@@ -524,6 +775,141 @@ def top_k_top_p_filter(
             sorted_logits,
         )
     return logits
+
+
+def sample_discrete_ids(
+    logits: torch.Tensor,
+    temperature: float = 0.8,
+    top_k: int = 50,
+    top_p: float = 0.95,
+    do_sample: bool = True,
+) -> torch.LongTensor:
+    """Sample token ids from logits with optional temperature/top-k/top-p filtering."""
+    if not do_sample or temperature <= 0.0:
+        return torch.argmax(logits, dim=-1)
+
+    scaled_logits = logits / temperature
+    filtered_logits = top_k_top_p_filter(
+        scaled_logits,
+        top_k=top_k,
+        top_p=top_p,
+    )
+    probs = torch.softmax(filtered_logits, dim=-1)
+    sample_shape = probs.shape[:-1]
+    samples = torch.multinomial(probs.reshape(-1, probs.shape[-1]), num_samples=1)
+    return samples.reshape(*sample_shape)
+
+
+def inject_continuous_backbone_noise(
+    clean_latents: torch.FloatTensor,
+) -> torch.FloatTensor:
+    """Inject random noise into continuous latents before backbone conditioning."""
+    k = torch.rand(
+        (*clean_latents.shape[:-1], 1),
+        device=clean_latents.device,
+        dtype=clean_latents.dtype,
+    )
+    e = torch.randn_like(clean_latents)
+    return torch.sqrt(k) * e + torch.sqrt(1.0 - k) * clean_latents
+
+
+def sample_flow_training_inputs(
+    continuous_targets: torch.FloatTensor,
+    flow_timesteps: Optional[torch.FloatTensor] = None,
+    noise: Optional[torch.FloatTensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample flow-matching mixtures and denoising targets for continuous latents."""
+    if flow_timesteps is None:
+        flow_timesteps = torch.rand(
+            continuous_targets.shape[:-1],
+            device=continuous_targets.device,
+            dtype=continuous_targets.dtype,
+        )
+    if noise is None:
+        noise = torch.randn_like(continuous_targets)
+
+    t = flow_timesteps.unsqueeze(-1)
+    flow_inputs = (1.0 - t) * noise + t * continuous_targets
+    flow_target = continuous_targets - noise
+    return flow_inputs, flow_target, flow_timesteps
+
+
+def get_time_shifted_steps(
+    *,
+    num_steps: int,
+    t_shift: float,
+    device: torch.device,
+) -> torch.FloatTensor:
+    """Build [0, 1] timesteps with a time-shift transform."""
+    if num_steps < 1:
+        raise ValueError("num_steps must be >= 1.")
+    if t_shift <= 0.0:
+        raise ValueError("t_shift must be > 0.")
+    base = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
+    return t_shift * base / (1.0 + (t_shift - 1.0) * base)
+
+
+def build_parallel_stable_unmask_schedule(
+    *,
+    maskable_lengths: torch.LongTensor,
+    num_steps: int,
+    t_shift: float,
+) -> torch.LongTensor:
+    """
+    Build per-sample unmask counts for stable parallel decoding.
+
+    The schedule mirrors iterative unmasking:
+    k_n = r_n - r_{n-1} with time-shifted cumulative ratio r_n.
+    """
+    if num_steps < 1:
+        raise ValueError("num_steps must be >= 1.")
+
+    batch_size = int(maskable_lengths.shape[0])
+    device = maskable_lengths.device
+    schedule = torch.zeros(batch_size, num_steps, dtype=torch.long, device=device)
+    if batch_size <= 0:
+        return schedule
+
+    time_steps = get_time_shifted_steps(
+        num_steps=num_steps,
+        t_shift=t_shift,
+        device=device,
+    )
+    time_deltas = time_steps[1:] - time_steps[:-1]
+
+    for sample_idx in range(batch_size):
+        total_maskable = max(0, int(maskable_lengths[sample_idx].item()))
+        if total_maskable <= 0:
+            continue
+
+        remaining = total_maskable
+        for step_idx in range(num_steps):
+            if remaining <= 0:
+                break
+            if step_idx >= num_steps - 1:
+                step_unmask = remaining
+            else:
+                delta = float(time_deltas[step_idx].item())
+                step_unmask = int(math.ceil(float(total_maskable) * delta))
+                step_unmask = min(remaining, max(0, step_unmask))
+            schedule[sample_idx, step_idx] = int(step_unmask)
+            remaining -= int(step_unmask)
+
+    return schedule
+
+
+def gumbel_sample_scores(
+    scores: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Apply temperature-scaled Gumbel perturbation for position selection."""
+    if temperature <= 0.0:
+        return scores
+    scaled_scores = scores / temperature
+    uniform = torch.rand_like(scaled_scores)
+    uniform = uniform.clamp(min=1e-10, max=1.0 - 1e-10)
+    gumbel_noise = -torch.log(-torch.log(uniform))
+    return scaled_scores + gumbel_noise
 
 
 def resolve_generation_discrete_eos_token_id(

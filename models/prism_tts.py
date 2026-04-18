@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -19,18 +20,25 @@ from utils.model_utils import (
     PrismTTSGenerationOutput,
     PrismTTSOutput,
     assemble_flat_batch,
+    build_default_mimi_speech_encoder,
     build_flat_batch_from_collate,
+    build_lazy_mimi_speech_decoder,
+    build_parallel_stable_unmask_schedule,
     build_special_block_mask,
     build_two_level_rope_position_embeddings,
     estimate_parallel_speech_target_lengths,
+    gumbel_sample_scores,
+    inject_continuous_backbone_noise,
     infer_special_discrete_token_ids,
+    normalize_raw_text_batch,
     normalize_continuous_latents,
     normalize_discrete_tokens,
     normalize_lengths,
     normalize_text_tokens,
     resolve_generation_discrete_eos_token_id,
+    sample_discrete_ids,
+    sample_flow_training_inputs,
     sample_masked_target_blocks,
-    top_k_top_p_filter,
 )
 
 
@@ -208,7 +216,7 @@ class PrismTTS(nn.Module):
         token_embeds = self.discrete_embedding(flat.token_ids)
         continuous_values = flat.continuous_values
         if inject_continuous_noise:
-            continuous_values = self._inject_continuous_backbone_noise(continuous_values)
+            continuous_values = inject_continuous_backbone_noise(continuous_values)
         continuous_embeds = self.continuous_proj(continuous_values)
         base_embeds = torch.where(
             is_continuous.unsqueeze(-1),
@@ -256,40 +264,6 @@ class PrismTTS(nn.Module):
             masked_continuous_positions,
             masked_target_token_mask,
         )
-
-    def _inject_continuous_backbone_noise(
-        self,
-        clean_latents: torch.FloatTensor,
-    ) -> torch.FloatTensor:
-        """Inject random noise into continuous latents before backbone conditioning."""
-        k = torch.rand(
-            (*clean_latents.shape[:-1], 1),
-            device=clean_latents.device,
-            dtype=clean_latents.dtype,
-        )
-        e = torch.randn_like(clean_latents)
-        return torch.sqrt(k) * e + torch.sqrt(1.0 - k) * clean_latents
-
-    def _sample_flow_training_inputs(
-        self,
-        continuous_targets: torch.FloatTensor,
-        flow_timesteps: Optional[torch.FloatTensor] = None,
-        noise: Optional[torch.FloatTensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Sample flow-matching mixtures and targets for continuous latent denoising."""
-        if flow_timesteps is None:
-            flow_timesteps = torch.rand(
-                continuous_targets.shape[:-1],
-                device=continuous_targets.device,
-                dtype=continuous_targets.dtype,
-            )
-        if noise is None:
-            noise = torch.randn_like(continuous_targets)
-
-        t = flow_timesteps.unsqueeze(-1)
-        flow_inputs = (1.0 - t) * noise + t * continuous_targets
-        flow_target = continuous_targets - noise
-        return flow_inputs, flow_target, flow_timesteps
 
     def _compute_discrete_loss(
         self,
@@ -364,7 +338,7 @@ class PrismTTS(nn.Module):
                 raise ValueError("noise must cover all target speech blocks.")
             selected_noise = noise[batch_indices, target_block_indices, :]
 
-        flow_inputs, flow_target, sampled_timesteps = self._sample_flow_training_inputs(
+        flow_inputs, flow_target, sampled_timesteps = sample_flow_training_inputs(
             continuous_targets=target_continuous,
             flow_timesteps=selected_flow_timesteps,
             noise=selected_noise,
@@ -385,98 +359,14 @@ class PrismTTS(nn.Module):
         top_p: float = 0.95,
         do_sample: bool = True,
     ) -> torch.LongTensor:
-        """Sample discrete ids from logits with optional temperature/top-k/top-p."""
-        if not do_sample or temperature <= 0.0:
-            return torch.argmax(logits, dim=-1)
-
-        scaled_logits = logits / temperature
-        filtered_logits = top_k_top_p_filter(
-            scaled_logits,
+        """Compatibility wrapper for utilities-backed discrete sampling."""
+        return sample_discrete_ids(
+            logits=logits,
+            temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            do_sample=do_sample,
         )
-        probs = torch.softmax(filtered_logits, dim=-1)
-        sample_shape = probs.shape[:-1]
-        samples = torch.multinomial(probs.reshape(-1, probs.shape[-1]), num_samples=1)
-        return samples.reshape(*sample_shape)
-
-    def _get_time_shifted_steps(
-        self,
-        *,
-        num_steps: int,
-        t_shift: float,
-        device: torch.device,
-    ) -> torch.FloatTensor:
-        """Build [0, 1] time steps using time-shift transform."""
-        if num_steps < 1:
-            raise ValueError("num_steps must be >= 1.")
-        if t_shift <= 0.0:
-            raise ValueError("t_shift must be > 0.")
-        base = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
-        return t_shift * base / (1.0 + (t_shift - 1.0) * base)
-
-    def _build_parallel_stable_unmask_schedule(
-        self,
-        *,
-        maskable_lengths: torch.LongTensor,
-        num_steps: int,
-        t_shift: float,
-    ) -> torch.LongTensor:
-        """
-        Build per-sample unmask counts for stable parallel decoding.
-
-        The schedule mirrors iterative unmasking:
-        k_n = r_n - r_{n-1} with time-shifted cumulative ratio r_n.
-        """
-        if num_steps < 1:
-            raise ValueError("num_steps must be >= 1.")
-
-        batch_size = int(maskable_lengths.shape[0])
-        device = maskable_lengths.device
-        schedule = torch.zeros(batch_size, num_steps, dtype=torch.long, device=device)
-        if batch_size <= 0:
-            return schedule
-
-        time_steps = self._get_time_shifted_steps(
-            num_steps=num_steps,
-            t_shift=t_shift,
-            device=device,
-        )
-        time_deltas = time_steps[1:] - time_steps[:-1]
-
-        for sample_idx in range(batch_size):
-            total_maskable = max(0, int(maskable_lengths[sample_idx].item()))
-            if total_maskable <= 0:
-                continue
-
-            remaining = total_maskable
-            for step_idx in range(num_steps):
-                if remaining <= 0:
-                    break
-                if step_idx >= num_steps - 1:
-                    step_unmask = remaining
-                else:
-                    delta = float(time_deltas[step_idx].item())
-                    step_unmask = int(math.ceil(float(total_maskable) * delta))
-                    step_unmask = min(remaining, max(0, step_unmask))
-                schedule[sample_idx, step_idx] = int(step_unmask)
-                remaining -= int(step_unmask)
-
-        return schedule
-
-    def _gumbel_sample_scores(
-        self,
-        scores: torch.Tensor,
-        temperature: float,
-    ) -> torch.Tensor:
-        """Apply temperature-scaled Gumbel perturbation for position selection."""
-        if temperature <= 0.0:
-            return scores
-        scaled_scores = scores / temperature
-        uniform = torch.rand_like(scaled_scores)
-        uniform = uniform.clamp(min=1e-10, max=1.0 - 1e-10)
-        gumbel_noise = -torch.log(-torch.log(uniform))
-        return scaled_scores + gumbel_noise
 
     def sample_continuous_latent(
         self,
@@ -669,55 +559,6 @@ class PrismTTS(nn.Module):
             text_target = text_prompt.new_zeros((batch_size, 0))
         else:
             text_target = normalize_text_tokens(text_target, "text_target")
-
-        return self._generate_prepared(
-            text_prompt=text_prompt,
-            discrete_prompt=discrete_prompt,
-            continuous_prompt=continuous_prompt,
-            text_target=text_target,
-            text_prompt_lengths=text_prompt_lengths,
-            speech_prompt_lengths=speech_prompt_lengths,
-            text_target_lengths=text_target_lengths,
-            speech_target_lengths=speech_target_lengths,
-            max_new_blocks=max_new_blocks,
-            discrete_eos_token_id=discrete_eos_token_id,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            do_sample=do_sample,
-            flow_num_steps=flow_num_steps,
-            parallel_num_steps=parallel_num_steps,
-            force_silent_special_tokens=force_silent_special_tokens,
-            return_dict=return_dict,
-            generation_method=generation_method,
-        )
-
-    @torch.no_grad()
-    def _generate_prepared(
-        self,
-        *,
-        text_prompt: torch.LongTensor,
-        discrete_prompt: torch.LongTensor,
-        continuous_prompt: torch.FloatTensor,
-        text_target: torch.LongTensor,
-        text_prompt_lengths: Optional[torch.Tensor | int] = None,
-        speech_prompt_lengths: Optional[torch.Tensor | int] = None,
-        text_target_lengths: Optional[torch.Tensor | int] = None,
-        speech_target_lengths: Optional[torch.Tensor | int] = None,
-        max_new_blocks: Optional[int] = 128,
-        discrete_eos_token_id: Optional[int] = 2049,
-        temperature: float = 0.8,
-        top_k: int = 50,
-        top_p: float = 0.95,
-        do_sample: bool = True,
-        flow_num_steps: Optional[int] = None,
-        force_silent_special_tokens: bool = False,
-        return_dict: bool = True,
-        generation_method: str = "causal",
-        parallel_num_steps: Optional[int] = None,
-    ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
-        """Generate from already-prepared tensor inputs, routed by generation method."""
-        batch_size = int(text_prompt.shape[0])
 
         if max_new_blocks is not None and int(max_new_blocks) < 0:
             raise ValueError("max_new_blocks must be >= 0 when provided.")
@@ -1364,7 +1205,7 @@ class PrismTTS(nn.Module):
         masked_blocks = maskable_target_mask.clone()
         maskable_lengths = torch.clamp(speech_target_lengths - 1, min=0)
         num_parallel_steps = int(parallel_num_steps)
-        unmask_schedule = self._build_parallel_stable_unmask_schedule(
+        unmask_schedule = build_parallel_stable_unmask_schedule(
             maskable_lengths=maskable_lengths,
             num_steps=num_parallel_steps,
             t_shift=0.1,
@@ -1510,7 +1351,7 @@ class PrismTTS(nn.Module):
 
                 sample_scores = block_confidence[sample_idx, sample_masked_blocks]
                 if do_sample and position_temperature > 0.0:
-                    sample_scores = self._gumbel_sample_scores(
+                    sample_scores = gumbel_sample_scores(
                         sample_scores,
                         temperature=position_temperature,
                     )
@@ -1541,46 +1382,47 @@ class PrismTTS(nn.Module):
 
 
     @torch.no_grad()
-    def generate_from_raw(
+    def generate_e2e(
         self,
         raw_text_prompt: str | Sequence[str],
         raw_speech_prompt: Any | list[Any],
         raw_text_target: str | Sequence[str],
         *,
-        text_tokenizer: Callable[[str], Sequence[int]],
-        speech_prompt_encoder: Callable[[Any], tuple[torch.Tensor, torch.Tensor]],
+        text_tokenizer: Optional[Callable[[str], Sequence[int]]] = None,
+        speech_encoder: Optional[Callable[[Any], tuple[torch.Tensor, torch.Tensor]]] = None,
+        speech_decoder: Optional[Callable[[torch.Tensor], Any]] = None,
+        output_type: str = "tensor",
         return_dict: bool = True,
+        mimi_model_name_or_path: str = "kyutai/mimi",
+        mimi_revision: str = "main",
+        mimi_token: str | bool | None = None,
+        mimi_local_files_only: bool = False,
         **generate_kwargs: Any,
-    ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
+    ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor] | torch.Tensor:
         """
-        Convenience wrapper around `generate` that accepts raw text/audio-like inputs.
+        End-to-end generation from raw text/audio-like inputs.
 
-        `text_tokenizer` converts a raw string to token ids.
-        `speech_prompt_encoder` converts one raw speech prompt object to:
+        `text_tokenizer` converts raw string input to text token ids.
+        `speech_encoder` converts one raw speech prompt object to:
         - discrete tokens with shape [L, N] or [N, L]
         - continuous latents with shape [L, D] (or [D, L], accepted and transposed)
         where N=num_discrete_tokens and D=continuous_latent_size.
 
-        For batched inference, pass lists for all raw inputs with matching lengths.
+        If `text_tokenizer` is None, initialize a `SharedVocabTokenizer` using
+        the same default behavior as dataset construction.
+        If `speech_encoder` and/or `speech_decoder` is None, initialize the
+        missing component(s) from Mimi.
+
+        `output_type` controls the return value:
+        - "tensor": return token/latent tensors (same behavior as `generate`).
+        - "speech": return decoded waveform tensor from `speech_decoder`.
         """
+        output_type_normalized = str(output_type).strip().lower()
+        if output_type_normalized not in ("tensor", "speech"):
+            raise ValueError("output_type must be one of {'tensor', 'speech'}.")
 
-        def _normalize_raw_text_batch(
-            value: str | Sequence[str],
-            name: str,
-        ) -> list[str]:
-            if isinstance(value, str):
-                return [value]
-            if not isinstance(value, Sequence):
-                raise ValueError(f"{name} must be a string or sequence of strings.")
-            out = list(value)
-            if len(out) == 0:
-                raise ValueError(f"{name} must not be empty.")
-            if not all(isinstance(item, str) for item in out):
-                raise ValueError(f"{name} sequence must contain only strings.")
-            return out
-
-        prompt_text_list = _normalize_raw_text_batch(raw_text_prompt, "raw_text_prompt")
-        target_text_list = _normalize_raw_text_batch(raw_text_target, "raw_text_target")
+        prompt_text_list = normalize_raw_text_batch(raw_text_prompt, "raw_text_prompt")
+        target_text_list = normalize_raw_text_batch(raw_text_target, "raw_text_target")
 
         if isinstance(raw_speech_prompt, list):
             speech_prompt_list = list(raw_speech_prompt)
@@ -1599,6 +1441,47 @@ class PrismTTS(nn.Module):
         device = params[0].device
         continuous_dtype = self.continuous_proj.weight.dtype
 
+        if text_tokenizer is None:
+            from dataset.dataset import SharedVocabTokenizer, build_shared_token_layout
+
+            discrete_token_count = int(self.discrete_vocab_size) - 3
+            if discrete_token_count < 1:
+                raise ValueError(
+                    "Cannot infer tokenizer shared layout: discrete_vocab_size must be >= 4."
+                )
+            _, eos_token_id, _, text_token_offset = build_shared_token_layout(discrete_token_count)
+            vocab_path = Path(__file__).resolve().parents[1] / "dataset" / "vocab.txt"
+            text_tokenizer = SharedVocabTokenizer(
+                vocab_path=vocab_path,
+                text_token_offset=text_token_offset,
+                eos_token_id=eos_token_id,
+                append_eos=False,
+            )
+
+        needs_default_mimi_encoder = speech_encoder is None
+        needs_default_mimi_decoder = speech_decoder is None
+        if needs_default_mimi_encoder:
+            speech_encoder = build_default_mimi_speech_encoder(
+                num_discrete_tokens=int(self.num_discrete_tokens),
+                device=device,
+                continuous_dtype=continuous_dtype,
+                mimi_model_name_or_path=mimi_model_name_or_path,
+                mimi_revision=mimi_revision,
+                mimi_token=mimi_token,
+                mimi_local_files_only=bool(mimi_local_files_only),
+                raw_prompt_name="raw_speech_prompt",
+            )
+
+        if needs_default_mimi_decoder:
+            speech_decoder = build_lazy_mimi_speech_decoder(
+                device=device,
+                continuous_dtype=continuous_dtype,
+                mimi_model_name_or_path=mimi_model_name_or_path,
+                mimi_revision=mimi_revision,
+                mimi_token=mimi_token,
+                mimi_local_files_only=bool(mimi_local_files_only),
+            )
+
         prompt_token_lists: list[list[int]] = []
         target_token_lists: list[list[int]] = []
         speech_discrete_list: list[torch.LongTensor] = []
@@ -1610,10 +1493,10 @@ class PrismTTS(nn.Module):
             prompt_token_lists.append(prompt_tokens)
             target_token_lists.append(target_tokens)
 
-            encoded = speech_prompt_encoder(speech_prompt_list[sample_idx])
+            encoded = speech_encoder(speech_prompt_list[sample_idx])
             if not isinstance(encoded, tuple) or len(encoded) != 2:
                 raise ValueError(
-                    "speech_prompt_encoder must return a tuple of "
+                    "speech_encoder must return a tuple of "
                     "(discrete_tokens, continuous_latents)."
                 )
             discrete_tokens, continuous_latents = encoded
@@ -1735,31 +1618,45 @@ class PrismTTS(nn.Module):
                 continuous_prompt[sample_idx, : speech_continuous.shape[0], :] = speech_continuous
 
         if "text_prompt_lengths" in generate_kwargs:
-            raise ValueError("Do not pass text_prompt_lengths when using generate_from_raw.")
+            raise ValueError("Do not pass text_prompt_lengths when using generate_e2e.")
         if "speech_prompt_lengths" in generate_kwargs:
-            raise ValueError("Do not pass speech_prompt_lengths when using generate_from_raw.")
+            raise ValueError("Do not pass speech_prompt_lengths when using generate_e2e.")
         if "text_target_lengths" in generate_kwargs:
-            raise ValueError("Do not pass text_target_lengths when using generate_from_raw.")
+            raise ValueError("Do not pass text_target_lengths when using generate_e2e.")
         if "return_dict" in generate_kwargs:
-            raise ValueError("Use generate_from_raw(return_dict=...) instead of return_dict in kwargs.")
+            raise ValueError("Use generate_e2e(return_dict=...) instead of return_dict in kwargs.")
 
-        return self._generate_prepared(
+        generation = self.generate(
             text_prompt=text_prompt,
-            discrete_prompt=normalize_discrete_tokens(
-                discrete_prompt,
-                "discrete_prompt",
-                num_discrete_tokens=self.num_discrete_tokens,
-            ),
-            continuous_prompt=normalize_continuous_latents(
-                continuous_prompt,
-                expected_len=int(max_speech_prompt),
-                name="continuous_prompt",
-                continuous_latent_size=self.continuous_latent_size,
-            ),
-            text_target=normalize_text_tokens(text_target, "text_target"),
+            discrete_prompt=discrete_prompt,
+            continuous_prompt=continuous_prompt,
+            text_target=text_target,
             text_prompt_lengths=text_prompt_lengths,
             speech_prompt_lengths=speech_prompt_lengths,
             text_target_lengths=text_target_lengths,
-            return_dict=return_dict,
+            return_dict=True,
             **generate_kwargs,
         )
+
+        if output_type_normalized == "tensor":
+            if return_dict:
+                return generation
+            if generation.discrete_ids is None or generation.continuous_latents is None:
+                raise RuntimeError("generate_e2e(tensor) requires generated discrete and continuous outputs.")
+            return generation.discrete_ids, generation.continuous_latents
+
+        if speech_decoder is None:
+            raise RuntimeError("speech_decoder is required for output_type='speech'.")
+        if generation.continuous_latents is None:
+            raise RuntimeError("Generation produced no continuous latents to decode.")
+
+        decoded_speech = speech_decoder(generation.continuous_latents)
+        if torch.is_tensor(decoded_speech):
+            speech_tensor = decoded_speech
+        else:
+            speech_tensor = torch.as_tensor(decoded_speech)
+        if speech_tensor.dim() == 3 and speech_tensor.shape[1] == 1:
+            speech_tensor = speech_tensor[:, 0, :]
+        if speech_tensor.dim() == 1:
+            speech_tensor = speech_tensor.unsqueeze(0)
+        return speech_tensor

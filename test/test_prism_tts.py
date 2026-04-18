@@ -866,7 +866,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 return_dict=True,
             )
 
-    def test_generate_from_raw_accepts_string_and_raw_speech_prompt(self) -> None:
+    def test_generate_e2e_accepts_string_and_raw_speech_prompt(self) -> None:
         eos_id = int(
             resolve_generation_discrete_eos_token_id(
                 None,
@@ -898,12 +898,12 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
 
         raw_prompt_audio = torch.tensor([0.1, -0.2, 0.3, -0.4], device=self.device)
         with torch.no_grad():
-            outputs = self.model.generate_from_raw(
+            outputs = self.model.generate_e2e(
                 raw_text_prompt="ab",
                 raw_speech_prompt=raw_prompt_audio,
                 raw_text_target="cd",
                 text_tokenizer=_tokenizer,
-                speech_prompt_encoder=_speech_encoder,
+                speech_encoder=_speech_encoder,
                 max_new_blocks=3,
                 discrete_eos_token_id=eos_id,
                 do_sample=False,
@@ -919,7 +919,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             max(0, int(outputs.discrete_ids.shape[-1]) - 1),
         )
 
-    def test_generate_from_raw_supports_batched_inputs(self) -> None:
+    def test_generate_e2e_supports_batched_inputs(self) -> None:
         eos_id = int(
             resolve_generation_discrete_eos_token_id(
                 None,
@@ -954,12 +954,12 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             torch.tensor([0.3, -0.3], device=self.device),
         ]
         with torch.no_grad():
-            outputs = self.model.generate_from_raw(
+            outputs = self.model.generate_e2e(
                 raw_text_prompt=["hello", "yo"],
                 raw_speech_prompt=raw_prompts,
                 raw_text_target=["world", "ha"],
                 text_tokenizer=_tokenizer,
-                speech_prompt_encoder=_speech_encoder,
+                speech_encoder=_speech_encoder,
                 max_new_blocks=2,
                 discrete_eos_token_id=eos_id,
                 do_sample=False,
