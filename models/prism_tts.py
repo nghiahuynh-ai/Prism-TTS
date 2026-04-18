@@ -12,34 +12,7 @@ from transformers import LlamaConfig
 
 from models.flow_head import FlowHead
 from models.llama_backbone import LlamaBackbone
-from utils.model_utils import (
-    SPEECH_CONTINUOUS_TOKEN_TYPE,
-    SPEECH_DISCRETE_TOKEN_TYPE,
-    TEXT_TOKEN_TYPE,
-    FlatBatch,
-    PrismTTSGenerationOutput,
-    PrismTTSOutput,
-    assemble_flat_batch,
-    build_default_mimi_speech_encoder,
-    build_flat_batch_from_collate,
-    build_lazy_mimi_speech_decoder,
-    build_parallel_stable_unmask_schedule,
-    build_special_block_mask,
-    build_two_level_rope_position_embeddings,
-    estimate_parallel_speech_target_lengths,
-    gumbel_sample_scores,
-    inject_continuous_backbone_noise,
-    infer_special_discrete_token_ids,
-    normalize_raw_text_batch,
-    normalize_continuous_latents,
-    normalize_discrete_tokens,
-    normalize_lengths,
-    normalize_text_tokens,
-    resolve_generation_discrete_eos_token_id,
-    sample_discrete_ids,
-    sample_flow_training_inputs,
-    sample_masked_target_blocks,
-)
+import utils.model_utils as MU
 
 
 class PrismTTS(nn.Module):
@@ -150,8 +123,8 @@ class PrismTTS(nn.Module):
         # Shared layout: EOT is typically EOS - 1.
         self.eot_token_id = max(0, self.eos_token_id - 1)
 
-        self.training_special_discrete_token_ids = infer_special_discrete_token_ids(
-            resolve_generation_discrete_eos_token_id(
+        self.training_special_discrete_token_ids = MU.infer_special_discrete_token_ids(
+            MU.resolve_generation_discrete_eos_token_id(
                 None,
                 backbone_eos_token_id=self.backbone.config.eos_token_id,
                 discrete_vocab_size=self.discrete_vocab_size,
@@ -190,7 +163,7 @@ class PrismTTS(nn.Module):
 
     def _build_inputs_embeds(
         self,
-        flat: FlatBatch,
+        flat: MU.FlatBatch,
         masked_target_blocks: torch.BoolTensor,
         inject_continuous_noise: bool = False,
     ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
@@ -198,9 +171,9 @@ class PrismTTS(nn.Module):
         batch_size, seq_len = flat.token_ids.shape
         device = flat.token_ids.device
 
-        is_speech = flat.token_type_ids != TEXT_TOKEN_TYPE
-        is_discrete = flat.token_type_ids == SPEECH_DISCRETE_TOKEN_TYPE
-        is_continuous = flat.token_type_ids == SPEECH_CONTINUOUS_TOKEN_TYPE
+        is_speech = flat.token_type_ids != MU.TEXT_TOKEN_TYPE
+        is_discrete = flat.token_type_ids == MU.SPEECH_DISCRETE_TOKEN_TYPE
+        is_continuous = flat.token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE
 
         target_token_mask = flat.target_block_ids >= 0
         if masked_target_blocks.numel() == 0:
@@ -216,7 +189,7 @@ class PrismTTS(nn.Module):
         token_embeds = self.discrete_embedding(flat.token_ids)
         continuous_values = flat.continuous_values
         if inject_continuous_noise:
-            continuous_values = inject_continuous_backbone_noise(continuous_values)
+            continuous_values = MU.inject_continuous_backbone_noise(continuous_values)
         continuous_embeds = self.continuous_proj(continuous_values)
         base_embeds = torch.where(
             is_continuous.unsqueeze(-1),
@@ -236,7 +209,7 @@ class PrismTTS(nn.Module):
             masked_discrete_embeds = self.masked_discrete_embeddings[disc_stream_ids]
             masked_discrete_embeds = (
                 masked_discrete_embeds
-                + self.token_type_embeddings[SPEECH_DISCRETE_TOKEN_TYPE]
+                + self.token_type_embeddings[MU.SPEECH_DISCRETE_TOKEN_TYPE]
                 + self.speech_stream_embeddings[disc_stream_ids]
             )
             base_embeds = torch.where(
@@ -249,7 +222,7 @@ class PrismTTS(nn.Module):
             cont_stream_ids = flat.speech_stream_ids.clamp(min=0, max=self.speech_block_size - 1)
             masked_cont_embeds = (
                 self.masked_continuous_embedding.view(1, 1, self.hidden_size)
-                + self.token_type_embeddings[SPEECH_CONTINUOUS_TOKEN_TYPE].view(1, 1, self.hidden_size)
+                + self.token_type_embeddings[MU.SPEECH_CONTINUOUS_TOKEN_TYPE].view(1, 1, self.hidden_size)
                 + self.speech_stream_embeddings[cont_stream_ids]
             )
             base_embeds = torch.where(
@@ -338,7 +311,7 @@ class PrismTTS(nn.Module):
                 raise ValueError("noise must cover all target speech blocks.")
             selected_noise = noise[batch_indices, target_block_indices, :]
 
-        flow_inputs, flow_target, sampled_timesteps = sample_flow_training_inputs(
+        flow_inputs, flow_target, sampled_timesteps = MU.sample_flow_training_inputs(
             continuous_targets=target_continuous,
             flow_timesteps=selected_flow_timesteps,
             noise=selected_noise,
@@ -360,7 +333,7 @@ class PrismTTS(nn.Module):
         do_sample: bool = True,
     ) -> torch.LongTensor:
         """Compatibility wrapper for utilities-backed discrete sampling."""
-        return sample_discrete_ids(
+        return MU.sample_discrete_ids(
             logits=logits,
             temperature=temperature,
             top_k=top_k,
@@ -402,7 +375,7 @@ class PrismTTS(nn.Module):
 
     def _encode(
         self,
-        flat: FlatBatch,
+        flat: MU.FlatBatch,
         masked_target_blocks: torch.BoolTensor,
         inject_continuous_noise: bool = False,
     ) -> tuple[
@@ -419,7 +392,7 @@ class PrismTTS(nn.Module):
                 inject_continuous_noise=inject_continuous_noise,
             )
         )
-        position_embeddings = build_two_level_rope_position_embeddings(
+        position_embeddings = MU.build_two_level_rope_position_embeddings(
             inputs_embeds=inputs_embeds,
             speech_stream_ids=flat.speech_stream_ids,
             rotary_emb=self.backbone.rotary_emb,
@@ -451,9 +424,9 @@ class PrismTTS(nn.Module):
         mask_ratio: Optional[float] = None,
         masked_target_blocks: Optional[torch.BoolTensor] = None,
         return_dict: bool = True,
-    ) -> PrismTTSOutput | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> MU.PrismTTSOutput | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run masked block reconstruction training from collate-preflattened tensors."""
-        flat = build_flat_batch_from_collate(
+        flat = MU.build_flat_batch_from_collate(
             flat_token_ids=flat_token_ids,
             flat_continuous_values=flat_continuous_values,
             flat_token_type_ids=flat_token_type_ids,
@@ -471,7 +444,7 @@ class PrismTTS(nn.Module):
             effective_mask_ratio = float(mask_ratio)
             if not (0.0 <= effective_mask_ratio <= 1.0):
                 raise ValueError("mask_ratio must be in [0, 1].")
-        masked_blocks = sample_masked_target_blocks(
+        masked_blocks = MU.sample_masked_target_blocks(
             target_block_counts=flat.target_block_counts,
             mask_ratio=effective_mask_ratio,
             masked_target_blocks=masked_target_blocks,
@@ -510,7 +483,7 @@ class PrismTTS(nn.Module):
         if not return_dict:
             return loss, discrete_loss, continuous_loss, flow_loss
 
-        return PrismTTSOutput(
+        return MU.PrismTTSOutput(
             loss=loss,
             discrete_loss=discrete_loss,
             continuous_loss=continuous_loss,
@@ -539,15 +512,15 @@ class PrismTTS(nn.Module):
         return_dict: bool = True,
         generation_method: str = "causal",
         parallel_num_steps: Optional[int] = None,
-    ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
+    ) -> MU.PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor]:
         """Generate target speech blocks conditioned on text/speech prompt and target text."""
-        text_prompt = normalize_text_tokens(text_prompt, "text_prompt")
-        discrete_prompt = normalize_discrete_tokens(
+        text_prompt = MU.normalize_text_tokens(text_prompt, "text_prompt")
+        discrete_prompt = MU.normalize_discrete_tokens(
             discrete_prompt,
             "discrete_prompt",
             num_discrete_tokens=self.num_discrete_tokens,
         )
-        continuous_prompt = normalize_continuous_latents(
+        continuous_prompt = MU.normalize_continuous_latents(
             continuous_prompt,
             expected_len=int(discrete_prompt.shape[1]),
             name="continuous_prompt",
@@ -558,7 +531,7 @@ class PrismTTS(nn.Module):
         if text_target is None:
             text_target = text_prompt.new_zeros((batch_size, 0))
         else:
-            text_target = normalize_text_tokens(text_target, "text_target")
+            text_target = MU.normalize_text_tokens(text_target, "text_target")
 
         if max_new_blocks is not None and int(max_new_blocks) < 0:
             raise ValueError("max_new_blocks must be >= 0 when provided.")
@@ -575,7 +548,7 @@ class PrismTTS(nn.Module):
                 "generation_method must be one of {'causal', 'parallel', 'parallel_stable'}."
             )
 
-        text_prompt_lengths = normalize_lengths(
+        text_prompt_lengths = MU.normalize_lengths(
             lengths=text_prompt_lengths,
             batch_size=batch_size,
             max_length=int(text_prompt.shape[1]),
@@ -583,7 +556,7 @@ class PrismTTS(nn.Module):
             device=text_prompt.device,
             default_value=int(text_prompt.shape[1]),
         )
-        speech_prompt_lengths = normalize_lengths(
+        speech_prompt_lengths = MU.normalize_lengths(
             lengths=speech_prompt_lengths,
             batch_size=batch_size,
             max_length=int(discrete_prompt.shape[1]),
@@ -591,7 +564,7 @@ class PrismTTS(nn.Module):
             device=text_prompt.device,
             default_value=int(discrete_prompt.shape[1]),
         )
-        text_target_lengths = normalize_lengths(
+        text_target_lengths = MU.normalize_lengths(
             lengths=text_target_lengths,
             batch_size=batch_size,
             max_length=int(text_target.shape[1]),
@@ -604,7 +577,7 @@ class PrismTTS(nn.Module):
 
         if speech_target_lengths is None:
             if generation_method_normalized in ("parallel", "parallel_stable"):
-                speech_target_lengths = estimate_parallel_speech_target_lengths(
+                speech_target_lengths = MU.estimate_parallel_speech_target_lengths(
                     text_prompt_lengths=text_prompt_lengths,
                     speech_prompt_lengths=speech_prompt_lengths,
                     text_target_lengths=text_target_lengths,
@@ -621,7 +594,7 @@ class PrismTTS(nn.Module):
                     if max_new_blocks is None
                     else int(max_new_blocks)
                 )
-                speech_target_lengths = normalize_lengths(
+                speech_target_lengths = MU.normalize_lengths(
                     lengths=speech_target_lengths,
                     batch_size=batch_size,
                     max_length=speech_target_max_length,
@@ -636,7 +609,7 @@ class PrismTTS(nn.Module):
                 .max()
                 .item()
             )
-            speech_target_lengths = normalize_lengths(
+            speech_target_lengths = MU.normalize_lengths(
                 lengths=speech_target_lengths,
                 batch_size=batch_size,
                 max_length=speech_target_max_length,
@@ -656,20 +629,20 @@ class PrismTTS(nn.Module):
             empty_cont = continuous_prompt.new_empty((batch_size, 0, self.continuous_latent_size))
             if not return_dict:
                 return empty_disc, empty_cont
-            return PrismTTSGenerationOutput(
+            return MU.PrismTTSGenerationOutput(
                 text_ids=text_ids_out,
                 discrete_ids=empty_disc,
                 continuous_latents=empty_cont,
                 discrete_logits=tuple(),
             )
 
-        discrete_eos_id = resolve_generation_discrete_eos_token_id(
+        discrete_eos_id = MU.resolve_generation_discrete_eos_token_id(
             discrete_eos_token_id,
             backbone_eos_token_id=self.backbone.config.eos_token_id,
             discrete_vocab_size=self.discrete_vocab_size,
         )
         special_discrete_token_ids = (
-            infer_special_discrete_token_ids(
+            MU.infer_special_discrete_token_ids(
                 discrete_eos_id,
                 backbone_eos_token_id=self.backbone.config.eos_token_id,
                 backbone_pad_token_id=self.backbone.config.pad_token_id,
@@ -714,7 +687,7 @@ class PrismTTS(nn.Module):
 
         if not return_dict:
             return predicted_discrete.transpose(1, 2).contiguous(), predicted_continuous
-        return PrismTTSGenerationOutput(
+        return MU.PrismTTSGenerationOutput(
             text_ids=text_ids_out,
             discrete_ids=predicted_discrete.transpose(1, 2).contiguous(),
             continuous_latents=predicted_continuous,
@@ -805,7 +778,7 @@ class PrismTTS(nn.Module):
             current_discrete[masked_blocks] = self.pad_token_id
             current_continuous[masked_blocks] = 0.0
 
-            flat = assemble_flat_batch(
+            flat = MU.assemble_flat_batch(
                 text_prompt=text_prompt,
                 discrete_prompt=discrete_prompt,
                 continuous_prompt=continuous_prompt,
@@ -873,7 +846,7 @@ class PrismTTS(nn.Module):
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = predicted_discrete[continuous_batch_idx, step_idx, :]
-                    special_step_mask = build_special_block_mask(
+                    special_step_mask = MU.build_special_block_mask(
                         discrete_tokens=step_discrete,
                         special_token_ids=special_discrete_token_ids,
                     )
@@ -987,7 +960,7 @@ class PrismTTS(nn.Module):
                 current_discrete[masked_blocks] = self.pad_token_id
                 current_continuous[masked_blocks] = 0.0
 
-            flat = assemble_flat_batch(
+            flat = MU.assemble_flat_batch(
                 text_prompt=text_prompt,
                 discrete_prompt=discrete_prompt,
                 continuous_prompt=continuous_prompt,
@@ -1088,7 +1061,7 @@ class PrismTTS(nn.Module):
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = predicted_discrete[continuous_batch_idx, continuous_block_idx, :]
-                    special_step_mask = build_special_block_mask(
+                    special_step_mask = MU.build_special_block_mask(
                         discrete_tokens=step_discrete,
                         special_token_ids=special_discrete_token_ids,
                     )
@@ -1205,7 +1178,7 @@ class PrismTTS(nn.Module):
         masked_blocks = maskable_target_mask.clone()
         maskable_lengths = torch.clamp(speech_target_lengths - 1, min=0)
         num_parallel_steps = int(parallel_num_steps)
-        unmask_schedule = build_parallel_stable_unmask_schedule(
+        unmask_schedule = MU.build_parallel_stable_unmask_schedule(
             maskable_lengths=maskable_lengths,
             num_steps=num_parallel_steps,
             t_shift=0.1,
@@ -1222,7 +1195,7 @@ class PrismTTS(nn.Module):
             current_discrete[masked_blocks] = self.pad_token_id
             current_continuous[masked_blocks] = 0.0
 
-            flat = assemble_flat_batch(
+            flat = MU.assemble_flat_batch(
                 text_prompt=text_prompt,
                 discrete_prompt=discrete_prompt,
                 continuous_prompt=continuous_prompt,
@@ -1310,7 +1283,7 @@ class PrismTTS(nn.Module):
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = candidate_discrete[continuous_batch_idx, continuous_block_idx, :]
-                    special_step_mask = build_special_block_mask(
+                    special_step_mask = MU.build_special_block_mask(
                         discrete_tokens=step_discrete,
                         special_token_ids=special_discrete_token_ids,
                     )
@@ -1351,7 +1324,7 @@ class PrismTTS(nn.Module):
 
                 sample_scores = block_confidence[sample_idx, sample_masked_blocks]
                 if do_sample and position_temperature > 0.0:
-                    sample_scores = gumbel_sample_scores(
+                    sample_scores = MU.gumbel_sample_scores(
                         sample_scores,
                         temperature=position_temperature,
                     )
@@ -1398,7 +1371,7 @@ class PrismTTS(nn.Module):
         mimi_token: str | bool | None = None,
         mimi_local_files_only: bool = False,
         **generate_kwargs: Any,
-    ) -> PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor] | torch.Tensor:
+    ) -> MU.PrismTTSGenerationOutput | tuple[torch.LongTensor, torch.FloatTensor] | torch.Tensor:
         """
         End-to-end generation from raw text/audio-like inputs.
 
@@ -1421,8 +1394,8 @@ class PrismTTS(nn.Module):
         if output_type_normalized not in ("tensor", "speech"):
             raise ValueError("output_type must be one of {'tensor', 'speech'}.")
 
-        prompt_text_list = normalize_raw_text_batch(raw_text_prompt, "raw_text_prompt")
-        target_text_list = normalize_raw_text_batch(raw_text_target, "raw_text_target")
+        prompt_text_list = MU.normalize_raw_text_batch(raw_text_prompt, "raw_text_prompt")
+        target_text_list = MU.normalize_raw_text_batch(raw_text_target, "raw_text_target")
 
         if isinstance(raw_speech_prompt, list):
             speech_prompt_list = list(raw_speech_prompt)
@@ -1461,7 +1434,7 @@ class PrismTTS(nn.Module):
         needs_default_mimi_encoder = speech_encoder is None
         needs_default_mimi_decoder = speech_decoder is None
         if needs_default_mimi_encoder:
-            speech_encoder = build_default_mimi_speech_encoder(
+            speech_encoder = MU.build_default_mimi_speech_encoder(
                 num_discrete_tokens=int(self.num_discrete_tokens),
                 device=device,
                 continuous_dtype=continuous_dtype,
@@ -1473,7 +1446,7 @@ class PrismTTS(nn.Module):
             )
 
         if needs_default_mimi_decoder:
-            speech_decoder = build_lazy_mimi_speech_decoder(
+            speech_decoder = MU.build_lazy_mimi_speech_decoder(
                 device=device,
                 continuous_dtype=continuous_dtype,
                 mimi_model_name_or_path=mimi_model_name_or_path,

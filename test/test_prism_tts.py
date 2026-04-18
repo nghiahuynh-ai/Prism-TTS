@@ -257,7 +257,7 @@ class TestPrismTTS(unittest.TestCase):
         flat_batch = collate(samples)
 
         captured_ratios: list[float] = []
-        original_sampler = prism_tts_module.sample_masked_target_blocks
+        original_sampler = prism_tts_module.MU.sample_masked_target_blocks
 
         def _capture_ratio(
             target_block_counts: torch.LongTensor,
@@ -271,7 +271,7 @@ class TestPrismTTS(unittest.TestCase):
                 masked_target_blocks=masked_target_blocks,
             )
 
-        prism_tts_module.sample_masked_target_blocks = _capture_ratio
+        prism_tts_module.MU.sample_masked_target_blocks = _capture_ratio
         try:
             self.model(
                 flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
@@ -294,7 +294,7 @@ class TestPrismTTS(unittest.TestCase):
                 return_dict=True,
             )
         finally:
-            prism_tts_module.sample_masked_target_blocks = original_sampler
+            prism_tts_module.MU.sample_masked_target_blocks = original_sampler
 
         self.assertEqual(len(captured_ratios), 2)
         for ratio in captured_ratios:
