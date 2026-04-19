@@ -244,7 +244,7 @@ class PrismTTS(nn.Module):
         token_ids: torch.LongTensor,
         masked_discrete_positions: torch.BoolTensor,
     ) -> tuple[torch.Tensor, torch.FloatTensor]:
-        """Compute plain CE loss on masked discrete tokens and return selected logits."""
+        """Compute weighted CE on masked discrete tokens and return selected logits."""
         if not masked_discrete_positions.any():
             zero = hidden_states.new_zeros(())
             empty_logits = hidden_states.new_zeros((0, self.discrete_vocab_size))
@@ -253,7 +253,39 @@ class PrismTTS(nn.Module):
         selected_hidden = hidden_states[masked_discrete_positions]
         selected_targets = token_ids[masked_discrete_positions]
         selected_logits = self.discrete_lm_head(selected_hidden)
-        loss = F.cross_entropy(selected_logits, selected_targets)
+        per_token_loss = F.cross_entropy(
+            selected_logits,
+            selected_targets,
+            reduction="none",
+        )
+
+        token_weights = torch.full_like(
+            per_token_loss,
+            fill_value=self.discrete_regular_token_loss_weight,
+            dtype=per_token_loss.dtype,
+        )
+        if (
+            self.discrete_special_token_loss_weight != self.discrete_regular_token_loss_weight
+            and len(self.training_special_discrete_token_ids) > 0
+        ):
+            special_ids = torch.tensor(
+                self.training_special_discrete_token_ids,
+                dtype=selected_targets.dtype,
+                device=selected_targets.device,
+            )
+            special_mask = torch.isin(selected_targets, special_ids)
+            token_weights = torch.where(
+                special_mask,
+                token_weights.new_full(
+                    token_weights.shape,
+                    self.discrete_special_token_loss_weight,
+                ),
+                token_weights,
+            )
+
+        weighted_loss = per_token_loss * token_weights
+        normalizer = token_weights.sum().clamp_min(1e-12)
+        loss = weighted_loss.sum() / normalizer
         return loss, selected_logits
 
     def _compute_continuous_losses(

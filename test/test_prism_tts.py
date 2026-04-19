@@ -866,6 +866,77 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 return_dict=True,
             )
 
+    def test_discrete_loss_applies_special_token_weight(self) -> None:
+        model = PrismTTS(
+            llama_config=make_small_config(),
+            num_discrete_tokens=1,
+            discrete_vocab_size=16,
+            continuous_latent_size=8,
+            discrete_regular_token_loss_weight=1.0,
+            discrete_special_token_loss_weight=0.05,
+            flow_sample_steps=2,
+        ).to(self.device)
+        model.eval()
+
+        self.assertGreater(len(model.training_special_discrete_token_ids), 0)
+        special_id = int(model.training_special_discrete_token_ids[0])
+        regular_id = 1 if special_id != 1 else 2
+
+        hidden_states = torch.zeros(1, 4, model.hidden_size, device=self.device)
+        token_ids = torch.tensor(
+            [[regular_id, special_id, regular_id, regular_id]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        masked_positions = torch.tensor(
+            [[True, True, True, False]],
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        fixed_logits = torch.zeros(
+            3,
+            model.discrete_vocab_size,
+            dtype=hidden_states.dtype,
+            device=self.device,
+        )
+        fixed_logits[0, regular_id] = 4.0
+        fixed_logits[1, regular_id] = 4.0
+        fixed_logits[2, regular_id] = 1.0
+
+        class _FixedHead(torch.nn.Module):
+            def __init__(self, logits: torch.Tensor) -> None:
+                super().__init__()
+                self.register_buffer("logits", logits)
+
+            def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+                if hidden.shape[0] != self.logits.shape[0]:
+                    raise AssertionError("Unexpected hidden batch size in fixed head.")
+                return self.logits
+
+        model.discrete_lm_head = _FixedHead(fixed_logits)
+        loss, logits_out = model._compute_discrete_loss(
+            hidden_states=hidden_states,
+            token_ids=token_ids,
+            masked_discrete_positions=masked_positions,
+        )
+
+        selected_targets = token_ids[masked_positions]
+        per_token_loss = torch.nn.functional.cross_entropy(
+            fixed_logits,
+            selected_targets,
+            reduction="none",
+        )
+        expected_weights = torch.tensor(
+            [1.0, 0.05, 1.0],
+            dtype=per_token_loss.dtype,
+            device=per_token_loss.device,
+        )
+        expected_loss = (per_token_loss * expected_weights).sum() / expected_weights.sum()
+
+        self.assertTrue(torch.allclose(logits_out, fixed_logits, atol=0.0, rtol=0.0))
+        self.assertTrue(torch.allclose(loss, expected_loss, atol=1e-7, rtol=1e-6))
+
     def test_generate_e2e_accepts_string_and_raw_speech_prompt(self) -> None:
         eos_id = int(
             resolve_generation_discrete_eos_token_id(
