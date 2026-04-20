@@ -859,6 +859,7 @@ class PrismTTSLightning(pl.LightningModule):
                 "sample_id",
                 "generation_method",
                 "groundtruth_audio",
+                "prior_audio",
                 "predicted_audio",
             ]
         )
@@ -869,6 +870,12 @@ class PrismTTSLightning(pl.LightningModule):
             method = str(row["generation_method"])
             target_audio = np.asarray(row["target_audio"], dtype=np.float32)
             pred_audio = np.asarray(row["predicted_audio"], dtype=np.float32)
+            prior_audio_raw = row.get("prior_audio")
+            prior_audio = (
+                None
+                if prior_audio_raw is None
+                else np.asarray(prior_audio_raw, dtype=np.float32)
+            )
             table.add_data(
                 step,
                 sample_source,
@@ -880,6 +887,17 @@ class PrismTTSLightning(pl.LightningModule):
                     caption=(
                         f"{sample_source}_groundtruth_step_{step}_sample_{sample_idx}"
                     ),
+                ),
+                (
+                    None
+                    if prior_audio is None
+                    else wandb.Audio(
+                        prior_audio,
+                        sample_rate=self.audio_sample_rate,
+                        caption=(
+                            f"{sample_source}_{method}_prior_step_{step}_sample_{sample_idx}"
+                        ),
+                    )
                 ),
                 wandb.Audio(
                     pred_audio,
@@ -915,6 +933,7 @@ class PrismTTSLightning(pl.LightningModule):
                 "sample_id",
                 "generation_method",
                 "groundtruth_mel_spectrogram",
+                "prior_mel_spectrogram",
                 "predicted_mel_spectrogram",
             ]
         )
@@ -926,12 +945,27 @@ class PrismTTSLightning(pl.LightningModule):
             method = str(row["generation_method"])
             target_audio = np.asarray(row["target_audio"], dtype=np.float32)
             pred_audio = np.asarray(row["predicted_audio"], dtype=np.float32)
+            prior_audio_raw = row.get("prior_audio")
+            prior_audio = (
+                None
+                if prior_audio_raw is None
+                else np.asarray(prior_audio_raw, dtype=np.float32)
+            )
             target_mel = self._build_mel_spectrogram_image(
                 target_audio,
                 title=(
                     f"Groundtruth Mel ({sample_source}, sample {sample_idx}, step {step})"
                 ),
             )
+            prior_mel = None
+            if prior_audio is not None:
+                prior_mel = self._build_mel_spectrogram_image(
+                    prior_audio,
+                    title=(
+                        "Prior Mel "
+                        f"({sample_source}, {method}, sample {sample_idx}, step {step})"
+                    ),
+                )
             pred_mel = self._build_mel_spectrogram_image(
                 pred_audio,
                 title=(
@@ -948,6 +982,7 @@ class PrismTTSLightning(pl.LightningModule):
                 sample_idx,
                 method,
                 target_mel,
+                prior_mel,
                 pred_mel,
             )
             added += 1
@@ -1012,7 +1047,9 @@ class PrismTTSLightning(pl.LightningModule):
                 continuous_latent_size=self.model.continuous_latent_size,
             )
 
-            normalized_generations: list[tuple[str, torch.FloatTensor]] = []
+            normalized_generations: list[
+                tuple[str, torch.FloatTensor, Optional[torch.FloatTensor]]
+            ] = []
             for method_name, generation in generations.items():
                 continuous = generation.continuous_latents
                 if continuous is None:
@@ -1023,7 +1060,15 @@ class PrismTTSLightning(pl.LightningModule):
                     name=f"generation[{method_name}].continuous_latents",
                     continuous_latent_size=self.model.continuous_latent_size,
                 )
-                normalized_generations.append((str(method_name), normalized))
+                normalized_prior: Optional[torch.FloatTensor] = None
+                if generation.prior_latents is not None:
+                    normalized_prior = normalize_continuous_latents(
+                        generation.prior_latents,
+                        expected_len=generation.prior_latents.shape[1],
+                        name=f"generation[{method_name}].prior_latents",
+                        continuous_latent_size=self.model.continuous_latent_size,
+                    )
+                normalized_generations.append((str(method_name), normalized, normalized_prior))
             if not normalized_generations:
                 continue
 
@@ -1040,15 +1085,17 @@ class PrismTTSLightning(pl.LightningModule):
             if sample_target_len < 1:
                 continue
 
-            for method, pred_continuous in normalized_generations:
+            for method, pred_continuous, prior_continuous in normalized_generations:
                 if int(pred_continuous.shape[0]) < 1:
                     continue
-                sample_pred_len = min(sample_target_len, int(pred_continuous.shape[1]))
-                if sample_pred_len < 1:
+                sample_eval_len = min(sample_target_len, int(pred_continuous.shape[1]))
+                if prior_continuous is not None:
+                    sample_eval_len = min(sample_eval_len, int(prior_continuous.shape[1]))
+                if sample_eval_len < 1:
                     continue
 
-                sample_target_continuous = target_continuous[0, :sample_pred_len, :]
-                sample_pred_continuous = pred_continuous[0, :sample_pred_len, :]
+                sample_target_continuous = target_continuous[0, :sample_eval_len, :]
+                sample_pred_continuous = pred_continuous[0, :sample_eval_len, :]
                 target_audio = LU.decode_audio(
                     sample_target_continuous,
                     audio_decoder=self.audio_decoder,
@@ -1059,6 +1106,13 @@ class PrismTTSLightning(pl.LightningModule):
                 )
                 if target_audio is None or pred_audio is None:
                     continue
+                prior_audio = None
+                if prior_continuous is not None:
+                    sample_prior_continuous = prior_continuous[0, :sample_eval_len, :]
+                    prior_audio = LU.decode_audio(
+                        sample_prior_continuous,
+                        audio_decoder=self.audio_decoder,
+                    )
 
                 rows.append(
                     {
@@ -1066,6 +1120,7 @@ class PrismTTSLightning(pl.LightningModule):
                         "sample_id": sample_idx,
                         "generation_method": method,
                         "target_audio": target_audio,
+                        "prior_audio": prior_audio,
                         "predicted_audio": pred_audio,
                     }
                 )

@@ -42,6 +42,7 @@ class PrismTTSGenerationOutput(ModelOutput):
     text_ids: Optional[torch.LongTensor] = None
     discrete_ids: Optional[torch.LongTensor] = None
     continuous_latents: Optional[torch.FloatTensor] = None
+    prior_latents: Optional[torch.FloatTensor] = None
     discrete_logits: Optional[tuple[torch.Tensor, ...]] = None
 
 

@@ -343,6 +343,10 @@ class TestPrismTTS(unittest.TestCase):
             outputs.continuous_latents.shape,
             (batch_size, generated_len, self.continuous_latent_size),
         )
+        self.assertEqual(
+            outputs.prior_latents.shape,
+            (batch_size, generated_len, self.continuous_latent_size),
+        )
         self.assertEqual(len(outputs.discrete_logits), max(0, generated_len - 1))
         self.assertEqual(
             outputs.discrete_logits[0].shape,
@@ -424,6 +428,14 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             torch.allclose(
                 full_outputs.continuous_latents,
                 second_outputs.continuous_latents,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                full_outputs.prior_latents,
+                second_outputs.prior_latents,
                 atol=1e-5,
                 rtol=1e-5,
             )
@@ -578,6 +590,10 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             outputs.continuous_latents.shape,
             (batch_size, generated_len, self.continuous_latent_size),
         )
+        self.assertEqual(
+            outputs.prior_latents.shape,
+            (batch_size, generated_len, self.continuous_latent_size),
+        )
         self.assertGreaterEqual(len(outputs.discrete_logits), 1)
 
     def test_generate_parallel_stable_returns_expected_shapes(self) -> None:
@@ -632,6 +648,10 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         )
         self.assertEqual(
             outputs.continuous_latents.shape,
+            (batch_size, generated_len, self.continuous_latent_size),
+        )
+        self.assertEqual(
+            outputs.prior_latents.shape,
             (batch_size, generated_len, self.continuous_latent_size),
         )
         self.assertGreaterEqual(len(outputs.discrete_logits), 1)

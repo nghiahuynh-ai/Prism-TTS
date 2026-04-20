@@ -665,6 +665,7 @@ class PrismTTS(nn.Module):
                 text_ids=text_ids_out,
                 discrete_ids=empty_disc,
                 continuous_latents=empty_cont,
+                prior_latents=empty_cont,
                 discrete_logits=tuple(),
             )
 
@@ -692,6 +693,7 @@ class PrismTTS(nn.Module):
         (
             predicted_discrete,
             predicted_continuous,
+            predicted_prior,
             generated_lengths,
             collected_logits,
         ) = generation_fn(
@@ -716,6 +718,7 @@ class PrismTTS(nn.Module):
         final_target = int(generated_lengths.max().item()) if batch_size > 0 else 0
         predicted_discrete = predicted_discrete[:, :final_target, :]
         predicted_continuous = predicted_continuous[:, :final_target, :]
+        predicted_prior = predicted_prior[:, :final_target, :]
 
         if not return_dict:
             return predicted_discrete.transpose(1, 2).contiguous(), predicted_continuous
@@ -723,6 +726,7 @@ class PrismTTS(nn.Module):
             text_ids=text_ids_out,
             discrete_ids=predicted_discrete.transpose(1, 2).contiguous(),
             continuous_latents=predicted_continuous,
+            prior_latents=predicted_prior,
             discrete_logits=tuple(collected_logits),
         )
 
@@ -749,6 +753,7 @@ class PrismTTS(nn.Module):
     ) -> tuple[
         torch.LongTensor,
         torch.FloatTensor,
+        torch.FloatTensor,
         torch.LongTensor,
         list[torch.Tensor],
     ]:
@@ -771,6 +776,9 @@ class PrismTTS(nn.Module):
         predicted_continuous = continuous_prompt.new_zeros(
             (batch_size, max_target, self.continuous_latent_size)
         )
+        predicted_prior = continuous_prompt.new_zeros(
+            (batch_size, max_target, self.continuous_latent_size)
+        )
         generated_lengths = torch.zeros(
             batch_size,
             dtype=torch.long,
@@ -778,7 +786,13 @@ class PrismTTS(nn.Module):
         )
         collected_logits: list[torch.Tensor] = []
         if max_target <= 0:
-            return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
+            return (
+                predicted_discrete,
+                predicted_continuous,
+                predicted_prior,
+                generated_lengths,
+                collected_logits,
+            )
 
         valid_target_mask = (
             torch.arange(max_target, device=device).unsqueeze(0)
@@ -875,6 +889,7 @@ class PrismTTS(nn.Module):
                 )
                 continuous_batch_idx = batch_indices[step_continuous_positions]
                 predicted_continuous[continuous_batch_idx, step_idx, :] = sampled_continuous
+                predicted_prior[continuous_batch_idx, step_idx, :] = prior_prediction
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = predicted_discrete[continuous_batch_idx, step_idx, :]
@@ -898,7 +913,13 @@ class PrismTTS(nn.Module):
             collected_logits.append(step_logits)
 
         generated_lengths = speech_target_lengths.clone()
-        return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
+        return (
+            predicted_discrete,
+            predicted_continuous,
+            predicted_prior,
+            generated_lengths,
+            collected_logits,
+        )
 
     @torch.no_grad()
     def generate_parallel(
@@ -922,6 +943,7 @@ class PrismTTS(nn.Module):
         special_discrete_token_ids: tuple[int, ...],
     ) -> tuple[
         torch.LongTensor,
+        torch.FloatTensor,
         torch.FloatTensor,
         torch.LongTensor,
         list[torch.Tensor],
@@ -950,10 +972,14 @@ class PrismTTS(nn.Module):
         predicted_continuous = continuous_prompt.new_zeros(
             (batch_size, max_target, self.continuous_latent_size)
         )
+        predicted_prior = continuous_prompt.new_zeros(
+            (batch_size, max_target, self.continuous_latent_size)
+        )
         if max_target <= 0:
             return (
                 predicted_discrete,
                 predicted_continuous,
+                predicted_prior,
                 speech_target_lengths.new_zeros(batch_size),
                 [],
             )
@@ -1090,6 +1116,7 @@ class PrismTTS(nn.Module):
                 continuous_batch_idx = batch_indices[masked_continuous_positions]
                 continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
                 predicted_continuous[continuous_batch_idx, continuous_block_idx, :] = sampled_continuous
+                predicted_prior[continuous_batch_idx, continuous_block_idx, :] = prior_prediction
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = predicted_discrete[continuous_batch_idx, continuous_block_idx, :]
@@ -1134,7 +1161,13 @@ class PrismTTS(nn.Module):
             masked_blocks = next_masked_blocks & maskable_target_mask
 
         generated_lengths = speech_target_lengths.clone()
-        return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
+        return (
+            predicted_discrete,
+            predicted_continuous,
+            predicted_prior,
+            generated_lengths,
+            collected_logits,
+        )
 
     @torch.no_grad()
     def generate_parallel_stable(
@@ -1158,6 +1191,7 @@ class PrismTTS(nn.Module):
         special_discrete_token_ids: tuple[int, ...],
     ) -> tuple[
         torch.LongTensor,
+        torch.FloatTensor,
         torch.FloatTensor,
         torch.LongTensor,
         list[torch.Tensor],
@@ -1186,10 +1220,14 @@ class PrismTTS(nn.Module):
         predicted_continuous = continuous_prompt.new_zeros(
             (batch_size, max_target, self.continuous_latent_size)
         )
+        predicted_prior = continuous_prompt.new_zeros(
+            (batch_size, max_target, self.continuous_latent_size)
+        )
         if max_target <= 0:
             return (
                 predicted_discrete,
                 predicted_continuous,
+                predicted_prior,
                 speech_target_lengths.new_zeros(batch_size),
                 [],
             )
@@ -1257,6 +1295,7 @@ class PrismTTS(nn.Module):
 
             candidate_discrete = predicted_discrete.clone()
             candidate_continuous = predicted_continuous.clone()
+            candidate_prior = predicted_prior.clone()
             block_conf_sum = torch.zeros((batch_size, max_target), dtype=torch.float32, device=device)
             block_conf_count = torch.zeros((batch_size, max_target), dtype=torch.float32, device=device)
 
@@ -1312,6 +1351,7 @@ class PrismTTS(nn.Module):
                 continuous_batch_idx = batch_indices[masked_continuous_positions]
                 continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
                 candidate_continuous[continuous_batch_idx, continuous_block_idx, :] = sampled_continuous
+                candidate_prior[continuous_batch_idx, continuous_block_idx, :] = prior_prediction
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = candidate_discrete[continuous_batch_idx, continuous_block_idx, :]
@@ -1378,12 +1418,21 @@ class PrismTTS(nn.Module):
                 predicted_continuous[sample_idx, selected_blocks, :] = candidate_continuous[
                     sample_idx, selected_blocks, :
                 ]
+                predicted_prior[sample_idx, selected_blocks, :] = candidate_prior[
+                    sample_idx, selected_blocks, :
+                ]
                 next_masked_blocks[sample_idx, selected_blocks] = False
 
             masked_blocks = next_masked_blocks & maskable_target_mask
 
         generated_lengths = speech_target_lengths.clone()
-        return predicted_discrete, predicted_continuous, generated_lengths, collected_logits
+        return (
+            predicted_discrete,
+            predicted_continuous,
+            predicted_prior,
+            generated_lengths,
+            collected_logits,
+        )
 
 
     @torch.no_grad()
