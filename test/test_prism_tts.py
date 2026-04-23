@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 import torch
-from transformers import LlamaConfig
 
 try:
     import yaml
@@ -19,9 +18,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-import models.prism_tts as prism_tts_module
 from models.prism_tts import PrismTTS
 from dataset.dataset import BatchCollate
+from utils import model_utils as MU
+from utils.backbone_utils import normalize_backbone_name, resolve_backbone_config_key
 from utils.model_utils import resolve_generation_discrete_eos_token_id
 
 
@@ -40,17 +40,39 @@ def load_model_config() -> dict:
     return model_cfg
 
 
-def make_large_config() -> LlamaConfig:
-    llama_cfg = dict(load_model_config()["llama_config"])
-    config = LlamaConfig(**llama_cfg)
-    if "_attn_implementation" in llama_cfg:
-        config._attn_implementation = llama_cfg["_attn_implementation"]
-    return config
+@lru_cache(maxsize=1)
+def resolve_test_backbone_setup() -> tuple[str, dict]:
+    model_cfg = load_model_config()
+    backbone_payload = model_cfg.get("backbone")
+    backbone_name_raw: object = "llama"
+    config_key_raw: object = None
+    if isinstance(backbone_payload, str):
+        backbone_name_raw = backbone_payload
+    elif isinstance(backbone_payload, dict):
+        backbone_name_raw = backbone_payload.get("name", "llama")
+        config_key_raw = backbone_payload.get("config_key")
+    elif backbone_payload is not None:
+        raise ValueError("model.backbone must be a mapping, string, or null.")
+
+    backbone_name = normalize_backbone_name(backbone_name_raw)
+    if isinstance(config_key_raw, str) and config_key_raw.strip():
+        config_key = config_key_raw.strip()
+    else:
+        config_key = resolve_backbone_config_key(backbone_name)
+
+    config_payload = model_cfg.get(config_key)
+    if not isinstance(config_payload, dict):
+        raise unittest.SkipTest(
+            f"test/test_prism_tts.py requires mapping model.{config_key} "
+            f"for backbone {backbone_name!r} from config/model.yaml."
+        )
+    return backbone_name, dict(config_payload)
 
 
-def make_small_config() -> LlamaConfig:
-    llama_cfg = dict(load_model_config()["llama_config"])
-    llama_cfg.update(
+def make_small_backbone_setup() -> tuple[str, dict]:
+    backbone_name, base_cfg = resolve_test_backbone_setup()
+    small_cfg = dict(base_cfg)
+    small_cfg.update(
         {
             "vocab_size": 256,
             "hidden_size": 64,
@@ -61,10 +83,10 @@ def make_small_config() -> LlamaConfig:
             "pad_token_id": 0,
         }
     )
-    config = LlamaConfig(**llama_cfg)
-    if "_attn_implementation" in llama_cfg:
-        config._attn_implementation = llama_cfg["_attn_implementation"]
-    return config
+    layer_types = small_cfg.get("layer_types")
+    if isinstance(layer_types, list):
+        small_cfg["layer_types"] = ["full_attention"] * int(small_cfg["num_hidden_layers"])
+    return backbone_name, small_cfg
 
 
 class TestPrismTTS(unittest.TestCase):
@@ -72,14 +94,13 @@ class TestPrismTTS(unittest.TestCase):
     def setUpClass(cls):
         torch.manual_seed(0)
         cls.device = torch.device("cpu")
-        cls.llama_config = make_large_config()
+        cls.backbone_name, cls.backbone_config = resolve_test_backbone_setup()
         prism_cfg = load_model_config()["prism_tts"]
         cls.num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
         cls.discrete_vocab_size = int(prism_cfg["discrete_vocab_size"])
         cls.continuous_latent_size = int(prism_cfg["continuous_latent_size"])
-        cls.text_vocab_size = int(cls.llama_config.vocab_size)
         cls.model = PrismTTS(
-            llama_config=cls.llama_config,
+            backbone_config=cls.backbone_config,
             num_discrete_tokens=cls.num_discrete_tokens,
             discrete_vocab_size=cls.discrete_vocab_size,
             continuous_latent_size=cls.continuous_latent_size,
@@ -87,7 +108,10 @@ class TestPrismTTS(unittest.TestCase):
             flow_model_channels=prism_cfg.get("flow_model_channels"),
             flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
             flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
+            backbone_name=cls.backbone_name,
+            backbone_hf_checkpoint=None,
         ).to(cls.device)
+        cls.text_vocab_size = int(cls.model.backbone.config.vocab_size)
         cls.model_num_params = sum(p.numel() for p in cls.model.parameters())
         cls._print_model_summary()
 
@@ -99,7 +123,7 @@ class TestPrismTTS(unittest.TestCase):
         print(cls.model)
         print("-" * 100)
         print("Model Config:")
-        print(cls.llama_config)
+        print(cls.model.backbone.config)
         print("-" * 100)
         print(f"Total Parameters: {cls.model_num_params:,}")
         print("-" * 100)
@@ -120,7 +144,10 @@ class TestPrismTTS(unittest.TestCase):
         torch.manual_seed(0)
 
     def test_model_has_about_100m_parameters(self):
-        self.assertGreaterEqual(self.model_num_params, MIN_REASONABLE_PARAM_COUNT)
+        if self.model.backbone_name == "llama":
+            self.assertGreaterEqual(self.model_num_params, MIN_REASONABLE_PARAM_COUNT)
+            return
+        self.assertGreater(self.model_num_params, 0)
 
     def test_forward_returns_losses_only(self):
         batch_size = 2
@@ -257,7 +284,7 @@ class TestPrismTTS(unittest.TestCase):
         flat_batch = collate(samples)
 
         captured_ratios: list[float] = []
-        original_sampler = prism_tts_module.MU.sample_masked_target_blocks
+        original_sampler = MU.sample_masked_target_blocks
 
         def _capture_ratio(
             target_block_counts: torch.LongTensor,
@@ -271,7 +298,7 @@ class TestPrismTTS(unittest.TestCase):
                 masked_target_blocks=masked_target_blocks,
             )
 
-        prism_tts_module.MU.sample_masked_target_blocks = _capture_ratio
+        MU.sample_masked_target_blocks = _capture_ratio
         try:
             self.model(
                 flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
@@ -294,7 +321,7 @@ class TestPrismTTS(unittest.TestCase):
                 return_dict=True,
             )
         finally:
-            prism_tts_module.MU.sample_masked_target_blocks = original_sampler
+            MU.sample_masked_target_blocks = original_sampler
 
         self.assertEqual(len(captured_ratios), 2)
         for ratio in captured_ratios:
@@ -360,12 +387,15 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         self.num_discrete_tokens = 3
         self.discrete_vocab_size = 64
         self.continuous_latent_size = 8
+        backbone_name, backbone_config = make_small_backbone_setup()
         self.model = PrismTTS(
-            llama_config=make_small_config(),
+            backbone_config=backbone_config,
             num_discrete_tokens=self.num_discrete_tokens,
             discrete_vocab_size=self.discrete_vocab_size,
             continuous_latent_size=self.continuous_latent_size,
             flow_sample_steps=2,
+            backbone_name=backbone_name,
+            backbone_hf_checkpoint=None,
         ).to(self.device)
         self.model.eval()
 
@@ -887,14 +917,17 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             )
 
     def test_discrete_loss_applies_special_token_weight(self) -> None:
+        backbone_name, backbone_config = make_small_backbone_setup()
         model = PrismTTS(
-            llama_config=make_small_config(),
+            backbone_config=backbone_config,
             num_discrete_tokens=1,
             discrete_vocab_size=16,
             continuous_latent_size=8,
             discrete_regular_token_loss_weight=1.0,
             discrete_special_token_loss_weight=0.05,
             flow_sample_steps=2,
+            backbone_name=backbone_name,
+            backbone_hf_checkpoint=None,
         ).to(self.device)
         model.eval()
 

@@ -111,6 +111,80 @@ class SharedVocabTokenizer:
         return token_ids
 
 
+def _coerce_token_id_sequence(token_ids: Any) -> list[int]:
+    if torch.is_tensor(token_ids):
+        token_ids = token_ids.detach().to(device="cpu", dtype=torch.long).tolist()
+    elif isinstance(token_ids, np.ndarray):
+        token_ids = token_ids.tolist()
+
+    if isinstance(token_ids, (str, bytes)):
+        raise ValueError("Tokenizer returned text instead of token ids.")
+    if not isinstance(token_ids, Sequence):
+        raise ValueError(f"Tokenizer output must be a sequence, got {type(token_ids).__name__}.")
+
+    values = list(token_ids)
+    if values and isinstance(values[0], Sequence) and not isinstance(values[0], (str, bytes)):
+        if len(values) != 1:
+            raise ValueError(
+                "Tokenizer returned batched token ids; expected a single sequence for one input string."
+            )
+        values = list(values[0])
+    return [int(token_id) for token_id in values]
+
+
+def tokenize_with_external_tokenizer(tokenizer: Any, text: str) -> list[int]:
+    """
+    Tokenize text using an external tokenizer object/callable.
+
+    Supports Hugging Face tokenizers and lightweight callable tokenizers that
+    return token-id sequences directly.
+    """
+    if hasattr(tokenizer, "encode"):
+        try:
+            encoded = tokenizer.encode(text, add_special_tokens=False)
+        except TypeError:
+            encoded = tokenizer.encode(text)
+        return _coerce_token_id_sequence(encoded)
+
+    try:
+        encoded = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+    except TypeError:
+        encoded = tokenizer(text)
+
+    if isinstance(encoded, Mapping):
+        if "input_ids" not in encoded:
+            raise ValueError("Tokenizer mapping output must include 'input_ids'.")
+        return _coerce_token_id_sequence(encoded["input_ids"])
+    return _coerce_token_id_sequence(encoded)
+
+
+class BackboneTextTokenizer:
+    """
+    Adapter around pretrained backbone tokenizers used for text tokenization.
+    """
+
+    def __init__(self, tokenizer: Any, append_eos: bool = False) -> None:
+        self.tokenizer = tokenizer
+        self.append_eos = bool(append_eos)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        self.eos_token_id = None if eos_token_id is None else int(eos_token_id)
+
+    def __call__(self, text: str) -> list[int]:
+        token_ids = tokenize_with_external_tokenizer(self.tokenizer, text)
+        if self.append_eos:
+            if self.eos_token_id is None:
+                raise ValueError(
+                    "append_eos_to_text=True requires tokenizer.eos_token_id for backbone tokenizers."
+                )
+            token_ids.append(self.eos_token_id)
+        return token_ids
+
+
 @dataclass(frozen=True)
 class ManifestEntry:
     file_name: str
@@ -135,7 +209,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
     - discrete_token_count: EOT
     - discrete_token_count + 1: EOS
     - discrete_token_count + 2: PAD
-    - [discrete_token_count + 3, ...]: text tokens from vocab.txt
+    - default text tokenizer (`SharedVocabTokenizer`) uses ids >= discrete_token_count + 3.
+      When an external text tokenizer is provided (e.g. Gemma/Qwen checkpoint tokenizer),
+      text ids follow that tokenizer's native id space.
 
     Each NPY file must contain:
     - discrete: int array, shape [L, N]
@@ -152,6 +228,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         discrete_stream_count: int | None = None,
         continuous_feature_dim: int | None = None,
         append_eos_to_text: bool = False,
+        text_tokenizer: Any | None = None,
         cache_npy: bool = False,
         cache_npz: bool | None = None,
     ) -> None:
@@ -168,12 +245,19 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             if vocab_path is not None
             else Path(__file__).resolve().parent / "vocab.txt"
         )
-        self.tokenizer = SharedVocabTokenizer(
+        self.codec_tokenizer = SharedVocabTokenizer(
             vocab_path=resolved_vocab_path,
             text_token_offset=self.text_token_offset,
             eos_token_id=self.eos_token_id,
             append_eos=append_eos_to_text,
         )
+        if text_tokenizer is None:
+            self.tokenizer = self.codec_tokenizer
+        else:
+            self.tokenizer = BackboneTextTokenizer(
+                tokenizer=text_tokenizer,
+                append_eos=append_eos_to_text,
+            )
         self.vocab_path = resolved_vocab_path
 
         if cache_npz is not None:
@@ -360,10 +444,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             discrete_max = int(discrete.max().item())
             if discrete_min < 0 or discrete_max >= self.text_token_offset:
                 raise ValueError(
-                    "Discrete ids must be within shared discrete/special range "
+                    "Discrete ids must stay within shared codec range "
                     f"[0, {self.text_token_offset - 1}], got min={discrete_min}, "
-                    f"max={discrete_max} in {npy_path}. "
-                    "Text ids start from text_token_offset."
+                    f"max={discrete_max} in {npy_path}."
                 )
 
         if self.cache_npy:

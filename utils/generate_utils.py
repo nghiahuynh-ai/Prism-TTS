@@ -4,15 +4,15 @@ import math
 import warnings
 import wave
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import LlamaConfig
 
-from dataset.dataset import SharedVocabTokenizer
+from dataset.dataset import tokenize_with_external_tokenizer
 from models.prism_tts import PrismTTS
+from utils.backbone_utils import resolve_backbone_spec
 
 try:
     import yaml
@@ -83,14 +83,17 @@ def require_mapping(config: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def build_model(model_config: dict[str, Any]) -> PrismTTS:
+def build_model(model_config: dict[str, Any], *, hf_token: Optional[str] = None) -> PrismTTS:
     model_cfg = require_mapping(model_config, "model")
     prism_cfg = require_mapping(model_cfg, "prism_tts")
-    llama_cfg = dict(require_mapping(model_cfg, "llama_config"))
+    backbone_spec = resolve_backbone_spec(model_cfg)
+    backbone_cfg = dict(backbone_spec.config) if backbone_spec.config is not None else None
+    backbone_hf_kwargs = dict(backbone_spec.hf_kwargs)
+    if hf_token is not None and "token" not in backbone_hf_kwargs:
+        backbone_hf_kwargs["token"] = hf_token
 
-    llama_config = LlamaConfig(**llama_cfg)
     return PrismTTS(
-        llama_config=llama_config,
+        backbone_config=backbone_cfg,
         num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
         discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
         continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
@@ -106,6 +109,10 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
         ),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
         parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 64)),
+        backbone_name=backbone_spec.name,
+        backbone_hf_checkpoint=backbone_spec.hf_checkpoint,
+        backbone_hf_strict=backbone_spec.hf_strict,
+        backbone_hf_kwargs=backbone_hf_kwargs,
     )
 
 
@@ -556,11 +563,11 @@ def trim_latent_special_blocks(
     return latents[keep_start:keep_end]
 
 
-def safe_tokenize(tokenizer: SharedVocabTokenizer, text: str, field_name: str) -> torch.LongTensor:
-    token_ids = tokenizer(text)
+def safe_tokenize(tokenizer: Any, text: str, field_name: str) -> torch.LongTensor:
+    token_ids = tokenize_with_external_tokenizer(tokenizer, text)
     if len(token_ids) == 0 and text.strip() != "":
         warnings.warn(
-            f"{field_name} became empty after OOV filtering. Check dataset/vocab.txt coverage.",
+            f"{field_name} became empty after tokenization.",
             RuntimeWarning,
             stacklevel=2,
         )

@@ -19,12 +19,16 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-from transformers import LlamaConfig
 
 from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism_sample_lengths
 from dataset.dataset import BatchCollate, PrismDataset, build_shared_token_layout
 from models.prism_tts import PrismTTS
 from models.prism_tts_lightning import PrismTTSLightning
+from utils.backbone_utils import (
+    build_backbone_text_tokenizer,
+    resolve_backbone_spec,
+    should_use_checkpoint_text_tokenizer,
+)
 
 try:
     import lightning.pytorch as pl
@@ -378,7 +382,9 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
             )
 
     prism_cfg = _require_mapping(model_cfg, "prism_tts")
-    llama_cfg = _require_mapping(model_cfg, "llama_config")
+    backbone_spec = resolve_backbone_spec(model_cfg)
+    backbone_cfg = dict(backbone_spec.config) if backbone_spec.config is not None else None
+    backbone_cfg_path = f"model.{backbone_spec.config_key}"
     dataset_cfg = _require_mapping(data_cfg, "dataset")
 
     num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
@@ -428,21 +434,28 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
             "model.prism_tts.discrete_vocab_size is too small for shared token layout. "
             f"Need at least {text_offset}, got {discrete_vocab_size}."
         )
-    llama_vocab_size = int(llama_cfg["vocab_size"])
-    if discrete_vocab_size > llama_vocab_size:
+    uses_checkpoint_text_tokenizer = should_use_checkpoint_text_tokenizer(backbone_spec.name)
+    if uses_checkpoint_text_tokenizer and backbone_spec.hf_checkpoint is None:
         raise ValueError(
-            "model.prism_tts.discrete_vocab_size must be <= model.llama_config.vocab_size "
-            "because text and discrete embeddings are unified."
+            "Gemma/Qwen backbones require model.backbone.hf_checkpoint so text tokenization "
+            "can be inherited from the pretrained checkpoint."
         )
+    if backbone_cfg is not None:
+        backbone_vocab_size = int(backbone_cfg["vocab_size"])
+        if not uses_checkpoint_text_tokenizer and discrete_vocab_size > backbone_vocab_size:
+            raise ValueError(
+                f"model.prism_tts.discrete_vocab_size must be <= {backbone_cfg_path}.vocab_size "
+                "because text and discrete embeddings are unified."
+            )
 
-    if "pad_token_id" in llama_cfg and int(llama_cfg["pad_token_id"]) != pad_id:
-        raise ValueError(
-            f"model.llama_config.pad_token_id must equal data shared pad token id ({pad_id})."
-        )
-    if "eos_token_id" in llama_cfg and int(llama_cfg["eos_token_id"]) != eos_id:
-        raise ValueError(
-            f"model.llama_config.eos_token_id must equal data shared eos token id ({eos_id})."
-        )
+        if "pad_token_id" in backbone_cfg and int(backbone_cfg["pad_token_id"]) != pad_id:
+            raise ValueError(
+                f"{backbone_cfg_path}.pad_token_id must equal data shared pad token id ({pad_id})."
+            )
+        if "eos_token_id" in backbone_cfg and int(backbone_cfg["eos_token_id"]) != eos_id:
+            raise ValueError(
+                f"{backbone_cfg_path}.eos_token_id must equal data shared eos token id ({eos_id})."
+            )
 
 
 def _build_model(config: dict[str, Any]) -> PrismTTS:
@@ -452,25 +465,27 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         raise ValueError(f"Unsupported model.name={model_name!r}. Only 'prism_tts' is supported.")
 
     prism_cfg = _require_mapping(model_cfg, "prism_tts")
-    llama_cfg = dict(_require_mapping(model_cfg, "llama_config"))
-    attn_impl = str(llama_cfg.get("_attn_implementation", "eager")).lower()
-    force_eager = os.environ.get("PRISM_TTS_FORCE_EAGER_ATTN", "").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if torch.cuda.is_available() and attn_impl == "eager" and not force_eager:
-        llama_cfg["_attn_implementation"] = "sdpa"
-        print(
-            "[train.py] model.llama_config._attn_implementation='eager' detected on CUDA; "
-            "overriding to 'sdpa' to avoid eager-attention allocator instability. "
-            "Set PRISM_TTS_FORCE_EAGER_ATTN=true to keep eager."
-        )
-    llama_config = LlamaConfig(**llama_cfg)
+    backbone_spec = resolve_backbone_spec(model_cfg)
+    backbone_cfg = dict(backbone_spec.config) if backbone_spec.config is not None else None
+
+    if backbone_spec.name == "llama" and backbone_cfg is not None:
+        attn_impl = str(backbone_cfg.get("_attn_implementation", "eager")).lower()
+        force_eager = os.environ.get("PRISM_TTS_FORCE_EAGER_ATTN", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if torch.cuda.is_available() and attn_impl == "eager" and not force_eager:
+            backbone_cfg["_attn_implementation"] = "sdpa"
+            print(
+                f"[train.py] model.{backbone_spec.config_key}._attn_implementation='eager' "
+                "detected on CUDA; overriding to 'sdpa' to avoid eager-attention allocator "
+                "instability. Set PRISM_TTS_FORCE_EAGER_ATTN=true to keep eager."
+            )
 
     return PrismTTS(
-        llama_config=llama_config,
+        backbone_config=backbone_cfg,
         num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
         discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
         continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
@@ -486,6 +501,10 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         ),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
         parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 64)),
+        backbone_name=backbone_spec.name,
+        backbone_hf_checkpoint=backbone_spec.hf_checkpoint,
+        backbone_hf_strict=backbone_spec.hf_strict,
+        backbone_hf_kwargs=backbone_spec.hf_kwargs,
     )
 
 
@@ -731,6 +750,8 @@ def _build_data_objects(
     config: dict[str, Any],
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
     data_cfg = _require_mapping(config, "data")
+    model_cfg = _require_mapping(config, "model")
+    backbone_spec = resolve_backbone_spec(model_cfg)
     loader_cfg = _require_mapping(data_cfg, "loader")
     dataset_cfg = _require_mapping(data_cfg, "dataset")
     collate_cfg = _require_mapping(data_cfg, "collate")
@@ -747,6 +768,14 @@ def _build_data_objects(
         "append_eos_to_text": bool(dataset_cfg.get("append_eos_to_text", False)),
         "cache_npy": bool(dataset_cfg.get("cache_npy", False)),
     }
+    dataset_text_tokenizer = build_backbone_text_tokenizer(
+        backbone_name=backbone_spec.name,
+        backbone_hf_checkpoint=backbone_spec.hf_checkpoint,
+        backbone_hf_kwargs=backbone_spec.hf_kwargs,
+        require_checkpoint=should_use_checkpoint_text_tokenizer(backbone_spec.name),
+    )
+    if dataset_text_tokenizer is not None:
+        dataset_kwargs["text_tokenizer"] = dataset_text_tokenizer
 
     train_manifest = _optional_path(data_cfg.get("train_manifest"))
     if train_manifest is None:

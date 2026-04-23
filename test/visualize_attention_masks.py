@@ -89,7 +89,7 @@ def make_model(num_discrete_tokens: int) -> PrismTTS:
     )
     config._attn_implementation = "eager"
     return PrismTTS(
-        llama_config=config,
+        backbone_config=config,
         num_discrete_tokens=num_discrete_tokens,
         discrete_vocab_size=32,
         continuous_latent_size=8,

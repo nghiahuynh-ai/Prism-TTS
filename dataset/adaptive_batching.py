@@ -18,6 +18,13 @@ def _estimate_text_token_count(text: str, char_to_id: Mapping[str, int], append_
     return max(1, count)
 
 
+def _estimate_text_token_count_with_tokenizer(text: str, tokenizer: Any) -> int:
+    from dataset.dataset import tokenize_with_external_tokenizer
+
+    token_ids = tokenize_with_external_tokenizer(tokenizer, text)
+    return max(1, len(token_ids))
+
+
 def _estimate_discrete_length(duration_seconds: float, codec_frame_rate_hz: float) -> int:
     if not math.isfinite(duration_seconds) or duration_seconds <= 0.0:
         return 1
@@ -87,30 +94,44 @@ def estimate_prism_sample_lengths(
 
     entries = getattr(dataset, "_entries", None)
     tokenizer = getattr(dataset, "tokenizer", None)
-    if (
-        isinstance(entries, Sequence)
-        and len(entries) > 0
-        and tokenizer is not None
-        and hasattr(tokenizer, "char_to_id")
-    ):
-        char_to_id = getattr(tokenizer, "char_to_id")
-        append_eos = bool(getattr(tokenizer, "append_eos", False))
-        if not isinstance(char_to_id, Mapping):
-            raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
+    if isinstance(entries, Sequence) and len(entries) > 0:
+        char_to_id = None
+        append_eos = False
+        if tokenizer is not None and hasattr(tokenizer, "char_to_id"):
+            candidate_mapping = getattr(tokenizer, "char_to_id")
+            if not isinstance(candidate_mapping, Mapping):
+                raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
+            char_to_id = candidate_mapping
+            append_eos = bool(getattr(tokenizer, "append_eos", False))
         num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
 
         lengths: list[int] = []
         for entry in entries:
-            text_prompt_len = _estimate_text_token_count(
-                str(getattr(entry, "prompt_transcript")),
-                char_to_id=char_to_id,
-                append_eos=append_eos,
-            )
-            text_target_len = _estimate_text_token_count(
-                str(getattr(entry, "transcript")),
-                char_to_id=char_to_id,
-                append_eos=append_eos,
-            )
+            prompt_transcript = str(getattr(entry, "prompt_transcript"))
+            target_transcript = str(getattr(entry, "transcript"))
+            if char_to_id is not None:
+                text_prompt_len = _estimate_text_token_count(
+                    prompt_transcript,
+                    char_to_id=char_to_id,
+                    append_eos=append_eos,
+                )
+                text_target_len = _estimate_text_token_count(
+                    target_transcript,
+                    char_to_id=char_to_id,
+                    append_eos=append_eos,
+                )
+            elif tokenizer is not None:
+                text_prompt_len = _estimate_text_token_count_with_tokenizer(
+                    prompt_transcript,
+                    tokenizer=tokenizer,
+                )
+                text_target_len = _estimate_text_token_count_with_tokenizer(
+                    target_transcript,
+                    tokenizer=tokenizer,
+                )
+            else:
+                text_prompt_len = max(1, len(prompt_transcript))
+                text_target_len = max(1, len(target_transcript))
             prompt_discrete_len = _estimate_discrete_length(
                 float(getattr(entry, "prompt_duration")),
                 codec_frame_rate_hz,

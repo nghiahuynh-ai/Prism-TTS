@@ -1171,6 +1171,20 @@ class PrismTTSLightning(pl.LightningModule):
         if tokens.numel() == 0:
             return ""
 
+        tokenizer = self._resolve_text_tokenizer()
+        if tokenizer is not None and hasattr(tokenizer, "decode"):
+            try:
+                decoded = str(
+                    tokenizer.decode(
+                        tokens.tolist(),
+                        skip_special_tokens=True,
+                    )
+                ).strip()
+            except Exception:
+                decoded = ""
+            if decoded:
+                return decoded
+
         token_to_char = self._text_id_to_char()
         pad_token_id = int(getattr(self.model, "pad_token_id", -1))
         eos_token_id = int(getattr(self.model, "eos_token_id", -1))

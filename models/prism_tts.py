@@ -8,11 +8,10 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import LlamaConfig
 
 from models.flow_head import FlowHead
-from models.llama_backbone import LlamaBackbone
 from utils import model_utils as MU
+from utils import backbone_utils as BU
 
 
 class PrismTTS(nn.Module):
@@ -28,7 +27,6 @@ class PrismTTS(nn.Module):
 
     def __init__(
         self,
-        llama_config: LlamaConfig,
         num_discrete_tokens: int,
         discrete_vocab_size: int,
         continuous_latent_size: int,
@@ -40,6 +38,12 @@ class PrismTTS(nn.Module):
         discrete_special_token_loss_weight: float = 1.0,
         flow_sample_steps: int = 64,
         parallel_sample_steps: int = 64,
+        *,
+        backbone_name: str = "llama",
+        backbone_config: Optional[Any] = None,
+        backbone_hf_checkpoint: Optional[str] = None,
+        backbone_hf_strict: bool = True,
+        backbone_hf_kwargs: Optional[dict[str, Any]] = None,
     ):
         """Initialize model modules, embeddings, loss weights, and special-token ids."""
         super().__init__()
@@ -47,10 +51,6 @@ class PrismTTS(nn.Module):
             raise ValueError("num_discrete_tokens must be at least 1.")
         if discrete_vocab_size < 1:
             raise ValueError("discrete_vocab_size must be at least 1.")
-        if discrete_vocab_size > llama_config.vocab_size:
-            raise ValueError(
-                "discrete_vocab_size must be <= llama_config.vocab_size when text/discrete embeddings are shared."
-            )
         if continuous_latent_size < 1:
             raise ValueError("continuous_latent_size must be at least 1.")
         if flow_loss_weight < 0.0:
@@ -74,7 +74,32 @@ class PrismTTS(nn.Module):
         if parallel_sample_steps < 1:
             raise ValueError("parallel_sample_steps must be at least 1.")
 
-        self.hidden_size = int(llama_config.hidden_size)
+        resolved_backbone_name = BU.normalize_backbone_name(backbone_name)
+        self.backbone_hf_checkpoint = BU.normalize_optional_string(backbone_hf_checkpoint)
+        self.backbone_hf_kwargs = dict(backbone_hf_kwargs or {})
+        if backbone_config is None and self.backbone_hf_checkpoint is None:
+            raise ValueError(
+                "Provide backbone_config, or set model.backbone.hf_checkpoint."
+            )
+
+        self.backbone_name = resolved_backbone_name
+        self.backbone = BU.build_backbone(
+            backbone_name=self.backbone_name,
+            backbone_config=backbone_config,
+            backbone_hf_checkpoint=self.backbone_hf_checkpoint,
+            backbone_hf_strict=backbone_hf_strict,
+            backbone_hf_kwargs=self.backbone_hf_kwargs,
+        )
+        self.use_separate_codec_embedding = self.backbone_name in {"gemma", "qwen"}
+
+        backbone_vocab_size = int(self.backbone.config.vocab_size)
+        if not self.use_separate_codec_embedding and discrete_vocab_size > backbone_vocab_size:
+            raise ValueError(
+                "discrete_vocab_size must be <= selected backbone config.vocab_size when "
+                "text/discrete embeddings are shared."
+            )
+
+        self.hidden_size = int(self.backbone.config.hidden_size)
         self.num_discrete_tokens = int(num_discrete_tokens)
         self.discrete_vocab_size = int(discrete_vocab_size)
         self.continuous_latent_size = int(continuous_latent_size)
@@ -87,7 +112,14 @@ class PrismTTS(nn.Module):
         self.flow_sample_steps = int(flow_sample_steps)
         self.parallel_sample_steps = int(parallel_sample_steps)
 
-        self.backbone = LlamaBackbone(llama_config)
+        if self.use_separate_codec_embedding:
+            self.codec_embedding_table = nn.Embedding(
+                self.discrete_vocab_size,
+                self.hidden_size,
+            )
+        else:
+            self.codec_embedding_table = None
+
         self.discrete_lm_head = nn.Linear(self.hidden_size, self.discrete_vocab_size, bias=False)
         self.continuous_proj = nn.Linear(self.continuous_latent_size, self.hidden_size)
         self.continuous_prior_head = nn.Linear(self.hidden_size, self.continuous_latent_size)
@@ -126,19 +158,22 @@ class PrismTTS(nn.Module):
         self.training_special_discrete_token_ids = MU.infer_special_discrete_token_ids(
             MU.resolve_generation_discrete_eos_token_id(
                 None,
-                backbone_eos_token_id=self.backbone.config.eos_token_id,
+                backbone_eos_token_id=self.eos_token_id,
                 discrete_vocab_size=self.discrete_vocab_size,
             ),
-            backbone_eos_token_id=self.backbone.config.eos_token_id,
-            backbone_pad_token_id=self.backbone.config.pad_token_id,
+            backbone_eos_token_id=self.eos_token_id,
+            backbone_pad_token_id=self.pad_token_id,
             discrete_vocab_size=self.discrete_vocab_size,
         )
+        self._default_text_tokenizer: Optional[Any] = None
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         """Reinitialize trainable parameters using the configured initializer range."""
         std = getattr(self.backbone.config, "initializer_range", 0.02)
+        if self.codec_embedding_table is not None:
+            nn.init.normal_(self.codec_embedding_table.weight, mean=0.0, std=std)
         nn.init.normal_(self.discrete_lm_head.weight, mean=0.0, std=std)
         nn.init.normal_(self.continuous_proj.weight, mean=0.0, std=std)
         nn.init.normal_(self.continuous_prior_head.weight, mean=0.0, std=std)
@@ -153,12 +188,14 @@ class PrismTTS(nn.Module):
 
     @property
     def text_embedding(self) -> nn.Embedding:
-        """Return the shared embedding table used for text tokens."""
+        """Return the backbone text embedding table."""
         return self.backbone.embed_tokens
 
     @property
     def discrete_embedding(self) -> nn.Embedding:
-        """Return the shared embedding table used for discrete speech tokens."""
+        """Return the embedding table used for discrete speech tokens."""
+        if self.codec_embedding_table is not None:
+            return self.codec_embedding_table
         return self.backbone.embed_tokens
 
     def _build_inputs_embeds(
@@ -168,9 +205,6 @@ class PrismTTS(nn.Module):
         inject_continuous_noise: bool = False,
     ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
         """Build model input embeddings and masks for masked discrete/continuous targets."""
-        batch_size, seq_len = flat.token_ids.shape
-        device = flat.token_ids.device
-
         is_speech = flat.token_type_ids != MU.TEXT_TOKEN_TYPE
         is_discrete = flat.token_type_ids == MU.SPEECH_DISCRETE_TOKEN_TYPE
         is_continuous = flat.token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE
@@ -186,16 +220,26 @@ class PrismTTS(nn.Module):
         masked_discrete_positions = masked_target_token_mask & is_discrete
         masked_continuous_positions = masked_target_token_mask & is_continuous
 
-        token_embeds = self.discrete_embedding(flat.token_ids)
         continuous_values = flat.continuous_values
         if inject_continuous_noise:
             continuous_values = MU.inject_continuous_backbone_noise(continuous_values)
         continuous_embeds = self.continuous_proj(continuous_values)
-        base_embeds = torch.where(
-            is_continuous.unsqueeze(-1),
-            continuous_embeds,
-            token_embeds,
-        )
+        if self.codec_embedding_table is None:
+            token_embeds = self.discrete_embedding(flat.token_ids)
+            base_embeds = torch.where(
+                is_continuous.unsqueeze(-1),
+                continuous_embeds,
+                token_embeds,
+            )
+        else:
+            # Split lookup so text ids always use pretrained text embeddings and
+            # codec ids use the dedicated codec embedding table.
+            base_embeds = continuous_embeds.clone()
+            text_positions = flat.token_type_ids == MU.TEXT_TOKEN_TYPE
+            if text_positions.any():
+                base_embeds[text_positions] = self.text_embedding(flat.token_ids[text_positions])
+            if is_discrete.any():
+                base_embeds[is_discrete] = self.discrete_embedding(flat.token_ids[is_discrete])
 
         type_embeds = self.token_type_embeddings[flat.token_type_ids.clamp(min=0, max=2)]
         base_embeds = base_embeds + type_embeds
@@ -671,14 +715,14 @@ class PrismTTS(nn.Module):
 
         discrete_eos_id = MU.resolve_generation_discrete_eos_token_id(
             discrete_eos_token_id,
-            backbone_eos_token_id=self.backbone.config.eos_token_id,
+            backbone_eos_token_id=self.eos_token_id,
             discrete_vocab_size=self.discrete_vocab_size,
         )
         special_discrete_token_ids = (
             MU.infer_special_discrete_token_ids(
                 discrete_eos_id,
-                backbone_eos_token_id=self.backbone.config.eos_token_id,
-                backbone_pad_token_id=self.backbone.config.pad_token_id,
+                backbone_eos_token_id=self.eos_token_id,
+                backbone_pad_token_id=self.pad_token_id,
                 discrete_vocab_size=self.discrete_vocab_size,
             )
             if force_silent_special_tokens
@@ -1434,6 +1478,46 @@ class PrismTTS(nn.Module):
             collected_logits,
         )
 
+    @staticmethod
+    def _tokenize_text_with_any_tokenizer(
+        tokenizer: Callable[[str], Sequence[int]] | Any,
+        text: str,
+    ) -> list[int]:
+        from dataset.dataset import tokenize_with_external_tokenizer
+
+        token_ids = tokenize_with_external_tokenizer(tokenizer, text)
+        return [int(token_id) for token_id in token_ids]
+
+    def _resolve_default_text_tokenizer(self) -> Callable[[str], Sequence[int]]:
+        if self._default_text_tokenizer is not None:
+            return self._default_text_tokenizer
+        if self.use_separate_codec_embedding:
+            tokenizer = BU.build_backbone_text_tokenizer(
+                backbone_name=self.backbone_name,
+                backbone_hf_checkpoint=self.backbone_hf_checkpoint,
+                backbone_hf_kwargs=self.backbone_hf_kwargs,
+                require_checkpoint=True,
+            )
+            self._default_text_tokenizer = tokenizer
+            return self._default_text_tokenizer
+
+        from dataset.dataset import SharedVocabTokenizer, build_shared_token_layout
+
+        discrete_token_count = int(self.discrete_vocab_size) - 3
+        if discrete_token_count < 1:
+            raise ValueError(
+                "Cannot infer tokenizer shared layout: discrete_vocab_size must be >= 4."
+            )
+        _, eos_token_id, _, text_token_offset = build_shared_token_layout(discrete_token_count)
+        vocab_path = Path(__file__).resolve().parents[1] / "dataset" / "vocab.txt"
+        self._default_text_tokenizer = SharedVocabTokenizer(
+            vocab_path=vocab_path,
+            text_token_offset=text_token_offset,
+            eos_token_id=eos_token_id,
+            append_eos=False,
+        )
+        return self._default_text_tokenizer
+
 
     @torch.no_grad()
     def generate_e2e(
@@ -1462,8 +1546,8 @@ class PrismTTS(nn.Module):
         - continuous latents with shape [L, D] (or [D, L], accepted and transposed)
         where N=num_discrete_tokens and D=continuous_latent_size.
 
-        If `text_tokenizer` is None, initialize a `SharedVocabTokenizer` using
-        the same default behavior as dataset construction.
+        If `text_tokenizer` is None, use the checkpoint tokenizer for Gemma/Qwen
+        (when configured), otherwise fall back to `SharedVocabTokenizer`.
         If `speech_encoder` and/or `speech_decoder` is None, initialize the
         missing component(s) from Mimi.
 
@@ -1496,21 +1580,7 @@ class PrismTTS(nn.Module):
         continuous_dtype = self.continuous_proj.weight.dtype
 
         if text_tokenizer is None:
-            from dataset.dataset import SharedVocabTokenizer, build_shared_token_layout
-
-            discrete_token_count = int(self.discrete_vocab_size) - 3
-            if discrete_token_count < 1:
-                raise ValueError(
-                    "Cannot infer tokenizer shared layout: discrete_vocab_size must be >= 4."
-                )
-            _, eos_token_id, _, text_token_offset = build_shared_token_layout(discrete_token_count)
-            vocab_path = Path(__file__).resolve().parents[1] / "dataset" / "vocab.txt"
-            text_tokenizer = SharedVocabTokenizer(
-                vocab_path=vocab_path,
-                text_token_offset=text_token_offset,
-                eos_token_id=eos_token_id,
-                append_eos=False,
-            )
+            text_tokenizer = self._resolve_default_text_tokenizer()
 
         needs_default_mimi_encoder = speech_encoder is None
         needs_default_mimi_decoder = speech_decoder is None
@@ -1542,8 +1612,14 @@ class PrismTTS(nn.Module):
         speech_continuous_list: list[torch.FloatTensor] = []
 
         for sample_idx in range(batch_size):
-            prompt_tokens = [int(token) for token in text_tokenizer(prompt_text_list[sample_idx])]
-            target_tokens = [int(token) for token in text_tokenizer(target_text_list[sample_idx])]
+            prompt_tokens = self._tokenize_text_with_any_tokenizer(
+                text_tokenizer,
+                prompt_text_list[sample_idx],
+            )
+            target_tokens = self._tokenize_text_with_any_tokenizer(
+                text_tokenizer,
+                target_text_list[sample_idx],
+            )
             prompt_token_lists.append(prompt_tokens)
             target_token_lists.append(target_tokens)
 

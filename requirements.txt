@@ -1,5 +1,6 @@
 torch>=2.2
-transformers>=4.40
+# Qwen3 support starts at transformers 4.51.0.
+transformers>=4.51.0
 lightning>=2.2
 numpy>=1.24
 PyYAML>=6.0

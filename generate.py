@@ -13,7 +13,7 @@ from transformers import AutoFeatureExtractor, MimiModel
 # Avoid Matplotlib cache warnings triggered indirectly by optional Lightning imports.
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
-from dataset.dataset import SharedVocabTokenizer, build_shared_token_layout
+from dataset.dataset import BackboneTextTokenizer, SharedVocabTokenizer, build_shared_token_layout
 from models.mimi_latent_decoder import MimiPreUpsampleLatentDecoder
 from utils import generate_utils
 
@@ -217,7 +217,7 @@ def main() -> None:
 
     model_config = generate_utils.read_yaml(args.model_config)
     data_config = generate_utils.read_yaml(args.data_config)
-    model = generate_utils.build_model(model_config)
+    model = generate_utils.build_model(model_config, hf_token=args.hf_token)
     generate_utils.load_checkpoint(model, args.checkpoint, use_ema=bool(args.use_ema))
     model.to(device=device, dtype=model_dtype)
     model.eval()
@@ -227,20 +227,25 @@ def main() -> None:
     dataset_cfg = generate_utils.require_mapping(data_cfg, "dataset")
 
     discrete_token_count = int(shared_layout_cfg["discrete_token_count"])
-    _, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(
-        discrete_token_count
-    )
+    _, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(discrete_token_count)
 
-    vocab_path_raw = data_cfg.get("vocab_path", "dataset/vocab.txt")
-    vocab_path = Path(vocab_path_raw)
-    if not vocab_path.is_absolute():
-        vocab_path = (Path.cwd() / vocab_path).resolve()
-    tokenizer = SharedVocabTokenizer(
-        vocab_path=vocab_path,
-        text_token_offset=text_token_offset,
-        eos_token_id=eos_token_id,
-        append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
-    )
+    if bool(getattr(model, "use_separate_codec_embedding", False)):
+        base_tokenizer = model._resolve_default_text_tokenizer()
+        tokenizer = BackboneTextTokenizer(
+            tokenizer=base_tokenizer,
+            append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
+        )
+    else:
+        vocab_path_raw = data_cfg.get("vocab_path", "dataset/vocab.txt")
+        vocab_path = Path(vocab_path_raw)
+        if not vocab_path.is_absolute():
+            vocab_path = (Path.cwd() / vocab_path).resolve()
+        tokenizer = SharedVocabTokenizer(
+            vocab_path=vocab_path,
+            text_token_offset=text_token_offset,
+            eos_token_id=eos_token_id,
+            append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
+        )
 
     prompt_audio, prompt_sample_rate = generate_utils.read_wav(args.prompt_audio)
 

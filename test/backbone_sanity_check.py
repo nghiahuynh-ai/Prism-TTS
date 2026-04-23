@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset.dataset import SharedVocabTokenizer, build_shared_token_layout
+from dataset.dataset import BackboneTextTokenizer, SharedVocabTokenizer, build_shared_token_layout
 from utils import generate_utils
 
 
@@ -531,18 +531,25 @@ def main() -> None:
     text_pad_value = int(pad_token_id)
     discrete_pad_value = int(pad_token_id)
 
-    vocab_path_raw = data_cfg.get("vocab_path", "dataset/vocab.txt")
-    vocab_path = Path(vocab_path_raw).expanduser()
-    if not vocab_path.is_absolute():
-        vocab_path = (Path.cwd() / vocab_path).resolve()
+    if bool(getattr(model, "use_separate_codec_embedding", False)):
+        base_tokenizer = model._resolve_default_text_tokenizer()
+        tokenizer = BackboneTextTokenizer(
+            tokenizer=base_tokenizer,
+            append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
+        )
     else:
-        vocab_path = vocab_path.resolve()
-    tokenizer = SharedVocabTokenizer(
-        vocab_path=vocab_path,
-        text_token_offset=text_token_offset,
-        eos_token_id=eos_token_id,
-        append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
-    )
+        vocab_path_raw = data_cfg.get("vocab_path", "dataset/vocab.txt")
+        vocab_path = Path(vocab_path_raw).expanduser()
+        if not vocab_path.is_absolute():
+            vocab_path = (Path.cwd() / vocab_path).resolve()
+        else:
+            vocab_path = vocab_path.resolve()
+        tokenizer = SharedVocabTokenizer(
+            vocab_path=vocab_path,
+            text_token_offset=text_token_offset,
+            eos_token_id=eos_token_id,
+            append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
+        )
 
     prompt_text_tokens = generate_utils.safe_tokenize(
         tokenizer,
