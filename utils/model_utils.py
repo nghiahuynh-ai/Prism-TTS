@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import math
 import wave
 from collections.abc import Callable, Sequence
@@ -734,31 +733,15 @@ def build_two_level_rope_position_embeddings(
     speech_stream_ids: torch.LongTensor,
     rotary_emb: torch.nn.Module,
 ) -> tuple[torch.Tensor, torch.Tensor] | dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    """Compose global 1D RoPE with within-block stream-index RoPE."""
+    """Build ordinary 1D RoPE position embeddings (legacy compatibility wrapper)."""
+    del speech_stream_ids
     batch_size, seq_len, _ = inputs_embeds.shape
     device = inputs_embeds.device
 
     global_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    secondary_position_ids = speech_stream_ids.clamp(min=0)
-
-    supports_layer_type = False
-    try:
-        supports_layer_type = "layer_type" in inspect.signature(rotary_emb.forward).parameters
-    except (TypeError, ValueError):
-        supports_layer_type = False
-
-    if not supports_layer_type:
-        global_cos, global_sin = rotary_emb(inputs_embeds, position_ids=global_position_ids)
-        secondary_cos, secondary_sin = rotary_emb(
-            inputs_embeds,
-            position_ids=secondary_position_ids,
-        )
-        cos = global_cos * secondary_cos - global_sin * secondary_sin
-        sin = global_sin * secondary_cos + global_cos * secondary_sin
-        return cos, sin
 
     # Rotary implementations like Gemma3 require `layer_type`.
-    # Build per-layer-type combined embeddings so mixed-attention backbones can consume them.
+    # Build per-layer-type ordinary embeddings so mixed-attention backbones can consume them.
     candidate_layer_types: list[str] = []
     config = getattr(rotary_emb, "config", None)
     config_layer_types = getattr(config, "layer_types", None)
@@ -776,20 +759,19 @@ def build_two_level_rope_position_embeddings(
     if not deduped_layer_types:
         deduped_layer_types = ["full_attention"]
 
+    if len(deduped_layer_types) == 1 and deduped_layer_types[0] == "full_attention":
+        try:
+            return rotary_emb(inputs_embeds, position_ids=global_position_ids)
+        except TypeError:
+            pass
+
     position_embeddings_by_layer: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     for layer_type in deduped_layer_types:
-        global_cos, global_sin = rotary_emb(
+        cos, sin = rotary_emb(
             inputs_embeds,
             position_ids=global_position_ids,
             layer_type=layer_type,
         )
-        secondary_cos, secondary_sin = rotary_emb(
-            inputs_embeds,
-            position_ids=secondary_position_ids,
-            layer_type=layer_type,
-        )
-        cos = global_cos * secondary_cos - global_sin * secondary_sin
-        sin = global_sin * secondary_cos + global_cos * secondary_sin
         position_embeddings_by_layer[layer_type] = (cos, sin)
 
     position_embeddings_by_layer["default"] = position_embeddings_by_layer[deduped_layer_types[0]]

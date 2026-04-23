@@ -24,6 +24,7 @@ class PrismTTS(nn.Module):
     Speech is flattened block-wise. Each speech block has (N + 1) streams:
     N discrete streams + 1 continuous stream.
     """
+    MAX_DISCRETE_STREAM_EMBEDDINGS = 32
 
     def __init__(
         self,
@@ -103,6 +104,11 @@ class PrismTTS(nn.Module):
         self.num_discrete_tokens = int(num_discrete_tokens)
         self.discrete_vocab_size = int(discrete_vocab_size)
         self.continuous_latent_size = int(continuous_latent_size)
+        if self.num_discrete_tokens > self.MAX_DISCRETE_STREAM_EMBEDDINGS:
+            raise ValueError(
+                "num_discrete_tokens exceeds supported stream embeddings: "
+                f"{self.num_discrete_tokens} > {self.MAX_DISCRETE_STREAM_EMBEDDINGS}."
+            )
         self.speech_block_size = self.num_discrete_tokens + 1
 
         self.flow_loss_weight = float(flow_loss_weight)
@@ -124,10 +130,11 @@ class PrismTTS(nn.Module):
         self.continuous_proj = nn.Linear(self.continuous_latent_size, self.hidden_size)
         self.continuous_prior_head = nn.Linear(self.hidden_size, self.continuous_latent_size)
 
-        self.token_type_embeddings = nn.Parameter(torch.empty(3, self.hidden_size))
-        self.speech_stream_embeddings = nn.Parameter(
-            torch.empty(self.speech_block_size, self.hidden_size)
+        # One embedding per discrete stream index, plus one dedicated continuous-stream embedding.
+        self.discrete_stream_embeddings = nn.Parameter(
+            torch.empty(self.MAX_DISCRETE_STREAM_EMBEDDINGS, self.hidden_size)
         )
+        self.continuous_stream_embedding = nn.Parameter(torch.empty(self.hidden_size))
         self.masked_discrete_embeddings = nn.Parameter(
             torch.empty(self.num_discrete_tokens, self.hidden_size)
         )
@@ -177,8 +184,8 @@ class PrismTTS(nn.Module):
         nn.init.normal_(self.discrete_lm_head.weight, mean=0.0, std=std)
         nn.init.normal_(self.continuous_proj.weight, mean=0.0, std=std)
         nn.init.normal_(self.continuous_prior_head.weight, mean=0.0, std=std)
-        nn.init.normal_(self.token_type_embeddings, mean=0.0, std=std)
-        nn.init.normal_(self.speech_stream_embeddings, mean=0.0, std=std)
+        nn.init.normal_(self.discrete_stream_embeddings, mean=0.0, std=std)
+        nn.init.normal_(self.continuous_stream_embedding, mean=0.0, std=std)
         nn.init.normal_(self.masked_discrete_embeddings, mean=0.0, std=std)
         nn.init.normal_(self.masked_continuous_embedding, mean=0.0, std=std)
         if self.continuous_proj.bias is not None:
@@ -205,7 +212,6 @@ class PrismTTS(nn.Module):
         inject_continuous_noise: bool = False,
     ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
         """Build model input embeddings and masks for masked discrete/continuous targets."""
-        is_speech = flat.token_type_ids != MU.TEXT_TOKEN_TYPE
         is_discrete = flat.token_type_ids == MU.SPEECH_DISCRETE_TOKEN_TYPE
         is_continuous = flat.token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE
 
@@ -241,20 +247,25 @@ class PrismTTS(nn.Module):
             if is_discrete.any():
                 base_embeds[is_discrete] = self.discrete_embedding(flat.token_ids[is_discrete])
 
-        type_embeds = self.token_type_embeddings[flat.token_type_ids.clamp(min=0, max=2)]
-        base_embeds = base_embeds + type_embeds
-
-        stream_ids_clamped = flat.speech_stream_ids.clamp(min=0, max=self.speech_block_size - 1)
-        stream_embeds = self.speech_stream_embeddings[stream_ids_clamped]
-        base_embeds = base_embeds + stream_embeds * is_speech.unsqueeze(-1).to(dtype=base_embeds.dtype)
+        discrete_stream_ids = flat.speech_stream_ids.clamp(
+            min=0,
+            max=self.MAX_DISCRETE_STREAM_EMBEDDINGS - 1,
+        )
+        discrete_stream_embeds = self.discrete_stream_embeddings[discrete_stream_ids]
+        base_embeds = base_embeds + (
+            discrete_stream_embeds * is_discrete.unsqueeze(-1).to(dtype=base_embeds.dtype)
+        )
+        base_embeds = base_embeds + (
+            self.continuous_stream_embedding.view(1, 1, self.hidden_size)
+            * is_continuous.unsqueeze(-1).to(dtype=base_embeds.dtype)
+        )
 
         if masked_discrete_positions.any():
             disc_stream_ids = flat.speech_stream_ids.clamp(min=0, max=self.num_discrete_tokens - 1)
             masked_discrete_embeds = self.masked_discrete_embeddings[disc_stream_ids]
             masked_discrete_embeds = (
                 masked_discrete_embeds
-                + self.token_type_embeddings[MU.SPEECH_DISCRETE_TOKEN_TYPE]
-                + self.speech_stream_embeddings[disc_stream_ids]
+                + self.discrete_stream_embeddings[disc_stream_ids]
             )
             base_embeds = torch.where(
                 masked_discrete_positions.unsqueeze(-1),
@@ -263,11 +274,9 @@ class PrismTTS(nn.Module):
             )
 
         if masked_continuous_positions.any():
-            cont_stream_ids = flat.speech_stream_ids.clamp(min=0, max=self.speech_block_size - 1)
             masked_cont_embeds = (
                 self.masked_continuous_embedding.view(1, 1, self.hidden_size)
-                + self.token_type_embeddings[MU.SPEECH_CONTINUOUS_TOKEN_TYPE].view(1, 1, self.hidden_size)
-                + self.speech_stream_embeddings[cont_stream_ids]
+                + self.continuous_stream_embedding.view(1, 1, self.hidden_size)
             )
             base_embeds = torch.where(
                 masked_continuous_positions.unsqueeze(-1),
@@ -460,7 +469,7 @@ class PrismTTS(nn.Module):
         torch.BoolTensor,
         torch.BoolTensor,
     ]:
-        """Encode flattened inputs with masking and two-level RoPE."""
+        """Encode flattened inputs with masking and ordinary backbone RoPE."""
         inputs_embeds, masked_discrete_positions, masked_continuous_positions, masked_target_token_mask = (
             self._build_inputs_embeds(
                 flat=flat,
@@ -468,15 +477,9 @@ class PrismTTS(nn.Module):
                 inject_continuous_noise=inject_continuous_noise,
             )
         )
-        position_embeddings = MU.build_two_level_rope_position_embeddings(
-            inputs_embeds=inputs_embeds,
-            speech_stream_ids=flat.speech_stream_ids,
-            rotary_emb=self.backbone.rotary_emb,
-        )
         backbone_outputs = self.backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=flat.attention_mask,
-            position_embeddings=position_embeddings,
             return_dict=True,
         )
         return (
