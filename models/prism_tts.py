@@ -504,12 +504,9 @@ class PrismTTS(nn.Module):
         self,
         cond: torch.FloatTensor,
         num_steps: Optional[int] = None,
+        temperature: float = 1.0,
     ) -> torch.FloatTensor:
         """Generate continuous latents by integrating from x0 = prior + eps."""
-        num_steps = num_steps or self.flow_sample_steps
-        if num_steps < 1:
-            raise ValueError("num_steps must be at least 1.")
-
         squeeze_seq_dim = False
         if cond.dim() == 2:
             cond = cond.unsqueeze(1)
@@ -517,22 +514,128 @@ class PrismTTS(nn.Module):
         elif cond.dim() != 3:
             raise ValueError("cond must have shape [batch, channels] or [batch, seq, channels].")
 
-        x = cond + torch.randn_like(cond)
-        dt = 1.0 / num_steps
-
-        for step_idx in range(num_steps):
-            t = torch.full(
-                (cond.shape[0],),
-                step_idx / num_steps,
-                device=cond.device,
-                dtype=cond.dtype,
-            )
-            velocity = self.flow_head(x, t)
-            x = x + dt * velocity
+        all_target_mask = torch.ones(
+            (cond.shape[0], cond.shape[1]),
+            dtype=torch.bool,
+            device=cond.device,
+        )
+        empty_prompt = cond.new_empty((cond.shape[0], 0, self.continuous_latent_size))
+        empty_prompt_lengths = torch.zeros(
+            cond.shape[0],
+            dtype=torch.long,
+            device=cond.device,
+        )
+        sampled = self._sample_continuous_with_clean_context(
+            prior_target=cond,
+            clean_target=torch.zeros_like(cond),
+            denoise_target_mask=all_target_mask,
+            valid_target_mask=all_target_mask,
+            prompt_latents=empty_prompt,
+            prompt_lengths=empty_prompt_lengths,
+            num_steps=num_steps,
+            temperature=temperature,
+        )
 
         if squeeze_seq_dim:
-            return x.squeeze(1)
-        return x
+            return sampled.squeeze(1)
+        return sampled
+
+    def _sample_continuous_with_clean_context(
+        self,
+        *,
+        prior_target: torch.FloatTensor,
+        clean_target: torch.FloatTensor,
+        denoise_target_mask: torch.BoolTensor,
+        valid_target_mask: torch.BoolTensor,
+        prompt_latents: torch.FloatTensor,
+        prompt_lengths: torch.LongTensor,
+        num_steps: Optional[int],
+        temperature: float = 1.0,
+    ) -> torch.FloatTensor:
+        """
+        Denoise selected target latents while keeping prompt/clean context fixed.
+
+        This mirrors `_compute_continuous_losses` inference semantics:
+        - initialize denoised positions from `prior + noise`
+        - keep all non-denoised valid positions fixed as clean context
+        - integrate velocity only on denoised positions
+        """
+        num_steps = num_steps or self.flow_sample_steps
+        if num_steps < 1:
+            raise ValueError("num_steps must be at least 1.")
+        if prior_target.dim() != 3:
+            raise ValueError("prior_target must have shape [batch, target_len, channels].")
+        if clean_target.shape != prior_target.shape:
+            raise ValueError("clean_target must match prior_target shape.")
+        if denoise_target_mask.shape != prior_target.shape[:2]:
+            raise ValueError("denoise_target_mask must have shape [batch, target_len].")
+        if valid_target_mask.shape != prior_target.shape[:2]:
+            raise ValueError("valid_target_mask must have shape [batch, target_len].")
+        if prompt_latents.dim() != 3:
+            raise ValueError("prompt_latents must have shape [batch, prompt_len, channels].")
+        if prompt_latents.shape[0] != prior_target.shape[0]:
+            raise ValueError("prompt_latents batch size must match prior_target.")
+        if prompt_latents.shape[2] != prior_target.shape[2]:
+            raise ValueError("prompt_latents channel size must match prior_target.")
+        if prompt_lengths.dim() != 1 or prompt_lengths.shape[0] != prior_target.shape[0]:
+            raise ValueError("prompt_lengths must have shape [batch].")
+        noise_temperature = max(0.0, float(temperature))
+
+        batch_size, target_len, latent_size = prior_target.shape
+        prompt_len = int(prompt_latents.shape[1])
+        device = prior_target.device
+
+        resolved_valid_target_mask = valid_target_mask.to(device=device, dtype=torch.bool)
+        resolved_denoise_target_mask = denoise_target_mask.to(device=device, dtype=torch.bool)
+        resolved_denoise_target_mask = resolved_denoise_target_mask & resolved_valid_target_mask
+        if not resolved_denoise_target_mask.any():
+            return clean_target
+
+        full_len = prompt_len + target_len
+        clean_sequence = prior_target.new_zeros((batch_size, full_len, latent_size))
+        if prompt_len > 0:
+            clean_sequence[:, :prompt_len, :] = prompt_latents
+        clean_sequence[:, prompt_len:, :] = clean_target
+
+        full_valid_mask = torch.zeros((batch_size, full_len), dtype=torch.bool, device=device)
+        if prompt_len > 0:
+            clamped_prompt_lengths = prompt_lengths.to(
+                device=device,
+                dtype=torch.long,
+            ).clamp(min=0, max=prompt_len)
+            prompt_positions = torch.arange(prompt_len, device=device).unsqueeze(0)
+            full_valid_mask[:, :prompt_len] = prompt_positions < clamped_prompt_lengths.unsqueeze(1)
+        full_valid_mask[:, prompt_len:] = resolved_valid_target_mask
+
+        full_denoise_mask = torch.zeros_like(full_valid_mask)
+        full_denoise_mask[:, prompt_len:] = resolved_denoise_target_mask
+        fixed_clean_mask = full_valid_mask & (~full_denoise_mask)
+
+        x = clean_sequence.clone()
+        noisy_target = prior_target + (noise_temperature * torch.randn_like(prior_target))
+        target_x = x[:, prompt_len:, :]
+        target_x[resolved_denoise_target_mask] = noisy_target[resolved_denoise_target_mask]
+        x[:, prompt_len:, :] = target_x
+
+        dt = 1.0 / num_steps
+        has_invalid_positions = not bool(full_valid_mask.all().item())
+        for step_idx in range(num_steps):
+            t = torch.full(
+                (batch_size,),
+                step_idx / num_steps,
+                device=device,
+                dtype=prior_target.dtype,
+            )
+            velocity = self.flow_head(x, t, mask=full_valid_mask)
+            x[full_denoise_mask] = x[full_denoise_mask] + dt * velocity[full_denoise_mask]
+            x[fixed_clean_mask] = clean_sequence[fixed_clean_mask]
+            if has_invalid_positions:
+                x = x.masked_fill(~full_valid_mask.unsqueeze(-1), 0.0)
+
+        denoised_target = clean_target.clone()
+        final_target = x[:, prompt_len:, :]
+        denoised_target[resolved_denoise_target_mask] = final_target[resolved_denoise_target_mask]
+        return denoised_target
 
     def _encode(
         self,
@@ -1008,13 +1111,29 @@ class PrismTTS(nn.Module):
             if step_continuous_positions.any():
                 continuous_hidden = hidden_states[step_continuous_positions]
                 prior_prediction = self.continuous_prior_head(continuous_hidden)
-                sampled_continuous = self.sample_continuous_latent(
-                    cond=prior_prediction,
-                    num_steps=flow_num_steps,
-                )
                 continuous_batch_idx = batch_indices[step_continuous_positions]
-                predicted_continuous[continuous_batch_idx, step_idx, :] = sampled_continuous
                 predicted_prior[continuous_batch_idx, step_idx, :] = prior_prediction
+                denoise_step_mask = torch.zeros(
+                    (batch_size, step_idx + 1),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                denoise_step_mask[continuous_batch_idx, step_idx] = True
+                denoised_step_context = self._sample_continuous_with_clean_context(
+                    prior_target=predicted_prior[:, : step_idx + 1, :],
+                    clean_target=predicted_continuous[:, : step_idx + 1, :],
+                    denoise_target_mask=denoise_step_mask,
+                    valid_target_mask=valid_target_mask[:, : step_idx + 1],
+                    prompt_latents=continuous_prompt,
+                    prompt_lengths=speech_prompt_lengths,
+                    num_steps=flow_num_steps,
+                    temperature=temperature,
+                )
+                predicted_continuous[continuous_batch_idx, step_idx, :] = denoised_step_context[
+                    continuous_batch_idx,
+                    step_idx,
+                    :,
+                ]
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = predicted_discrete[continuous_batch_idx, step_idx, :]
@@ -1234,14 +1353,22 @@ class PrismTTS(nn.Module):
             if masked_continuous_positions.any():
                 continuous_hidden = hidden_states[masked_continuous_positions]
                 prior_prediction = self.continuous_prior_head(continuous_hidden)
-                sampled_continuous = self.sample_continuous_latent(
-                    cond=prior_prediction,
-                    num_steps=flow_num_steps,
-                )
                 continuous_batch_idx = batch_indices[masked_continuous_positions]
                 continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
-                predicted_continuous[continuous_batch_idx, continuous_block_idx, :] = sampled_continuous
                 predicted_prior[continuous_batch_idx, continuous_block_idx, :] = prior_prediction
+                denoise_target_mask = torch.zeros_like(masked_blocks)
+                denoise_target_mask[continuous_batch_idx, continuous_block_idx] = True
+                denoised_targets = self._sample_continuous_with_clean_context(
+                    prior_target=predicted_prior,
+                    clean_target=predicted_continuous,
+                    denoise_target_mask=denoise_target_mask,
+                    valid_target_mask=valid_target_mask,
+                    prompt_latents=continuous_prompt,
+                    prompt_lengths=speech_prompt_lengths,
+                    num_steps=flow_num_steps,
+                    temperature=temperature,
+                )
+                predicted_continuous[denoise_target_mask] = denoised_targets[denoise_target_mask]
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = predicted_discrete[continuous_batch_idx, continuous_block_idx, :]
@@ -1469,14 +1596,22 @@ class PrismTTS(nn.Module):
             if masked_continuous_positions.any():
                 continuous_hidden = hidden_states[masked_continuous_positions]
                 prior_prediction = self.continuous_prior_head(continuous_hidden)
-                sampled_continuous = self.sample_continuous_latent(
-                    cond=prior_prediction,
-                    num_steps=flow_num_steps,
-                )
                 continuous_batch_idx = batch_indices[masked_continuous_positions]
                 continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
-                candidate_continuous[continuous_batch_idx, continuous_block_idx, :] = sampled_continuous
                 candidate_prior[continuous_batch_idx, continuous_block_idx, :] = prior_prediction
+                denoise_target_mask = torch.zeros_like(masked_blocks)
+                denoise_target_mask[continuous_batch_idx, continuous_block_idx] = True
+                denoised_targets = self._sample_continuous_with_clean_context(
+                    prior_target=candidate_prior,
+                    clean_target=candidate_continuous,
+                    denoise_target_mask=denoise_target_mask,
+                    valid_target_mask=valid_target_mask,
+                    prompt_latents=continuous_prompt,
+                    prompt_lengths=speech_prompt_lengths,
+                    num_steps=flow_num_steps,
+                    temperature=temperature,
+                )
+                candidate_continuous[denoise_target_mask] = denoised_targets[denoise_target_mask]
 
                 if len(special_discrete_token_ids) > 0:
                     step_discrete = candidate_discrete[continuous_batch_idx, continuous_block_idx, :]
