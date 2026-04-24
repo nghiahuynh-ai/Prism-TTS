@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import sys
 from typing import Any, Optional
 
@@ -199,6 +200,8 @@ class GemmaBackbone(_GEMMA_BACKBONE_BASE):
         )
         self.norm = Gemma3RMSNorm(text_config.hidden_size, eps=text_config.rms_norm_eps)
         self.rotary_emb = Gemma3RotaryEmbedding(text_config)
+        rotary_signature = inspect.signature(self.rotary_emb.forward)
+        self._rotary_emb_supports_layer_type = "layer_type" in rotary_signature.parameters
         self.gradient_checkpointing = False
 
         self.post_init()
@@ -272,6 +275,9 @@ class GemmaBackbone(_GEMMA_BACKBONE_BASE):
         position_embeddings: Optional[PositionEmbeddings | PositionEmbeddingsByLayerType],
     ) -> PositionEmbeddingsByLayerType:
         if position_embeddings is None:
+            if not self._rotary_emb_supports_layer_type:
+                shared_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
+                return {layer_type: shared_embeddings for layer_type in self.unique_layer_types}
             return {
                 layer_type: self.rotary_emb(hidden_states, position_ids=position_ids, layer_type=layer_type)
                 for layer_type in self.unique_layer_types

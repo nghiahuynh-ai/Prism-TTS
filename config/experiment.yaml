@@ -13,10 +13,10 @@ experiment:
   # experiment-specific values here.
   trainer:
     logger:
-      name: masking
+      name: mask-llm-2streams
 
     checkpoint:
-      dirpath: checkpoints/masking
+      dirpath: checkpoints/mask-llm-2streams
 
     distributed:
       enabled: true

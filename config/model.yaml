@@ -39,7 +39,7 @@ model:
     discrete_vocab_size: 2051
     continuous_latent_size: 512
     flow_num_res_blocks: 4
-    flow_model_channels: null
+    flow_model_channels: 512
     # Loss weights for masked speech-block reconstruction.
     continuous_loss_weight: 1.0
     flow_loss_weight: 1.0
