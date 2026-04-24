@@ -13,9 +13,10 @@ from transformers import AutoFeatureExtractor, MimiModel
 # Avoid Matplotlib cache warnings triggered indirectly by optional Lightning imports.
 os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "matplotlib"))
 
-from dataset.dataset import BackboneTextTokenizer, SharedVocabTokenizer, build_shared_token_layout
+from dataset.dataset import build_shared_token_layout
 from models.mimi_latent_decoder import MimiPreUpsampleLatentDecoder
 from utils import generate_utils
+from utils import tokenizer_utils as TU
 
 
 def parse_args() -> argparse.Namespace:
@@ -227,25 +228,23 @@ def main() -> None:
     dataset_cfg = generate_utils.require_mapping(data_cfg, "dataset")
 
     discrete_token_count = int(shared_layout_cfg["discrete_token_count"])
-    _, eos_token_id, pad_token_id, text_token_offset = build_shared_token_layout(discrete_token_count)
+    _, eos_token_id, pad_token_id, _ = build_shared_token_layout(discrete_token_count)
 
-    if bool(getattr(model, "use_separate_codec_embedding", False)):
-        base_tokenizer = model._resolve_default_text_tokenizer()
-        tokenizer = BackboneTextTokenizer(
-            tokenizer=base_tokenizer,
-            append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
-        )
-    else:
-        vocab_path_raw = data_cfg.get("vocab_path", "dataset/vocab.txt")
-        vocab_path = Path(vocab_path_raw)
-        if not vocab_path.is_absolute():
-            vocab_path = (Path.cwd() / vocab_path).resolve()
-        tokenizer = SharedVocabTokenizer(
-            vocab_path=vocab_path,
-            text_token_offset=text_token_offset,
-            eos_token_id=eos_token_id,
-            append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
-        )
+    tokenizer, resolved_default_tokenizer = TU.build_generation_text_tokenizer(
+        cached_default_text_tokenizer=getattr(model, "_default_text_tokenizer", None),
+        use_separate_codec_embedding=bool(getattr(model, "use_separate_codec_embedding", False)),
+        backbone_name=getattr(model, "backbone_name"),
+        backbone_hf_checkpoint=getattr(model, "backbone_hf_checkpoint"),
+        backbone_hf_kwargs=getattr(model, "backbone_hf_kwargs"),
+        discrete_vocab_size=int(getattr(model, "discrete_vocab_size")),
+        eot_token_id=int(getattr(model, "eot_token_id")),
+        eos_token_id=int(getattr(model, "eos_token_id")),
+        pad_token_id=int(getattr(model, "pad_token_id")),
+        append_eos_to_text=bool(dataset_cfg.get("append_eos_to_text", False)),
+        vocab_path=data_cfg.get("vocab_path", "dataset/vocab.txt"),
+    )
+    if hasattr(model, "_default_text_tokenizer"):
+        model._default_text_tokenizer = resolved_default_tokenizer
 
     prompt_audio, prompt_sample_rate = generate_utils.read_wav(args.prompt_audio)
 

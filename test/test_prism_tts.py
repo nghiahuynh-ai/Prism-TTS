@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -19,8 +21,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.prism_tts import PrismTTS
-from dataset.dataset import BatchCollate
+from dataset.dataset import BatchCollate, build_shared_token_layout
 from utils import model_utils as MU
+from utils import tokenizer_utils as TU
 from utils.backbone_utils import normalize_backbone_name, resolve_backbone_config_key
 from utils.model_utils import resolve_generation_discrete_eos_token_id
 
@@ -989,6 +992,135 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
 
         self.assertTrue(torch.allclose(logits_out, fixed_logits, atol=0.0, rtol=0.0))
         self.assertTrue(torch.allclose(loss, expected_loss, atol=1e-7, rtol=1e-6))
+
+    def test_build_generation_text_tokenizer_uses_requested_shared_vocab(self) -> None:
+        original_use_separate = bool(self.model.use_separate_codec_embedding)
+        original_default_tokenizer = self.model._default_text_tokenizer
+        try:
+            self.model.use_separate_codec_embedding = False
+            self.model._default_text_tokenizer = None
+            with tempfile.TemporaryDirectory() as tmpdir:
+                vocab_path = Path(tmpdir) / "vocab.txt"
+                vocab_path.write_text("x\ny\n", encoding="utf-8")
+                tokenizer, resolved_default_tokenizer = TU.build_generation_text_tokenizer(
+                    cached_default_text_tokenizer=self.model._default_text_tokenizer,
+                    use_separate_codec_embedding=self.model.use_separate_codec_embedding,
+                    backbone_name=self.model.backbone_name,
+                    backbone_hf_checkpoint=self.model.backbone_hf_checkpoint,
+                    backbone_hf_kwargs=self.model.backbone_hf_kwargs,
+                    discrete_vocab_size=self.model.discrete_vocab_size,
+                    eot_token_id=self.model.eot_token_id,
+                    eos_token_id=self.model.eos_token_id,
+                    pad_token_id=self.model.pad_token_id,
+                    append_eos_to_text=True,
+                    vocab_path=vocab_path,
+                )
+                self.model._default_text_tokenizer = resolved_default_tokenizer
+                token_ids = tokenizer("xy")
+
+            discrete_token_count = int(
+                TU.infer_shared_discrete_token_count(
+                    discrete_vocab_size=self.model.discrete_vocab_size,
+                    eot_token_id=self.model.eot_token_id,
+                    eos_token_id=self.model.eos_token_id,
+                    pad_token_id=self.model.pad_token_id,
+                )
+            )
+            _, eos_token_id, _, text_token_offset = build_shared_token_layout(discrete_token_count)
+            self.assertEqual(
+                token_ids,
+                [text_token_offset, text_token_offset + 1, eos_token_id],
+            )
+        finally:
+            self.model.use_separate_codec_embedding = original_use_separate
+            self.model._default_text_tokenizer = original_default_tokenizer
+
+    def test_build_generation_text_tokenizer_wraps_checkpoint_tokenizer_for_separate_embeddings(
+        self,
+    ) -> None:
+        class _DummyTokenizer:
+            eos_token_id = 99
+
+            @staticmethod
+            def encode(text: str, add_special_tokens: bool = False) -> list[int]:
+                del add_special_tokens
+                return [11 + index for index, _ in enumerate(text)]
+
+        original_use_separate = bool(self.model.use_separate_codec_embedding)
+        original_default_tokenizer = self.model._default_text_tokenizer
+        try:
+            self.model.use_separate_codec_embedding = True
+            self.model._default_text_tokenizer = _DummyTokenizer()
+            tokenizer, resolved_default_tokenizer = TU.build_generation_text_tokenizer(
+                cached_default_text_tokenizer=self.model._default_text_tokenizer,
+                use_separate_codec_embedding=self.model.use_separate_codec_embedding,
+                backbone_name=self.model.backbone_name,
+                backbone_hf_checkpoint=self.model.backbone_hf_checkpoint,
+                backbone_hf_kwargs=self.model.backbone_hf_kwargs,
+                discrete_vocab_size=self.model.discrete_vocab_size,
+                eot_token_id=self.model.eot_token_id,
+                eos_token_id=self.model.eos_token_id,
+                pad_token_id=self.model.pad_token_id,
+                append_eos_to_text=True,
+            )
+            self.model._default_text_tokenizer = resolved_default_tokenizer
+            self.assertEqual(tokenizer("abc"), [11, 12, 13, 99])
+        finally:
+            self.model.use_separate_codec_embedding = original_use_separate
+            self.model._default_text_tokenizer = original_default_tokenizer
+
+    def test_generate_e2e_uses_build_generation_text_tokenizer_when_not_provided(self) -> None:
+        captured: dict[str, object] = {}
+
+        def _build_tokenizer(**kwargs: object) -> tuple[object, object]:
+            captured["append_eos_to_text"] = kwargs.get("append_eos_to_text")
+            captured["vocab_path"] = kwargs.get("vocab_path")
+
+            def _tokenizer(_: str) -> list[int]:
+                return [7, 8]
+
+            return _tokenizer, object()
+
+        def _speech_encoder(raw_prompt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            frame_count = int(raw_prompt.shape[0])
+            discrete = torch.zeros(frame_count, self.num_discrete_tokens, dtype=torch.long)
+            continuous = torch.zeros(frame_count, self.continuous_latent_size, dtype=torch.float32)
+            return discrete, continuous
+
+        fake_generation = MU.PrismTTSGenerationOutput(
+            text_ids=torch.zeros((1, 1), dtype=torch.long),
+            discrete_ids=torch.zeros((1, self.num_discrete_tokens, 1), dtype=torch.long),
+            continuous_latents=torch.zeros((1, 1, self.continuous_latent_size), dtype=torch.float32),
+            prior_latents=torch.zeros((1, 1, self.continuous_latent_size), dtype=torch.float32),
+            discrete_logits=tuple(),
+        )
+
+        with mock.patch.object(
+            TU,
+            "build_generation_text_tokenizer",
+            side_effect=_build_tokenizer,
+        ) as mock_builder, mock.patch.object(
+            self.model,
+            "generate",
+            return_value=fake_generation,
+        ) as mock_generate:
+            output = self.model.generate_e2e(
+                raw_text_prompt="hi",
+                raw_speech_prompt=torch.tensor([0.1, -0.2], device=self.device),
+                raw_text_target="ok",
+                append_eos_to_text=True,
+                shared_vocab_path="custom_vocab.txt",
+                speech_encoder=_speech_encoder,
+                max_new_blocks=1,
+                do_sample=False,
+                return_dict=True,
+            )
+
+        self.assertIs(output, fake_generation)
+        self.assertEqual(captured["append_eos_to_text"], True)
+        self.assertEqual(captured["vocab_path"], "custom_vocab.txt")
+        mock_builder.assert_called_once()
+        mock_generate.assert_called_once()
 
     def test_generate_e2e_accepts_string_and_raw_speech_prompt(self) -> None:
         eos_id = int(

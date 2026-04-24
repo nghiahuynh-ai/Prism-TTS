@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from models.flow_head import FlowHead
 from utils import model_utils as MU
 from utils import backbone_utils as BU
+from utils import tokenizer_utils as TU
 
 
 class PrismTTS(nn.Module):
@@ -1694,47 +1695,6 @@ class PrismTTS(nn.Module):
             collected_logits,
         )
 
-    @staticmethod
-    def _tokenize_text_with_any_tokenizer(
-        tokenizer: Callable[[str], Sequence[int]] | Any,
-        text: str,
-    ) -> list[int]:
-        from dataset.dataset import tokenize_with_external_tokenizer
-
-        token_ids = tokenize_with_external_tokenizer(tokenizer, text)
-        return [int(token_id) for token_id in token_ids]
-
-    def _resolve_default_text_tokenizer(self) -> Callable[[str], Sequence[int]]:
-        if self._default_text_tokenizer is not None:
-            return self._default_text_tokenizer
-        if self.use_separate_codec_embedding:
-            tokenizer = BU.build_backbone_text_tokenizer(
-                backbone_name=self.backbone_name,
-                backbone_hf_checkpoint=self.backbone_hf_checkpoint,
-                backbone_hf_kwargs=self.backbone_hf_kwargs,
-                require_checkpoint=True,
-            )
-            self._default_text_tokenizer = tokenizer
-            return self._default_text_tokenizer
-
-        from dataset.dataset import SharedVocabTokenizer, build_shared_token_layout
-
-        discrete_token_count = int(self.discrete_vocab_size) - 3
-        if discrete_token_count < 1:
-            raise ValueError(
-                "Cannot infer tokenizer shared layout: discrete_vocab_size must be >= 4."
-            )
-        _, eos_token_id, _, text_token_offset = build_shared_token_layout(discrete_token_count)
-        vocab_path = Path(__file__).resolve().parents[1] / "dataset" / "vocab.txt"
-        self._default_text_tokenizer = SharedVocabTokenizer(
-            vocab_path=vocab_path,
-            text_token_offset=text_token_offset,
-            eos_token_id=eos_token_id,
-            append_eos=False,
-        )
-        return self._default_text_tokenizer
-
-
     @torch.no_grad()
     def generate_e2e(
         self,
@@ -1743,6 +1703,8 @@ class PrismTTS(nn.Module):
         raw_text_target: str | Sequence[str],
         *,
         text_tokenizer: Optional[Callable[[str], Sequence[int]]] = None,
+        append_eos_to_text: bool = False,
+        shared_vocab_path: str | Path | None = None,
         speech_encoder: Optional[Callable[[Any], tuple[torch.Tensor, torch.Tensor]]] = None,
         speech_decoder: Optional[Callable[[torch.Tensor], Any]] = None,
         output_type: str = "tensor",
@@ -1762,8 +1724,10 @@ class PrismTTS(nn.Module):
         - continuous latents with shape [L, D] (or [D, L], accepted and transposed)
         where N=num_discrete_tokens and D=continuous_latent_size.
 
-        If `text_tokenizer` is None, use the checkpoint tokenizer for Gemma/Qwen
-        (when configured), otherwise fall back to `SharedVocabTokenizer`.
+        If `text_tokenizer` is None, use utils tokenizer helpers:
+        checkpoint-native tokenizer for Gemma/Qwen, otherwise shared vocab.
+        `append_eos_to_text` and `shared_vocab_path` are applied only in this
+        default-tokenizer path.
         If `speech_encoder` and/or `speech_decoder` is None, initialize the
         missing component(s) from Mimi.
 
@@ -1796,7 +1760,20 @@ class PrismTTS(nn.Module):
         continuous_dtype = self.continuous_proj.weight.dtype
 
         if text_tokenizer is None:
-            text_tokenizer = self._resolve_default_text_tokenizer()
+            text_tokenizer, resolved_default_tokenizer = TU.build_generation_text_tokenizer(
+                cached_default_text_tokenizer=self._default_text_tokenizer,
+                use_separate_codec_embedding=self.use_separate_codec_embedding,
+                backbone_name=self.backbone_name,
+                backbone_hf_checkpoint=self.backbone_hf_checkpoint,
+                backbone_hf_kwargs=self.backbone_hf_kwargs,
+                discrete_vocab_size=self.discrete_vocab_size,
+                eot_token_id=self.eot_token_id,
+                eos_token_id=self.eos_token_id,
+                pad_token_id=self.pad_token_id,
+                append_eos_to_text=append_eos_to_text,
+                vocab_path=shared_vocab_path,
+            )
+            self._default_text_tokenizer = resolved_default_tokenizer
 
         needs_default_mimi_encoder = speech_encoder is None
         needs_default_mimi_decoder = speech_decoder is None
@@ -1828,11 +1805,11 @@ class PrismTTS(nn.Module):
         speech_continuous_list: list[torch.FloatTensor] = []
 
         for sample_idx in range(batch_size):
-            prompt_tokens = self._tokenize_text_with_any_tokenizer(
+            prompt_tokens = TU.tokenize_text_with_any_tokenizer(
                 text_tokenizer,
                 prompt_text_list[sample_idx],
             )
-            target_tokens = self._tokenize_text_with_any_tokenizer(
+            target_tokens = TU.tokenize_text_with_any_tokenizer(
                 text_tokenizer,
                 target_text_list[sample_idx],
             )
