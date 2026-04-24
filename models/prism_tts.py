@@ -140,12 +140,11 @@ class PrismTTS(nn.Module):
         )
         self.masked_continuous_embedding = nn.Parameter(torch.empty(self.hidden_size))
 
-        # Flow head conditions on the continuous prior.
+        # Flow head is timestep-conditioned; prior enters via x0 construction.
         self.flow_head = FlowHead(
             in_channels=self.continuous_latent_size,
             model_channels=flow_model_channels or self.hidden_size,
             out_channels=self.continuous_latent_size,
-            z_channels=self.continuous_latent_size,
             num_res_blocks=flow_num_res_blocks,
         )
 
@@ -345,42 +344,106 @@ class PrismTTS(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         continuous_values: torch.FloatTensor,
+        token_type_ids: torch.LongTensor,
         target_block_ids: torch.LongTensor,
+        target_block_counts: torch.LongTensor,
         masked_continuous_positions: torch.BoolTensor,
         flow_timesteps: Optional[torch.FloatTensor],
         noise: Optional[torch.FloatTensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute continuous prior MSE loss and flow-matching denoising loss."""
+        """
+        Compute continuous losses with sequence-level latent mixing.
+
+        Training flow:
+        1) Predict per-target-block priors with the backbone hidden states.
+        2) Build x0 = prior + eps and xt = t * x1 + (1 - t) * x0, where x1 is clean latent.
+        3) Mix clean and noised-prior latents by replacing only masked blocks with xt.
+        4) Run DiT flow head over the mixed sequence and compute flow loss on masked blocks only.
+        """
         if not masked_continuous_positions.any():
             zero = hidden_states.new_zeros(())
             return zero, zero
 
-        selected_hidden = hidden_states[masked_continuous_positions]
-        prior_prediction = self.continuous_prior_head(selected_hidden)
-        target_continuous = continuous_values[masked_continuous_positions]
-        reconstruction_loss = F.mse_loss(prior_prediction, target_continuous)
-
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
-        batch_indices = (
+        device = hidden_states.device
+        zero = hidden_states.new_zeros(())
+
+        target_continuous_positions = (
+            (target_block_ids >= 0)
+            & (token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE)
+        )
+        if not target_continuous_positions.any():
+            return zero, zero
+
+        max_target_blocks = int(target_block_counts.max().item()) if batch_size > 0 else 0
+        if max_target_blocks <= 0:
+            return zero, zero
+
+        batch_index_grid = (
             torch.arange(batch_size, device=hidden_states.device)
             .unsqueeze(1)
             .expand(batch_size, seq_len)
-        )[masked_continuous_positions]
-        target_block_indices = target_block_ids[masked_continuous_positions]
+        )
+        target_batch_indices = batch_index_grid[target_continuous_positions]
+        target_block_indices = target_block_ids[target_continuous_positions]
+        if target_block_indices.numel() > 0 and int(target_block_indices.max().item()) >= max_target_blocks:
+            raise ValueError("target_block_ids exceed target_block_counts.")
 
-        selected_flow_timesteps: Optional[torch.FloatTensor] = None
+        target_hidden = hidden_states[target_continuous_positions]
+        target_clean_latents = continuous_values[target_continuous_positions]
+        target_prior_latents = self.continuous_prior_head(target_hidden)
+        target_masked_flags = masked_continuous_positions[target_continuous_positions]
+
+        if target_masked_flags.any():
+            reconstruction_loss = F.mse_loss(
+                target_prior_latents[target_masked_flags],
+                target_clean_latents[target_masked_flags],
+            )
+        else:
+            reconstruction_loss = zero
+
+        clean_by_block = hidden_states.new_zeros(
+            (batch_size, max_target_blocks, self.continuous_latent_size)
+        )
+        prior_by_block = hidden_states.new_zeros(
+            (batch_size, max_target_blocks, self.continuous_latent_size)
+        )
+        valid_by_block = torch.zeros(batch_size, max_target_blocks, dtype=torch.bool, device=device)
+        masked_by_block = torch.zeros(batch_size, max_target_blocks, dtype=torch.bool, device=device)
+
+        clean_by_block[target_batch_indices, target_block_indices] = target_clean_latents
+        prior_by_block[target_batch_indices, target_block_indices] = target_prior_latents
+        valid_by_block[target_batch_indices, target_block_indices] = True
+        masked_by_block[target_batch_indices, target_block_indices] = target_masked_flags
+
+        expected_valid = (
+            torch.arange(max_target_blocks, device=device, dtype=torch.long).unsqueeze(0)
+            < target_block_counts.to(device=device, dtype=torch.long).unsqueeze(1)
+        )
+        valid_by_block = valid_by_block & expected_valid
+        masked_by_block = masked_by_block & valid_by_block
+        if not masked_by_block.any():
+            return reconstruction_loss, zero
+
         if flow_timesteps is not None:
             if flow_timesteps.dim() != 2 or flow_timesteps.shape[0] != batch_size:
                 raise ValueError("flow_timesteps must have shape [batch, target_blocks].")
-            max_target_blocks = int(target_block_indices.max().item()) + 1
             if flow_timesteps.shape[1] < max_target_blocks:
                 raise ValueError(
                     "flow_timesteps length must cover all target speech blocks."
                 )
-            selected_flow_timesteps = flow_timesteps[batch_indices, target_block_indices]
+            sampled_timesteps = flow_timesteps[:, :max_target_blocks].to(
+                device=device,
+                dtype=clean_by_block.dtype,
+            )
+        else:
+            sampled_timesteps = torch.rand(
+                (batch_size, max_target_blocks),
+                device=device,
+                dtype=clean_by_block.dtype,
+            )
 
-        selected_noise: Optional[torch.FloatTensor] = None
         if noise is not None:
             if noise.dim() != 3 or noise.shape[0] != batch_size:
                 raise ValueError(
@@ -391,22 +454,33 @@ class PrismTTS(nn.Module):
                     "noise channel mismatch: expected "
                     f"{self.continuous_latent_size}, got {noise.shape[2]}."
                 )
-            max_target_blocks = int(target_block_indices.max().item()) + 1
             if noise.shape[1] < max_target_blocks:
                 raise ValueError("noise must cover all target speech blocks.")
-            selected_noise = noise[batch_indices, target_block_indices, :]
+            sampled_noise = noise[:, :max_target_blocks, :].to(
+                device=device,
+                dtype=clean_by_block.dtype,
+            )
+        else:
+            sampled_noise = torch.randn_like(clean_by_block)
 
-        flow_inputs, flow_target, sampled_timesteps = MU.sample_flow_training_inputs(
-            continuous_targets=target_continuous,
-            flow_timesteps=selected_flow_timesteps,
-            noise=selected_noise,
-        )
+        x1 = clean_by_block
+        x0 = prior_by_block + sampled_noise
+        t = sampled_timesteps.unsqueeze(-1)
+        xt = t * x1 + (1.0 - t) * x0
+
+        mixed_inputs = x1.clone()
+        mixed_inputs[masked_by_block] = xt[masked_by_block]
+        flow_target = x1 - x0
+
         flow_prediction = self.flow_head(
-            flow_inputs,
+            mixed_inputs,
             sampled_timesteps,
-            prior_prediction,
+            mask=valid_by_block,
         )
-        flow_loss = F.mse_loss(flow_prediction, flow_target)
+        flow_loss = F.mse_loss(
+            flow_prediction[masked_by_block],
+            flow_target[masked_by_block],
+        )
         return reconstruction_loss, flow_loss
 
     def _sample_discrete_ids(
@@ -431,32 +505,34 @@ class PrismTTS(nn.Module):
         cond: torch.FloatTensor,
         num_steps: Optional[int] = None,
     ) -> torch.FloatTensor:
-        """Generate continuous latents by integrating the flow field from Gaussian noise."""
+        """Generate continuous latents by integrating from x0 = prior + eps."""
         num_steps = num_steps or self.flow_sample_steps
         if num_steps < 1:
             raise ValueError("num_steps must be at least 1.")
 
-        cond_shape = cond.shape[:-1]
-        flat_cond = cond.reshape(-1, cond.shape[-1])
-        x = torch.randn(
-            flat_cond.shape[0],
-            self.continuous_latent_size,
-            device=cond.device,
-            dtype=cond.dtype,
-        )
+        squeeze_seq_dim = False
+        if cond.dim() == 2:
+            cond = cond.unsqueeze(1)
+            squeeze_seq_dim = True
+        elif cond.dim() != 3:
+            raise ValueError("cond must have shape [batch, channels] or [batch, seq, channels].")
+
+        x = cond + torch.randn_like(cond)
         dt = 1.0 / num_steps
 
         for step_idx in range(num_steps):
             t = torch.full(
-                (flat_cond.shape[0],),
+                (cond.shape[0],),
                 step_idx / num_steps,
                 device=cond.device,
                 dtype=cond.dtype,
             )
-            velocity = self.flow_head(x, t, flat_cond)
+            velocity = self.flow_head(x, t)
             x = x + dt * velocity
 
-        return x.reshape(*cond_shape, self.continuous_latent_size)
+        if squeeze_seq_dim:
+            return x.squeeze(1)
+        return x
 
     def _encode(
         self,
@@ -548,7 +624,9 @@ class PrismTTS(nn.Module):
         continuous_loss, flow_loss = self._compute_continuous_losses(
             hidden_states=hidden_states,
             continuous_values=flat.continuous_values,
+            token_type_ids=flat.token_type_ids,
             target_block_ids=flat.target_block_ids,
+            target_block_counts=flat.target_block_counts,
             masked_continuous_positions=masked_continuous_positions,
             flow_timesteps=flow_timesteps,
             noise=noise,
