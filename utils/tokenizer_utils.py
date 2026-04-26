@@ -117,20 +117,19 @@ def build_generation_text_tokenizer(
 ) -> tuple[Callable[[str], Sequence[int]], Any]:
     from dataset.dataset import BackboneTextTokenizer, SharedVocabTokenizer, build_shared_token_layout
 
-    default_tokenizer = resolve_default_text_tokenizer(
-        cached_tokenizer=cached_default_text_tokenizer,
-        use_separate_codec_embedding=use_separate_codec_embedding,
-        backbone_name=backbone_name,
-        backbone_hf_checkpoint=backbone_hf_checkpoint,
-        backbone_hf_kwargs=backbone_hf_kwargs,
-        discrete_vocab_size=discrete_vocab_size,
-        eot_token_id=eot_token_id,
-        eos_token_id=eos_token_id,
-        pad_token_id=pad_token_id,
-        default_shared_vocab_path=default_shared_vocab_path,
-    )
-
     if use_separate_codec_embedding:
+        default_tokenizer = resolve_default_text_tokenizer(
+            cached_tokenizer=cached_default_text_tokenizer,
+            use_separate_codec_embedding=use_separate_codec_embedding,
+            backbone_name=backbone_name,
+            backbone_hf_checkpoint=backbone_hf_checkpoint,
+            backbone_hf_kwargs=backbone_hf_kwargs,
+            discrete_vocab_size=discrete_vocab_size,
+            eot_token_id=eot_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            default_shared_vocab_path=default_shared_vocab_path,
+        )
         return (
             BackboneTextTokenizer(
                 tokenizer=default_tokenizer,
@@ -147,8 +146,23 @@ def build_generation_text_tokenizer(
     )
     _, resolved_eos_token_id, _, text_token_offset = build_shared_token_layout(discrete_token_count)
 
-    if vocab_path is None and not append_eos_to_text and isinstance(default_tokenizer, SharedVocabTokenizer):
-        return default_tokenizer, default_tokenizer
+    cached_tokenizer = cached_default_text_tokenizer
+    if vocab_path is None and not append_eos_to_text:
+        default_tokenizer = resolve_default_text_tokenizer(
+            cached_tokenizer=cached_default_text_tokenizer,
+            use_separate_codec_embedding=use_separate_codec_embedding,
+            backbone_name=backbone_name,
+            backbone_hf_checkpoint=backbone_hf_checkpoint,
+            backbone_hf_kwargs=backbone_hf_kwargs,
+            discrete_vocab_size=discrete_vocab_size,
+            eot_token_id=eot_token_id,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+            default_shared_vocab_path=default_shared_vocab_path,
+        )
+        cached_tokenizer = default_tokenizer
+        if isinstance(default_tokenizer, SharedVocabTokenizer):
+            return default_tokenizer, default_tokenizer
 
     if vocab_path is None:
         if default_shared_vocab_path is None:
@@ -165,5 +179,5 @@ def build_generation_text_tokenizer(
             eos_token_id=resolved_eos_token_id,
             append_eos=append_eos_to_text,
         ),
-        default_tokenizer,
+        cached_tokenizer,
     )
