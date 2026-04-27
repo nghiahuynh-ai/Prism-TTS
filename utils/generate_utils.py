@@ -113,6 +113,7 @@ def build_model(model_config: dict[str, Any], *, hf_token: Optional[str] = None)
         backbone_hf_checkpoint=backbone_spec.hf_checkpoint,
         backbone_hf_strict=backbone_spec.hf_strict,
         backbone_hf_kwargs=backbone_hf_kwargs,
+        backbone_lora_config=backbone_spec.lora_config,
     )
 
 

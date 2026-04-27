@@ -24,12 +24,86 @@ from models.prism_tts import PrismTTS
 from dataset.dataset import BatchCollate, build_shared_token_layout
 from utils import model_utils as MU
 from utils import tokenizer_utils as TU
-from utils.backbone_utils import normalize_backbone_name, resolve_backbone_config_key
+from utils.backbone_utils import (
+    normalize_backbone_name,
+    resolve_backbone_config_key,
+    resolve_backbone_spec,
+)
 from utils.model_utils import resolve_generation_discrete_eos_token_id
 
 
 MODEL_CONFIG_PATH = PROJECT_ROOT / "config" / "model.yaml"
 MIN_REASONABLE_PARAM_COUNT = 90_000_000
+
+
+def _selected_backbone_name_from_model_config() -> str:
+    """
+    Resolve selected backbone name directly from config/model.yaml for test gating.
+    """
+    model_cfg = load_model_config()
+    backbone_payload = model_cfg.get("backbone")
+    backbone_name_raw: object = "llama"
+    if isinstance(backbone_payload, str):
+        backbone_name_raw = backbone_payload
+    elif isinstance(backbone_payload, dict):
+        backbone_name_raw = backbone_payload.get("name", "llama")
+    elif backbone_payload is not None:
+        raise ValueError("model.backbone must be a mapping, string, or null.")
+    return normalize_backbone_name(backbone_name_raw)
+
+
+def _count_trainable_and_non_trainable_params(model: torch.nn.Module) -> tuple[int, int]:
+    trainable = 0
+    non_trainable = 0
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            trainable += parameter.numel()
+        else:
+            non_trainable += parameter.numel()
+    return trainable, non_trainable
+
+
+def _submodule_param_counts_by_trainability(
+    model: torch.nn.Module,
+    *,
+    max_module_depth: int = 2,
+) -> tuple[dict[str, int], dict[str, int]]:
+    if max_module_depth < 1:
+        raise ValueError("max_module_depth must be >= 1.")
+
+    trainable_submodules: dict[str, int] = {}
+    non_trainable_submodules: dict[str, int] = {}
+    for parameter_name, parameter in model.named_parameters():
+        if "." not in parameter_name:
+            submodule_name = "<root>"
+        else:
+            full_submodule_name = parameter_name.rsplit(".", 1)[0]
+            submodule_parts = full_submodule_name.split(".")
+            if len(submodule_parts) > max_module_depth:
+                submodule_name = ".".join(submodule_parts[:max_module_depth])
+            else:
+                submodule_name = full_submodule_name
+        if parameter.requires_grad:
+            trainable_submodules[submodule_name] = (
+                trainable_submodules.get(submodule_name, 0) + parameter.numel()
+            )
+        else:
+            non_trainable_submodules[submodule_name] = (
+                non_trainable_submodules.get(submodule_name, 0) + parameter.numel()
+            )
+    return trainable_submodules, non_trainable_submodules
+
+
+def _print_submodule_param_counts(header: str, submodule_counts: dict[str, int]) -> None:
+    print(header)
+    if not submodule_counts:
+        print("(none)")
+        return
+    for submodule_name, param_count in sorted(
+        submodule_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    ):
+        print(f"{submodule_name}: {param_count:,}")
 
 
 @lru_cache(maxsize=1)
@@ -92,6 +166,67 @@ def make_small_backbone_setup() -> tuple[str, dict]:
     return backbone_name, small_cfg
 
 
+_LLADA_SUMMARY_ONLY_MODE = _selected_backbone_name_from_model_config() == "llada"
+
+
+@unittest.skipUnless(_LLADA_SUMMARY_ONLY_MODE, "LLaDA summary-only mode is disabled.")
+class TestPrismTTSLladaSummaryOnly(unittest.TestCase):
+    def test_print_llada_model_and_param_counts(self) -> None:
+        torch.manual_seed(0)
+        device = torch.device("cpu")
+        model_cfg = load_model_config()
+        backbone_spec = resolve_backbone_spec(model_cfg)
+        if backbone_spec.name != "llada":
+            raise ValueError("LLaDA summary-only mode requires model.backbone.name='llada'.")
+        if backbone_spec.hf_checkpoint is None:
+            raise ValueError(
+                "LLaDA summary-only mode requires model.backbone.hf_checkpoint "
+                "(e.g. GSAI-ML/LLaDA-8B-Base)."
+            )
+
+        llada_cfg_payload = (
+            dict(backbone_spec.config) if isinstance(backbone_spec.config, dict) else None
+        )
+        prism_cfg = model_cfg["prism_tts"]
+        model = PrismTTS(
+            backbone_name="llada",
+            backbone_config=llada_cfg_payload,
+            backbone_hf_checkpoint=backbone_spec.hf_checkpoint,
+            backbone_hf_strict=backbone_spec.hf_strict,
+            backbone_hf_kwargs=backbone_spec.hf_kwargs,
+            backbone_lora_config=backbone_spec.lora_config,
+            num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
+            discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
+            continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
+            flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
+            flow_model_channels=prism_cfg.get("flow_model_channels"),
+            flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
+            flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
+        ).to(device)
+        total_params = sum(parameter.numel() for parameter in model.parameters())
+        trainable_params, non_trainable_params = _count_trainable_and_non_trainable_params(model)
+        trainable_submodules, non_trainable_submodules = _submodule_param_counts_by_trainability(
+            model
+        )
+
+        print("=" * 100)
+        print("LLaDA Summary-Only Test Model:")
+        print(model)
+        print("-" * 100)
+        print(f"Total Parameters: {total_params:,}")
+        print(f"Trainable Parameters: {trainable_params:,}")
+        print(f"Non-trainable Parameters: {non_trainable_params:,}")
+        print("-" * 100)
+        _print_submodule_param_counts("Trainable Submodules:", trainable_submodules)
+        print("-" * 100)
+        _print_submodule_param_counts("Non-trainable Submodules:", non_trainable_submodules)
+        print("=" * 100)
+
+
+@unittest.skipIf(
+    _LLADA_SUMMARY_ONLY_MODE,
+    "LLaDA selected: skipping assertion tests; summary-only mode prints model and parameter counts.",
+)
 class TestPrismTTS(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -121,6 +256,10 @@ class TestPrismTTS(unittest.TestCase):
     @classmethod
     def _print_model_summary(cls):
         component_param_counts = cls._component_param_counts()
+        trainable_params, non_trainable_params = _count_trainable_and_non_trainable_params(cls.model)
+        trainable_submodules, non_trainable_submodules = _submodule_param_counts_by_trainability(
+            cls.model
+        )
         print("=" * 100)
         print("Model Architecture:")
         print(cls.model)
@@ -129,6 +268,12 @@ class TestPrismTTS(unittest.TestCase):
         print(cls.model.backbone.config)
         print("-" * 100)
         print(f"Total Parameters: {cls.model_num_params:,}")
+        print(f"Trainable Parameters: {trainable_params:,}")
+        print(f"Non-trainable Parameters: {non_trainable_params:,}")
+        print("-" * 100)
+        _print_submodule_param_counts("Trainable Submodules:", trainable_submodules)
+        print("-" * 100)
+        _print_submodule_param_counts("Non-trainable Submodules:", non_trainable_submodules)
         print("-" * 100)
         print("Component Parameters:")
         for component_name in sorted(component_param_counts):
@@ -383,6 +528,10 @@ class TestPrismTTS(unittest.TestCase):
             (batch_size, self.num_discrete_tokens, self.discrete_vocab_size),
         )
 
+@unittest.skipIf(
+    _LLADA_SUMMARY_ONLY_MODE,
+    "LLaDA selected: skipping assertion tests; summary-only mode prints model and parameter counts.",
+)
 class TestPrismTTSGenerationAlignment(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(0)

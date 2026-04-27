@@ -437,16 +437,21 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
     uses_checkpoint_text_tokenizer = should_use_checkpoint_text_tokenizer(backbone_spec.name)
     if uses_checkpoint_text_tokenizer and backbone_spec.hf_checkpoint is None:
         raise ValueError(
-            "Gemma/Qwen backbones require model.backbone.hf_checkpoint so text tokenization "
+            "Gemma/Qwen/LLaDA backbones require model.backbone.hf_checkpoint so text tokenization "
             "can be inherited from the pretrained checkpoint."
         )
     if backbone_cfg is not None:
-        backbone_vocab_size = int(backbone_cfg["vocab_size"])
-        if not uses_checkpoint_text_tokenizer and discrete_vocab_size > backbone_vocab_size:
-            raise ValueError(
-                f"model.prism_tts.discrete_vocab_size must be <= {backbone_cfg_path}.vocab_size "
-                "because text and discrete embeddings are unified."
-            )
+        if not uses_checkpoint_text_tokenizer:
+            if "vocab_size" not in backbone_cfg:
+                raise ValueError(
+                    f"{backbone_cfg_path}.vocab_size is required when text/discrete embeddings are unified."
+                )
+            backbone_vocab_size = int(backbone_cfg["vocab_size"])
+            if discrete_vocab_size > backbone_vocab_size:
+                raise ValueError(
+                    f"model.prism_tts.discrete_vocab_size must be <= {backbone_cfg_path}.vocab_size "
+                    "because text and discrete embeddings are unified."
+                )
 
         if "pad_token_id" in backbone_cfg and int(backbone_cfg["pad_token_id"]) != pad_id:
             raise ValueError(
@@ -505,6 +510,7 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         backbone_hf_checkpoint=backbone_spec.hf_checkpoint,
         backbone_hf_strict=backbone_spec.hf_strict,
         backbone_hf_kwargs=backbone_spec.hf_kwargs,
+        backbone_lora_config=backbone_spec.lora_config,
     )
 
 

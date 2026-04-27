@@ -9,8 +9,8 @@ model:
   # PRISM_TTS_BACKBONE(_NAME), PRISM_TTS_BACKBONE_HF_CHECKPOINT,
   # PRISM_TTS_HF_TOKEN / HUGGINGFACE_HUB_TOKEN / HF_TOKEN, etc.
   backbone:
-    # Supported: llama, gemma, qwen
-    name: gemma3
+    # Supported: llama, gemma, qwen, llada
+    name: llada
     # Optional: override the config section key. Defaults to "<name>_config".
     # config_key: llama_config
     # Optional HF checkpoint for initializing the selected backbone.
@@ -18,18 +18,31 @@ model:
     #   - meta-llama/Llama-3.2-1B
     #   - google/gemma-3-1b-it
     #   - Qwen/Qwen3-1.7B
+    #   - GSAI-ML/LLaDA-8B-Base
     # Default HF checkpoint for selected backbone (`name` above).
     # If you switch backbone name, update this accordingly.
-    hf_checkpoint: google/gemma-3-270m
+    hf_checkpoint: GSAI-ML/LLaDA-8B-Base
     hf_strict: true
     # Optional HF loader options (used only when hf_checkpoint is set).
     hf_token: null
     hf_revision: null
     hf_cache_dir: null
     hf_subfolder: null
-    hf_trust_remote_code: false
+    hf_trust_remote_code: true
     hf_local_files_only: false
     hf_force_download: false
+    # LoRA config (always applied when backbone.name is llada).
+    # `target_modules` is only valid for LLaDA.
+    lora:
+      enabled: true
+      r: 16
+      alpha: 32
+      dropout: 0.05
+      bias: none
+      target_modules: [q_proj, k_proj, v_proj, attn_out, ff_proj, up_proj, ff_out]
+      modules_to_save: null
+      use_rslora: false
+      init_lora_weights: true
 
   prism_tts:
     # Number of discrete streams per speech block.
@@ -175,3 +188,10 @@ model:
     rope_parameters:
       rope_type: default
       rope_theta: 1000000.0
+
+  # LLaDA config overrides used with model.backbone.hf_checkpoint.
+  # Recommended checkpoint: `GSAI-ML/LLaDA-8B-Base`.
+  llada_config:
+    pad_token_id: 2050
+    eos_token_id: 2049
+    use_cache: false

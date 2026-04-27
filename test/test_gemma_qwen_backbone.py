@@ -20,6 +20,13 @@ except Exception:  # pragma: no cover - optional dependency by environment
     Qwen3Config = None  # type: ignore[assignment]
 
 
+def _print_trainable_and_non_trainable_params(model: torch.nn.Module, *, label: str) -> None:
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    non_trainable = sum(parameter.numel() for parameter in model.parameters() if not parameter.requires_grad)
+    print(f"[{label}] Trainable Parameters: {trainable:,}")
+    print(f"[{label}] Non-trainable Parameters: {non_trainable:,}")
+
+
 @unittest.skipIf(Gemma3TextConfig is None, "Gemma3 config support is unavailable.")
 class TestGemmaBackboneMaskedAttention(unittest.TestCase):
     def test_forces_non_causal_full_attention(self):
@@ -42,6 +49,7 @@ class TestGemmaBackboneMaskedAttention(unittest.TestCase):
         config._attn_implementation = "eager"
 
         backbone = GemmaBackbone(config)
+        _print_trainable_and_non_trainable_params(backbone, label="GemmaBackbone")
 
         self.assertEqual(
             list(backbone.layer_types),
@@ -85,6 +93,7 @@ class TestQwenBackboneMaskedAttention(unittest.TestCase):
         config._attn_implementation = "eager"
 
         backbone = QwenBackbone(config)
+        _print_trainable_and_non_trainable_params(backbone, label="QwenBackbone")
 
         self.assertEqual(
             list(backbone.layer_types),

@@ -13,6 +13,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = PROJECT_ROOT / "models" / "llama_backbone.py"
 
 
+def _print_trainable_and_non_trainable_params(model: torch.nn.Module, *, label: str) -> None:
+    trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+    non_trainable = sum(parameter.numel() for parameter in model.parameters() if not parameter.requires_grad)
+    print(f"[{label}] Trainable Parameters: {trainable:,}")
+    print(f"[{label}] Non-trainable Parameters: {non_trainable:,}")
+
+
 def load_llama_backbone():
     spec = importlib.util.spec_from_file_location("prism_llama_backbone", MODEL_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -38,11 +45,15 @@ class TestLlamaBackbone(unittest.TestCase):
     def setUpClass(cls):
         torch.manual_seed(0)
         cls.LlamaBackbone = load_llama_backbone()
+        cls._printed_param_summary = False
 
     def setUp(self):
         torch.manual_seed(0)
         self.device = torch.device("cpu")
         self.model = self.LlamaBackbone(make_config()).to(self.device).eval()
+        if not type(self)._printed_param_summary:
+            _print_trainable_and_non_trainable_params(self.model, label="LlamaBackbone")
+            type(self)._printed_param_summary = True
 
     def test_forward_with_attention_mask(self):
         input_ids = torch.tensor(

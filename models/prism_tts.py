@@ -46,6 +46,7 @@ class PrismTTS(nn.Module):
         backbone_hf_checkpoint: Optional[str] = None,
         backbone_hf_strict: bool = True,
         backbone_hf_kwargs: Optional[dict[str, Any]] = None,
+        backbone_lora_config: Optional[dict[str, Any]] = None,
     ):
         """Initialize model modules, embeddings, loss weights, and special-token ids."""
         super().__init__()
@@ -79,6 +80,7 @@ class PrismTTS(nn.Module):
         resolved_backbone_name = BU.normalize_backbone_name(backbone_name)
         self.backbone_hf_checkpoint = BU.normalize_optional_string(backbone_hf_checkpoint)
         self.backbone_hf_kwargs = dict(backbone_hf_kwargs or {})
+        self.backbone_lora_config = dict(backbone_lora_config or {})
         if backbone_config is None and self.backbone_hf_checkpoint is None:
             raise ValueError(
                 "Provide backbone_config, or set model.backbone.hf_checkpoint."
@@ -91,8 +93,9 @@ class PrismTTS(nn.Module):
             backbone_hf_checkpoint=self.backbone_hf_checkpoint,
             backbone_hf_strict=backbone_hf_strict,
             backbone_hf_kwargs=self.backbone_hf_kwargs,
+            backbone_lora_config=self.backbone_lora_config,
         )
-        self.use_separate_codec_embedding = self.backbone_name in {"gemma", "qwen"}
+        self.use_separate_codec_embedding = self.backbone_name in {"gemma", "qwen", "llada"}
 
         backbone_vocab_size = int(self.backbone.config.vocab_size)
         if not self.use_separate_codec_embedding and discrete_vocab_size > backbone_vocab_size:
@@ -1725,7 +1728,7 @@ class PrismTTS(nn.Module):
         where N=num_discrete_tokens and D=continuous_latent_size.
 
         If `text_tokenizer` is None, use utils tokenizer helpers:
-        checkpoint-native tokenizer for Gemma/Qwen, otherwise shared vocab.
+        checkpoint-native tokenizer for Gemma/Qwen/LLaDA, otherwise shared vocab.
         `append_eos_to_text` and `shared_vocab_path` are applied only in this
         default-tokenizer path.
         If `speech_encoder` and/or `speech_decoder` is None, initialize the

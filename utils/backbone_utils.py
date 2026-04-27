@@ -9,6 +9,7 @@ import torch.nn as nn
 from transformers import LlamaConfig
 
 if TYPE_CHECKING:
+    from models.llada_backbone import LladaBackbone
     from models.llama_backbone import LlamaBackbone
 
 __all__ = [
@@ -31,12 +32,14 @@ class BackboneSpec:
     hf_checkpoint: Optional[str]
     hf_strict: bool
     hf_kwargs: dict[str, Any]
+    lora_config: dict[str, Any]
 
 
 _BACKBONE_NAME_ALIASES: dict[str, str] = {
     "llama": "llama",
     "llama2": "llama",
     "llama3": "llama",
+    "llada": "llada",
     "gemma": "gemma",
     "gemma3": "gemma",
     "qwen": "qwen",
@@ -131,7 +134,7 @@ def normalize_backbone_name(backbone_name: Any) -> str:
 
 def should_use_checkpoint_text_tokenizer(backbone_name: Any) -> bool:
     """Return whether text tokenization must come from the HF backbone checkpoint."""
-    return normalize_backbone_name(backbone_name) in {"gemma", "qwen"}
+    return normalize_backbone_name(backbone_name) in {"gemma", "qwen", "llada"}
 
 
 def build_backbone_text_tokenizer(
@@ -144,7 +147,7 @@ def build_backbone_text_tokenizer(
     """
     Load the text tokenizer from a backbone checkpoint when required.
 
-    Gemma and Qwen backbones rely on checkpoint-native tokenization so their
+    Gemma, Qwen, and LLaDA backbones rely on checkpoint-native tokenization so their
     pretrained text embedding table stays aligned with token ids.
     """
     if not should_use_checkpoint_text_tokenizer(backbone_name):
@@ -154,7 +157,7 @@ def build_backbone_text_tokenizer(
     if checkpoint is None:
         if require_checkpoint:
             raise ValueError(
-                "Gemma/Qwen backbones require model.backbone.hf_checkpoint so text "
+                "Gemma/Qwen/LLaDA backbones require model.backbone.hf_checkpoint so text "
                 "tokenization can be inherited from the pretrained checkpoint."
             )
         return None
@@ -163,7 +166,7 @@ def build_backbone_text_tokenizer(
         from transformers import AutoTokenizer
     except Exception as exc:
         raise ImportError(
-            "Loading Gemma/Qwen text tokenizer requires transformers AutoTokenizer support."
+            "Loading Gemma/Qwen/LLaDA text tokenizer requires transformers AutoTokenizer support."
         ) from exc
 
     loading_kwargs: dict[str, Any] = {}
@@ -287,6 +290,22 @@ def resolve_backbone_spec(model_cfg: Mapping[str, Any]) -> BackboneSpec:
         if env_value is not None:
             hf_kwargs[key] = env_value
 
+    lora_payload = backbone_overrides.get("lora")
+    if lora_payload is None:
+        lora_config: dict[str, Any] = {}
+    elif isinstance(lora_payload, Mapping):
+        lora_config = dict(lora_payload)
+    else:
+        raise ValueError("model.backbone.lora must be a mapping when provided.")
+    if backbone_name != "llada" and "target_modules" in lora_config:
+        raise ValueError(
+            "model.backbone.lora.target_modules is only supported with model.backbone.name='llada'."
+        )
+    if backbone_name == "llada" and "enabled" in lora_config and not bool(lora_config["enabled"]):
+        raise ValueError(
+            "model.backbone.lora.enabled must be true when model.backbone.name='llada'."
+        )
+
     config_payload = model_cfg.get(config_key)
     resolved_config: Optional[dict[str, Any]]
     if config_payload is None:
@@ -308,6 +327,7 @@ def resolve_backbone_spec(model_cfg: Mapping[str, Any]) -> BackboneSpec:
         hf_checkpoint=hf_checkpoint,
         hf_strict=hf_strict,
         hf_kwargs=hf_kwargs,
+        lora_config=lora_config,
     )
 
 
@@ -361,6 +381,17 @@ def _coerce_backbone_config(backbone_name: str, backbone_config: Any) -> Any:
             f"got {type(backbone_config).__name__}."
         )
 
+    if backbone_name == "llada":
+        if isinstance(backbone_config, Mapping):
+            return dict(backbone_config)
+        model_type = getattr(backbone_config, "model_type", None)
+        if model_type == "llada":
+            return backbone_config
+        raise TypeError(
+            "LLaDA backbone expects an llada config object or mapping-compatible payload, "
+            f"got {type(backbone_config).__name__}."
+        )
+
     raise ValueError(f"Unsupported backbone {backbone_name!r}.")
 
 
@@ -409,12 +440,29 @@ def build_backbone(
     backbone_hf_checkpoint: Optional[str],
     backbone_hf_strict: bool,
     backbone_hf_kwargs: Optional[dict[str, Any]],
+    backbone_lora_config: Optional[dict[str, Any]] = None,
 ) -> nn.Module:
     resolved_name = normalize_backbone_name(backbone_name)
     resolved_config: Optional[Any] = None
     if backbone_config is not None:
         resolved_config = _coerce_backbone_config(resolved_name, backbone_config)
     resolved_hf_kwargs = dict(backbone_hf_kwargs or {})
+    resolved_lora_config = dict(backbone_lora_config or {})
+    if resolved_name != "llada" and "target_modules" in resolved_lora_config:
+        raise ValueError(
+            "model.backbone.lora.target_modules is only supported with model.backbone.name='llada'."
+        )
+    lora_enabled = bool(resolved_lora_config.get("enabled", False))
+    if lora_enabled and resolved_name != "llada":
+        raise ValueError(
+            "model.backbone.lora.enabled is only supported with model.backbone.name='llada'."
+        )
+    if resolved_name == "llada":
+        if "enabled" in resolved_lora_config and not bool(resolved_lora_config["enabled"]):
+            raise ValueError(
+                "model.backbone.lora.enabled must be true when model.backbone.name='llada'."
+            )
+        resolved_lora_config.setdefault("enabled", True)
 
     if not backbone_hf_checkpoint:
         if resolved_config is None:
@@ -429,6 +477,14 @@ def build_backbone(
             from models.gemma_backbone import GemmaBackbone
 
             return GemmaBackbone(resolved_config)
+        if resolved_name == "llada":
+            from models.llada_backbone import LladaBackbone
+
+            return LladaBackbone.from_llada_config(
+                resolved_config,
+                lora_config=resolved_lora_config,
+                **resolved_hf_kwargs,
+            )
         from models.qwen_backbone import QwenBackbone
 
         return QwenBackbone(resolved_config)
@@ -449,6 +505,17 @@ def build_backbone(
         return GemmaBackbone.from_gemma3_pretrained(
             backbone_hf_checkpoint,
             strict=backbone_hf_strict,
+            **loading_kwargs,
+        )
+    if resolved_name == "llada":
+        from models.llada_backbone import LladaBackbone
+
+        loading_kwargs = dict(resolved_hf_kwargs)
+        return LladaBackbone.from_llada_pretrained(
+            backbone_hf_checkpoint,
+            config=resolved_config,
+            strict=backbone_hf_strict,
+            lora_config=resolved_lora_config,
             **loading_kwargs,
         )
     from models.qwen_backbone import QwenBackbone
