@@ -1,20 +1,16 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import inspect
 import math
 import os
-import shutil
-from collections.abc import Sequence
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-_DEFAULTED_CUDA_ALLOC_CONF = False
+DEFAULTED_CUDA_ALLOC_CONF = False
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
-    _DEFAULTED_CUDA_ALLOC_CONF = True
+    DEFAULTED_CUDA_ALLOC_CONF = True
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
@@ -28,6 +24,19 @@ from utils.backbone_utils import (
     build_backbone_text_tokenizer,
     resolve_backbone_spec,
     should_use_checkpoint_text_tokenizer,
+)
+from utils.train_utils import (
+    apply_wandb_cli_overrides,
+    build_audio_decoder,
+    coerce_betas,
+    coerce_gpu_indices,
+    filter_kwargs_for_callable,
+    length_quantile,
+    load_merged_configs,
+    optional_path,
+    require_mapping,
+    shared_memory_total_bytes,
+    should_force_single_process_loader,
 )
 
 try:
@@ -53,14 +62,6 @@ except ModuleNotFoundError:
         raise ImportError(
             "This training script requires `lightning` or `pytorch_lightning`."
         ) from exc
-
-try:
-    import yaml
-except ModuleNotFoundError as exc:
-    raise ImportError(
-        "This training script requires `PyYAML` (`pip install pyyaml`)."
-    ) from exc
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -157,214 +158,11 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _read_yaml(path: Path, *, required: bool) -> dict[str, Any]:
-    resolved = path.expanduser()
-    if not resolved.is_absolute():
-        resolved = Path.cwd() / resolved
-    resolved = resolved.resolve()
-    if not resolved.exists():
-        if required:
-            raise FileNotFoundError(f"Config file not found: {resolved}")
-        return {}
-    if not resolved.is_file():
-        raise ValueError(f"Config path is not a file: {resolved}")
+def validate_config_consistency(config: dict[str, Any]) -> None:
+    data_cfg = require_mapping(config, "data")
+    model_cfg = require_mapping(config, "model")
 
-    text = resolved.read_text(encoding="utf-8")
-    if text.strip() == "":
-        return {}
-
-    data = yaml.safe_load(text)
-    if data is None:
-        return {}
-    if not isinstance(data, dict):
-        raise ValueError(f"Expected mapping YAML at {resolved}, got {type(data).__name__}.")
-    return data
-
-
-def _deep_update(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    for key, value in override.items():
-        if (
-            key in base
-            and isinstance(base[key], dict)
-            and isinstance(value, dict)
-        ):
-            _deep_update(base[key], value)
-        else:
-            base[key] = value
-    return base
-
-
-def _maybe_str(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip() != "":
-        return value
-    return None
-
-
-def _parse_bool_string(value: str, *, field_name: str) -> bool:
-    lowered = value.strip().lower()
-    if lowered in {"1", "true", "yes", "y", "on"}:
-        return True
-    if lowered in {"0", "false", "no", "n", "off"}:
-        return False
-    raise ValueError(f"{field_name} must be a boolean string (true/false), got {value!r}.")
-
-
-def _coerce_wandb_log_model(value: str) -> bool | str:
-    lowered = value.strip().lower()
-    if lowered in {"1", "true", "yes", "y", "on"}:
-        return True
-    if lowered in {"0", "false", "no", "n", "off"}:
-        return False
-    return value
-
-
-def _extract_config_path_overrides(experiment_cfg: dict[str, Any]) -> dict[str, str]:
-    overrides: dict[str, str] = {}
-
-    candidates = [experiment_cfg]
-    nested = experiment_cfg.get("experiment")
-    if isinstance(nested, dict):
-        candidates.append(nested)
-
-    for cfg in candidates:
-        trainer_path = _maybe_str(cfg.get("trainer_config"))
-        model_path = _maybe_str(cfg.get("model_config"))
-        data_path = _maybe_str(cfg.get("data_config"))
-        if trainer_path is not None:
-            overrides["trainer_config"] = trainer_path
-        if model_path is not None:
-            overrides["model_config"] = model_path
-        if data_path is not None:
-            overrides["data_config"] = data_path
-
-        for section_name in ("configs", "config_paths"):
-            section = cfg.get(section_name)
-            if not isinstance(section, dict):
-                continue
-            trainer_path = _maybe_str(section.get("trainer"))
-            model_path = _maybe_str(section.get("model"))
-            data_path = _maybe_str(section.get("data"))
-            if trainer_path is not None:
-                overrides["trainer_config"] = trainer_path
-            if model_path is not None:
-                overrides["model_config"] = model_path
-            if data_path is not None:
-                overrides["data_config"] = data_path
-
-    return overrides
-
-
-def _apply_wandb_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
-    trainer_cfg = _require_mapping(config, "trainer")
-    logger_cfg = _require_mapping(trainer_cfg, "logger")
-
-    if args.wandb_project is not None:
-        logger_cfg["project"] = args.wandb_project
-    if args.wandb_name is not None:
-        logger_cfg["name"] = args.wandb_name
-    if args.wandb_save_dir is not None:
-        logger_cfg["save_dir"] = args.wandb_save_dir
-    if args.wandb_offline is not None:
-        logger_cfg["offline"] = _parse_bool_string(
-            args.wandb_offline,
-            field_name="--wandb-offline",
-        )
-    if args.wandb_log_model is not None:
-        logger_cfg["log_model"] = _coerce_wandb_log_model(args.wandb_log_model)
-    if args.wandb_entity is not None:
-        logger_cfg["entity"] = args.wandb_entity
-    if args.wandb_group is not None:
-        logger_cfg["group"] = args.wandb_group
-    if args.wandb_tags is not None:
-        logger_cfg["tags"] = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
-
-
-@dataclass
-class ResolvedConfigs:
-    merged: dict[str, Any]
-    trainer_config_path: Path
-    model_config_path: Path
-    data_config_path: Path
-    experiment_config_path: Path
-
-
-def _resolve_config_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
-    experiment_path = args.experiment_config.expanduser()
-    if not experiment_path.is_absolute():
-        experiment_path = (Path.cwd() / experiment_path).resolve()
-    else:
-        experiment_path = experiment_path.resolve()
-
-    experiment_cfg = _read_yaml(experiment_path, required=False)
-    path_overrides = _extract_config_path_overrides(experiment_cfg)
-
-    trainer_path = Path(path_overrides.get("trainer_config", str(args.trainer_config))).expanduser()
-    model_path = Path(path_overrides.get("model_config", str(args.model_config))).expanduser()
-    data_path = Path(path_overrides.get("data_config", str(args.data_config))).expanduser()
-
-    if not trainer_path.is_absolute():
-        trainer_path = (Path.cwd() / trainer_path).resolve()
-    else:
-        trainer_path = trainer_path.resolve()
-
-    if not model_path.is_absolute():
-        model_path = (Path.cwd() / model_path).resolve()
-    else:
-        model_path = model_path.resolve()
-
-    if not data_path.is_absolute():
-        data_path = (Path.cwd() / data_path).resolve()
-    else:
-        data_path = data_path.resolve()
-
-    return trainer_path, model_path, data_path, experiment_path
-
-
-def _load_merged_configs(args: argparse.Namespace) -> ResolvedConfigs:
-    trainer_path, model_path, data_path, experiment_path = _resolve_config_paths(args)
-
-    trainer_cfg = _read_yaml(trainer_path, required=True)
-    model_cfg = _read_yaml(model_path, required=True)
-    data_cfg = _read_yaml(data_path, required=True)
-    experiment_cfg = _read_yaml(experiment_path, required=False)
-
-    merged: dict[str, Any] = {}
-    _deep_update(merged, trainer_cfg)
-    _deep_update(merged, model_cfg)
-    _deep_update(merged, data_cfg)
-    _deep_update(merged, experiment_cfg)
-
-    nested_experiment = experiment_cfg.get("experiment")
-    if isinstance(nested_experiment, dict):
-        _deep_update(merged, nested_experiment)
-
-    return ResolvedConfigs(
-        merged=merged,
-        trainer_config_path=trainer_path,
-        model_config_path=model_path,
-        data_config_path=data_path,
-        experiment_config_path=experiment_path,
-    )
-
-
-def _require_mapping(config: dict[str, Any], key: str) -> dict[str, Any]:
-    value = config.get(key)
-    if not isinstance(value, dict):
-        raise ValueError(f"Missing required mapping '{key}' in merged config.")
-    return value
-
-
-def _coerce_betas(value: Any) -> tuple[float, float]:
-    if not isinstance(value, (tuple, list)) or len(value) != 2:
-        raise ValueError("trainer.lightning_module.betas must be a list/tuple of length 2.")
-    return float(value[0]), float(value[1])
-
-
-def _validate_config_consistency(config: dict[str, Any]) -> None:
-    data_cfg = _require_mapping(config, "data")
-    model_cfg = _require_mapping(config, "model")
-
-    shared_layout = _require_mapping(data_cfg, "shared_layout")
+    shared_layout = require_mapping(data_cfg, "shared_layout")
     discrete_token_count = int(shared_layout["discrete_token_count"])
     eot_id, eos_id, pad_id, text_offset = build_shared_token_layout(discrete_token_count)
 
@@ -381,11 +179,11 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
                 f"got {shared_layout[key]}"
             )
 
-    prism_cfg = _require_mapping(model_cfg, "prism_tts")
+    prism_cfg = require_mapping(model_cfg, "prism_tts")
     backbone_spec = resolve_backbone_spec(model_cfg)
     backbone_cfg = dict(backbone_spec.config) if backbone_spec.config is not None else None
     backbone_cfg_path = f"model.{backbone_spec.config_key}"
-    dataset_cfg = _require_mapping(data_cfg, "dataset")
+    dataset_cfg = require_mapping(data_cfg, "dataset")
 
     num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
     dataset_stream_count_raw = dataset_cfg.get("discrete_stream_count")
@@ -458,13 +256,13 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
             )
 
 
-def _build_model(config: dict[str, Any]) -> PrismTTS:
-    model_cfg = _require_mapping(config, "model")
+def build_model(config: dict[str, Any]) -> PrismTTS:
+    model_cfg = require_mapping(config, "model")
     model_name = model_cfg.get("name", "prism_tts")
     if model_name != "prism_tts":
         raise ValueError(f"Unsupported model.name={model_name!r}. Only 'prism_tts' is supported.")
 
-    prism_cfg = _require_mapping(model_cfg, "prism_tts")
+    prism_cfg = require_mapping(model_cfg, "prism_tts")
     backbone_spec = resolve_backbone_spec(model_cfg)
     backbone_cfg = dict(backbone_spec.config) if backbone_spec.config is not None else None
 
@@ -508,7 +306,7 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
     )
 
 
-def _build_scheduler_factory(
+def build_scheduler_factory(
     scheduler_cfg: dict[str, Any],
     *,
     max_steps: int,
@@ -553,15 +351,15 @@ def _build_scheduler_factory(
     return scheduler_factory
 
 
-def _build_lightning_module(
+def build_lightning_module(
     config: dict[str, Any],
     model: PrismTTS,
 ) -> PrismTTSLightning:
-    trainer_cfg = _require_mapping(config, "trainer")
-    module_cfg = _require_mapping(trainer_cfg, "lightning_module")
-    optimizer_cfg = _require_mapping(trainer_cfg, "optimizer")
-    scheduler_cfg = _require_mapping(trainer_cfg, "scheduler")
-    lightning_trainer_cfg = _require_mapping(trainer_cfg, "lightning_trainer")
+    trainer_cfg = require_mapping(config, "trainer")
+    module_cfg = require_mapping(trainer_cfg, "lightning_module")
+    optimizer_cfg = require_mapping(trainer_cfg, "optimizer")
+    scheduler_cfg = require_mapping(trainer_cfg, "scheduler")
+    lightning_trainer_cfg = require_mapping(trainer_cfg, "lightning_trainer")
 
     optimizer_name = str(optimizer_cfg.get("name", "adamw")).lower()
     if optimizer_name != "adamw":
@@ -570,17 +368,17 @@ def _build_lightning_module(
         )
 
     max_steps = int(lightning_trainer_cfg.get("max_steps", 0))
-    scheduler_factory = _build_scheduler_factory(
+    scheduler_factory = build_scheduler_factory(
         scheduler_cfg=scheduler_cfg,
         max_steps=max_steps,
     )
-    audio_decoder = _build_audio_decoder(module_cfg)
+    audio_decoder = build_audio_decoder(module_cfg)
 
     return PrismTTSLightning(
         model=model,
         learning_rate=float(module_cfg.get("learning_rate", 3.0e-4)),
         weight_decay=float(module_cfg.get("weight_decay", 0.01)),
-        betas=_coerce_betas(module_cfg.get("betas", [0.9, 0.95])),
+        betas=coerce_betas(module_cfg.get("betas", [0.9, 0.95])),
         eval_every_n_steps=int(module_cfg.get("eval_every_n_steps", 5000)),
         scheduler_factory=scheduler_factory,
         audio_decoder=audio_decoder,
@@ -597,171 +395,22 @@ def _build_lightning_module(
     )
 
 
-def _resolve_import_string(path: str, *, field_name: str) -> Any:
-    if ":" in path:
-        module_name, attr_name = path.split(":", 1)
-    else:
-        module_name, sep, attr_name = path.rpartition(".")
-        if sep == "":
-            raise ValueError(
-                f"{field_name} must be an import path like 'pkg.mod:obj' or 'pkg.mod.obj'."
-            )
-
-    module_name = module_name.strip()
-    attr_name = attr_name.strip()
-    if module_name == "" or attr_name == "":
-        raise ValueError(
-            f"{field_name} must be an import path like 'pkg.mod:obj' or 'pkg.mod.obj'."
-        )
-
-    try:
-        module = importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        raise ValueError(
-            f"Unable to import module {module_name!r} referenced by {field_name}."
-        ) from exc
-
-    try:
-        return getattr(module, attr_name)
-    except AttributeError as exc:
-        raise ValueError(
-            f"Unable to resolve attribute {attr_name!r} in module {module_name!r} "
-            f"for {field_name}."
-        ) from exc
-
-
-def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
-    decoder_spec = module_cfg.get("audio_decoder")
-    if decoder_spec is None:
-        return None
-    if isinstance(decoder_spec, str) and decoder_spec.strip() == "":
-        return None
-    if not isinstance(decoder_spec, str):
-        raise ValueError(
-            "trainer.lightning_module.audio_decoder must be a string import path "
-            "or null."
-        )
-
-    decoder_kwargs = module_cfg.get("audio_decoder_kwargs", {})
-    if decoder_kwargs is None:
-        decoder_kwargs = {}
-    if not isinstance(decoder_kwargs, dict):
-        raise ValueError(
-            "trainer.lightning_module.audio_decoder_kwargs must be a mapping when set."
-        )
-
-    decoder_obj = _resolve_import_string(
-        decoder_spec.strip(),
-        field_name="trainer.lightning_module.audio_decoder",
-    )
-    if not callable(decoder_obj):
-        raise ValueError(
-            "trainer.lightning_module.audio_decoder must resolve to a callable."
-        )
-
-    if inspect.isclass(decoder_obj):
-        instance = decoder_obj(**decoder_kwargs)
-        if callable(instance):
-            return instance
-        decode_method = getattr(instance, "decode", None)
-        if callable(decode_method):
-            return decode_method
-        raise ValueError(
-            "Audio decoder class instance must be callable or expose a callable `decode` method."
-        )
-
-    if decoder_kwargs:
-        return lambda latents, fn=decoder_obj, kwargs=dict(decoder_kwargs): fn(latents, **kwargs)
-    return decoder_obj
-
-
-def _optional_path(value: Any) -> str | None:
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        value = str(value)
-    value = value.strip()
-    if value == "":
-        return None
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    return str(path.resolve())
-
-
-def _shared_memory_total_bytes() -> int | None:
-    try:
-        return int(shutil.disk_usage("/dev/shm").total)
-    except OSError:
-        return None
-
-
-def _parse_env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return _parse_bool_string(raw, field_name=name)
-    except ValueError:
-        print(f"[train.py] Ignoring invalid {name}={raw!r}; using default={default}.")
-        return default
-
-
-def _parse_env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        print(f"[train.py] Ignoring invalid {name}={raw!r}; using default={default}.")
-        return default
-
-
-def _length_quantile(values: Sequence[int], quantile: float) -> int:
-    if not values:
-        raise ValueError("values must not be empty.")
-    if quantile <= 0.0 or quantile > 1.0:
-        raise ValueError(f"quantile must be in (0, 1], got {quantile}.")
-
-    sorted_values = sorted(max(1, int(value)) for value in values)
-    rank = max(0, min(len(sorted_values) - 1, int(math.ceil(quantile * len(sorted_values))) - 1))
-    return int(sorted_values[rank])
-
-
-def _should_force_single_process_loader(num_workers: int) -> bool:
-    if num_workers <= 0:
-        return False
-
-    # Allow explicit opt-out for environments where low /dev/shm is still acceptable.
-    if _parse_env_bool("PRISM_TTS_DISABLE_SHM_GUARD", False):
-        return False
-
-    total_bytes = _shared_memory_total_bytes()
-    if total_bytes is None:
-        return False
-
-    default_threshold = 512 * 1024 * 1024
-    threshold = _parse_env_int("PRISM_TTS_MIN_SHM_BYTES", default_threshold)
-    return total_bytes < threshold
-
-
-def _build_data_objects(
+def build_data_objects(
     config: dict[str, Any],
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
-    data_cfg = _require_mapping(config, "data")
-    model_cfg = _require_mapping(config, "model")
+    data_cfg = require_mapping(config, "data")
+    model_cfg = require_mapping(config, "model")
     backbone_spec = resolve_backbone_spec(model_cfg)
-    loader_cfg = _require_mapping(data_cfg, "loader")
-    dataset_cfg = _require_mapping(data_cfg, "dataset")
-    collate_cfg = _require_mapping(data_cfg, "collate")
-    shared_layout = _require_mapping(data_cfg, "shared_layout")
+    loader_cfg = require_mapping(data_cfg, "loader")
+    dataset_cfg = require_mapping(data_cfg, "dataset")
+    collate_cfg = require_mapping(data_cfg, "collate")
+    shared_layout = require_mapping(data_cfg, "shared_layout")
 
     discrete_token_count = int(shared_layout["discrete_token_count"])
 
     dataset_kwargs: dict[str, Any] = {
-        "vocab_path": _optional_path(data_cfg.get("vocab_path")),
-        "manifest_root": _optional_path(data_cfg.get("manifest_root")),
+        "vocab_path": optional_path(data_cfg.get("vocab_path")),
+        "manifest_root": optional_path(data_cfg.get("manifest_root")),
         "discrete_token_count": discrete_token_count,
         "discrete_stream_count": dataset_cfg.get("discrete_stream_count"),
         "continuous_feature_dim": dataset_cfg.get("continuous_feature_dim"),
@@ -777,15 +426,15 @@ def _build_data_objects(
     if dataset_text_tokenizer is not None:
         dataset_kwargs["text_tokenizer"] = dataset_text_tokenizer
 
-    train_manifest = _optional_path(data_cfg.get("train_manifest"))
+    train_manifest = optional_path(data_cfg.get("train_manifest"))
     if train_manifest is None:
         raise ValueError("data.train_manifest must be set for training.")
     train_dataset = PrismDataset(source=train_manifest, **dataset_kwargs)
 
-    val_manifest = _optional_path(data_cfg.get("val_manifest"))
+    val_manifest = optional_path(data_cfg.get("val_manifest"))
     val_dataset = PrismDataset(source=val_manifest, **dataset_kwargs) if val_manifest else None
 
-    test_manifest = _optional_path(data_cfg.get("test_manifest"))
+    test_manifest = optional_path(data_cfg.get("test_manifest"))
     test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs) if test_manifest else None
 
     collate = BatchCollate(
@@ -800,8 +449,8 @@ def _build_data_objects(
     persistent_workers = bool(loader_cfg.get("persistent_workers", False)) and num_workers > 0
     pin_memory = bool(loader_cfg.get("pin_memory", False))
 
-    if _should_force_single_process_loader(num_workers):
-        shm_total = _shared_memory_total_bytes()
+    if should_force_single_process_loader(num_workers):
+        shm_total = shared_memory_total_bytes()
         shm_mb = "unknown"
         if shm_total is not None:
             shm_mb = f"{(shm_total / (1024 * 1024)):.1f}"
@@ -863,9 +512,11 @@ def _build_data_objects(
         sample_lengths = estimate_prism_sample_lengths(
             train_dataset,
             codec_frame_rate_hz=float(collate_cfg.get("codec_frame_rate_hz", 12.5)),
+            show_progress=True,
+            progress_desc="Adaptive batching: estimating train sample lengths",
         )
 
-        reference_length = _length_quantile(sample_lengths, reference_quantile)
+        reference_length = length_quantile(sample_lengths, reference_quantile)
         memory_budget_raw = adaptive_cfg.get("memory_budget")
         if memory_budget_raw is None:
             memory_budget = train_batch_size * (reference_length**2)
@@ -953,31 +604,7 @@ def _build_data_objects(
     return train_loader, val_loader, test_loader
 
 
-def _filter_kwargs_for_callable(
-    fn: Any,
-    kwargs: dict[str, Any],
-    *,
-    context: str,
-) -> dict[str, Any]:
-    signature = inspect.signature(fn)
-    params = signature.parameters
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return kwargs
-
-    allowed = set(params.keys())
-    filtered: dict[str, Any] = {}
-    ignored: list[str] = []
-    for key, value in kwargs.items():
-        if key in allowed:
-            filtered[key] = value
-        else:
-            ignored.append(key)
-    if ignored:
-        print(f"[train.py] Ignoring unsupported {context} kwargs: {sorted(ignored)}")
-    return filtered
-
-
-def _build_logger(logger_cfg: dict[str, Any]) -> Any:
+def build_logger(logger_cfg: dict[str, Any]) -> Any:
     logger_type = str(logger_cfg.get("type", "none")).lower()
     if logger_type in {"", "none", "false", "null", "disabled"}:
         return False
@@ -998,7 +625,7 @@ def _build_logger(logger_cfg: dict[str, Any]) -> Any:
             "tags": logger_cfg.get("tags"),
         }
         kwargs = {k: v for k, v in kwargs.items() if v is not None}
-        kwargs = _filter_kwargs_for_callable(
+        kwargs = filter_kwargs_for_callable(
             WandbLogger.__init__,
             kwargs,
             context="WandbLogger",
@@ -1010,7 +637,7 @@ def _build_logger(logger_cfg: dict[str, Any]) -> Any:
             "save_dir": save_dir,
             "name": logger_cfg.get("name", "prism_tts"),
         }
-        kwargs = _filter_kwargs_for_callable(
+        kwargs = filter_kwargs_for_callable(
             TensorBoardLogger.__init__,
             kwargs,
             context="TensorBoardLogger",
@@ -1022,7 +649,7 @@ def _build_logger(logger_cfg: dict[str, Any]) -> Any:
             "save_dir": save_dir,
             "name": logger_cfg.get("name", "prism_tts"),
         }
-        kwargs = _filter_kwargs_for_callable(
+        kwargs = filter_kwargs_for_callable(
             CSVLogger.__init__,
             kwargs,
             context="CSVLogger",
@@ -1035,11 +662,11 @@ def _build_logger(logger_cfg: dict[str, Any]) -> Any:
     )
 
 
-def _build_callbacks(config: dict[str, Any]) -> list[Any]:
-    trainer_cfg = _require_mapping(config, "trainer")
-    lightning_trainer_cfg = _require_mapping(trainer_cfg, "lightning_trainer")
-    checkpoint_cfg = _require_mapping(trainer_cfg, "checkpoint")
-    scheduler_cfg = _require_mapping(trainer_cfg, "scheduler")
+def build_callbacks(config: dict[str, Any]) -> list[Any]:
+    trainer_cfg = require_mapping(config, "trainer")
+    lightning_trainer_cfg = require_mapping(trainer_cfg, "lightning_trainer")
+    checkpoint_cfg = require_mapping(trainer_cfg, "checkpoint")
+    scheduler_cfg = require_mapping(trainer_cfg, "scheduler")
 
     callbacks: list[Any] = []
 
@@ -1071,7 +698,7 @@ def _build_callbacks(config: dict[str, Any]) -> list[Any]:
         else:
             resolved_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        checkpoint_kwargs = _filter_kwargs_for_callable(
+        checkpoint_kwargs = filter_kwargs_for_callable(
             ModelCheckpoint.__init__,
             checkpoint_kwargs,
             context="ModelCheckpoint",
@@ -1087,7 +714,7 @@ def _build_callbacks(config: dict[str, Any]) -> list[Any]:
             )
 
     if bool(scheduler_cfg.get("enabled", True)):
-        lr_monitor_kwargs = _filter_kwargs_for_callable(
+        lr_monitor_kwargs = filter_kwargs_for_callable(
             LearningRateMonitor.__init__,
             {"logging_interval": "step"},
             context="LearningRateMonitor",
@@ -1111,13 +738,13 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
         self.dirpath = Path(dirpath).expanduser().resolve()
         self.filename = filename
         self.save_weights_only = save_weights_only
-        self._val_stage = 0
+        self.val_stage = 0
 
     def state_dict(self) -> dict[str, Any]:
-        return {"val_stage": int(self._val_stage)}
+        return {"val_stage": int(self.val_stage)}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self._val_stage = int(state_dict.get("val_stage", 0))
+        self.val_stage = int(state_dict.get("val_stage", 0))
 
     def on_validation_end(self, trainer: Any, pl_module: Any) -> None:
         del pl_module
@@ -1126,22 +753,22 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
         if not bool(getattr(trainer, "is_global_zero", True)):
             return
 
-        self._val_stage += 1
+        self.val_stage += 1
         format_values = {
             "step": int(trainer.global_step),
             "epoch": int(trainer.current_epoch),
-            "val_stage": int(self._val_stage),
+            "val_stage": int(self.val_stage),
         }
         filename = self.filename.format(**format_values)
         if not filename.endswith(".ckpt"):
             filename = f"{filename}.ckpt"
 
         self.dirpath.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = self._next_available_path(self.dirpath / filename)
+        checkpoint_path = self.next_available_path(self.dirpath / filename)
         trainer.save_checkpoint(str(checkpoint_path), weights_only=self.save_weights_only)
 
     @staticmethod
-    def _next_available_path(path: Path) -> Path:
+    def next_available_path(path: Path) -> Path:
         if not path.exists():
             return path
         version = 1
@@ -1152,47 +779,11 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
             version += 1
 
 
-def _trainer_supports_ckpt_path() -> bool:
+def trainer_supports_ckpt_path() -> bool:
     return "ckpt_path" in inspect.signature(pl.Trainer.fit).parameters
 
 
-def _coerce_gpu_indices(value: Any) -> list[int]:
-    indices: list[int]
-    if isinstance(value, str):
-        parts = [part.strip() for part in value.split(",") if part.strip() != ""]
-        if not parts:
-            raise ValueError(
-                "trainer.distributed.gpu_indices string must contain comma-separated GPU indices."
-            )
-        try:
-            indices = [int(part) for part in parts]
-        except ValueError as exc:
-            raise ValueError(
-                "trainer.distributed.gpu_indices string must contain only integer values."
-            ) from exc
-    elif isinstance(value, (list, tuple)):
-        if len(value) == 0:
-            raise ValueError("trainer.distributed.gpu_indices cannot be empty.")
-        try:
-            indices = [int(index) for index in value]
-        except ValueError as exc:
-            raise ValueError(
-                "trainer.distributed.gpu_indices list must contain only integer values."
-            ) from exc
-    else:
-        raise ValueError(
-            "trainer.distributed.gpu_indices must be a list/tuple of ints "
-            "or a comma-separated string."
-        )
-
-    if any(index < 0 for index in indices):
-        raise ValueError("trainer.distributed.gpu_indices must contain non-negative indices.")
-    if len(set(indices)) != len(indices):
-        raise ValueError("trainer.distributed.gpu_indices must not contain duplicates.")
-    return indices
-
-
-def _resolve_requested_device_count(
+def resolve_requested_device_count(
     *,
     accelerator: str,
     devices: Any,
@@ -1221,19 +812,19 @@ def _resolve_requested_device_count(
     return None
 
 
-def _apply_distributed_training_config(config: dict[str, Any]) -> None:
-    trainer_cfg = _require_mapping(config, "trainer")
+def apply_distributed_training_config(config: dict[str, Any]) -> None:
+    trainer_cfg = require_mapping(config, "trainer")
     distributed_cfg = trainer_cfg.get("distributed")
     if not isinstance(distributed_cfg, dict) or not bool(distributed_cfg.get("enabled", False)):
         return
 
-    lightning_trainer_cfg = _require_mapping(trainer_cfg, "lightning_trainer")
+    lightning_trainer_cfg = require_mapping(trainer_cfg, "lightning_trainer")
     accelerator = str(distributed_cfg.get("accelerator", "gpu"))
     lightning_trainer_cfg["accelerator"] = accelerator
     gpu_indices = distributed_cfg.get("gpu_indices")
     resolved_gpu_indices: list[int] | None = None
     if gpu_indices is not None:
-        resolved_gpu_indices = _coerce_gpu_indices(gpu_indices)
+        resolved_gpu_indices = coerce_gpu_indices(gpu_indices)
         lightning_trainer_cfg["devices"] = resolved_gpu_indices
     else:
         lightning_trainer_cfg["devices"] = distributed_cfg.get("devices", "auto")
@@ -1247,7 +838,7 @@ def _apply_distributed_training_config(config: dict[str, Any]) -> None:
     requested_strategy = str(
         distributed_cfg.get("strategy", "ddp_find_unused_parameters_false")
     )
-    device_count = _resolve_requested_device_count(
+    device_count = resolve_requested_device_count(
         accelerator=accelerator,
         devices=lightning_trainer_cfg.get("devices"),
         gpu_indices=resolved_gpu_indices,
@@ -1262,18 +853,18 @@ def _apply_distributed_training_config(config: dict[str, Any]) -> None:
     else:
         lightning_trainer_cfg["strategy"] = requested_strategy
 
-    module_cfg = _require_mapping(trainer_cfg, "lightning_module")
+    module_cfg = require_mapping(trainer_cfg, "lightning_module")
     if "sync_dist_logging" in distributed_cfg:
         module_cfg["sync_dist_logging"] = bool(distributed_cfg["sync_dist_logging"])
 
 
-def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any]) -> Any:
-    trainer_cfg = _require_mapping(config, "trainer")
-    lightning_trainer_cfg = dict(_require_mapping(trainer_cfg, "lightning_trainer"))
+def build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any]) -> Any:
+    trainer_cfg = require_mapping(config, "trainer")
+    lightning_trainer_cfg = dict(require_mapping(trainer_cfg, "lightning_trainer"))
     lightning_trainer_cfg["callbacks"] = callbacks
     lightning_trainer_cfg["logger"] = logger
 
-    trainer_kwargs = _filter_kwargs_for_callable(
+    trainer_kwargs = filter_kwargs_for_callable(
         pl.Trainer.__init__,
         lightning_trainer_cfg,
         context="Trainer",
@@ -1282,33 +873,33 @@ def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any])
 
 
 def run(args: argparse.Namespace) -> None:
-    resolved = _load_merged_configs(args)
+    resolved = load_merged_configs(args)
     config = resolved.merged
-    if _DEFAULTED_CUDA_ALLOC_CONF:
+    if DEFAULTED_CUDA_ALLOC_CONF:
         print(
             "[train.py] PYTORCH_CUDA_ALLOC_CONF was unset; defaulting to "
             "'backend:cudaMallocAsync' to avoid NVML-related allocator assertions."
         )
-    _apply_wandb_cli_overrides(config, args)
+    apply_wandb_cli_overrides(config, args)
 
-    _validate_config_consistency(config)
-    _apply_distributed_training_config(config)
+    validate_config_consistency(config)
+    apply_distributed_training_config(config)
 
-    trainer_cfg = _require_mapping(config, "trainer")
+    trainer_cfg = require_mapping(config, "trainer")
     seed = trainer_cfg.get("seed")
     if seed is not None:
         pl.seed_everything(int(seed), workers=bool(trainer_cfg.get("seed_workers", True)))
 
-    train_loader, val_loader, test_loader = _build_data_objects(config)
-    model = _build_model(config)
-    lightning_module = _build_lightning_module(config, model=model)
+    train_loader, val_loader, test_loader = build_data_objects(config)
+    model = build_model(config)
+    lightning_module = build_lightning_module(config, model=model)
 
-    logger = _build_logger(_require_mapping(trainer_cfg, "logger"))
-    callbacks = _build_callbacks(config)
+    logger = build_logger(require_mapping(trainer_cfg, "logger"))
+    callbacks = build_callbacks(config)
 
-    trainer = _build_trainer(config, logger=logger, callbacks=callbacks)
+    trainer = build_trainer(config, logger=logger, callbacks=callbacks)
 
-    supports_ckpt_path = _trainer_supports_ckpt_path()
+    supports_ckpt_path = trainer_supports_ckpt_path()
     if args.ckpt_path is not None and not supports_ckpt_path:
         raise RuntimeError(
             "This installed Lightning version does not support Trainer.fit(..., ckpt_path=...). "

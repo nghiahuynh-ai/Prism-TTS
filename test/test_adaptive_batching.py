@@ -49,3 +49,31 @@ def test_estimate_prism_sample_lengths_from_manifest_metadata():
         codec_frame_rate_hz=12.5,
     )
     assert lengths == [19, 20]
+
+
+def test_estimate_prism_sample_lengths_with_progress_enabled():
+    tokenizer = SimpleNamespace(
+        char_to_id={"a": 0, "b": 1, "c": 2},
+        append_eos=False,
+    )
+    entries = [
+        SimpleNamespace(
+            prompt_transcript="ab",
+            transcript="abc",
+            prompt_duration=0.16,
+            duration=0.16,
+        ),
+        SimpleNamespace(
+            prompt_transcript="aaaa",
+            transcript="bb",
+            prompt_duration=0.08,
+            duration=0.24,
+        ),
+    ]
+    dataset = SimpleNamespace(_entries=entries, tokenizer=tokenizer)
+    lengths = estimate_prism_sample_lengths(
+        dataset,
+        codec_frame_rate_hz=12.5,
+        show_progress=True,
+    )
+    assert lengths == [19, 20]

@@ -9,6 +9,7 @@ PyYAML>=6.0
 wandb>=0.16
 matplotlib>=3.7
 tensorboard>=2.14
+tqdm>=4.66
 
 # Test runner used by `make unit-test`.
 pytest>=8.0

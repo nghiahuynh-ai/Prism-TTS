@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from torch.utils.data import Sampler
+from tqdm.auto import tqdm
 
 
 def _estimate_text_token_count(text: str, char_to_id: Mapping[str, int], append_eos: bool) -> int:
@@ -87,6 +88,8 @@ def estimate_prism_sample_lengths(
     dataset: Any,
     *,
     codec_frame_rate_hz: float,
+    show_progress: bool = False,
+    progress_desc: str = "Estimating adaptive batching lengths",
 ) -> list[int]:
     """Estimate concatenated sequence length for each Prism sample."""
     if codec_frame_rate_hz <= 0:
@@ -106,7 +109,16 @@ def estimate_prism_sample_lengths(
         num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
 
         lengths: list[int] = []
-        for entry in entries:
+        entries_iterable: Any = entries
+        if show_progress and tqdm is not None:
+            entries_iterable = tqdm(
+                entries,
+                total=len(entries),
+                desc=progress_desc,
+                unit="sample",
+                dynamic_ncols=True,
+            )
+        for entry in entries_iterable:
             prompt_transcript = str(getattr(entry, "prompt_transcript"))
             target_transcript = str(getattr(entry, "transcript"))
             if char_to_id is not None:
@@ -154,7 +166,16 @@ def estimate_prism_sample_lengths(
     samples = getattr(dataset, "_samples", None)
     if isinstance(samples, Sequence) and len(samples) > 0:
         lengths = []
-        for sample in samples:
+        samples_iterable: Any = samples
+        if show_progress and tqdm is not None:
+            samples_iterable = tqdm(
+                samples,
+                total=len(samples),
+                desc=progress_desc,
+                unit="sample",
+                dynamic_ncols=True,
+            )
+        for sample in samples_iterable:
             if not isinstance(sample, Mapping):
                 raise ValueError(
                     "Expected each in-memory dataset sample to be a mapping for adaptive batching."
