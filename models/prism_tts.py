@@ -24,6 +24,8 @@ class PrismTTS(nn.Module):
 
     Speech is flattened block-wise. Each speech block has (N + 1) streams:
     N discrete streams + 1 continuous stream.
+    `N` is treated as the dataset-level maximum discrete stream count; each sample
+    may use only a prefix subset of streams.
     """
     MAX_DISCRETE_STREAM_EMBEDDINGS = 32
 

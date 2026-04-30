@@ -33,7 +33,9 @@ model:
 
   prism_tts:
     # Number of discrete streams per speech block.
-    num_discrete_tokens: 1
+    # When data.dataset.discrete_stream_count is set, train.py resolves this
+    # from dataset config (this value is fallback/default only).
+    num_discrete_tokens: 4
     # Must cover codec ids + EOT/EOS/PAD special ids.
     # For discrete_token_count=2048, minimum valid value is 2051.
     discrete_vocab_size: 2051

@@ -185,15 +185,14 @@ def validate_config_consistency(config: dict[str, Any]) -> None:
     backbone_cfg_path = f"model.{backbone_spec.config_key}"
     dataset_cfg = require_mapping(data_cfg, "dataset")
 
-    num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
+    num_discrete_tokens = resolve_num_discrete_tokens(config)
     dataset_stream_count_raw = dataset_cfg.get("discrete_stream_count")
-    if dataset_stream_count_raw is not None:
-        dataset_stream_count = int(dataset_stream_count_raw)
-        if num_discrete_tokens != dataset_stream_count:
-            raise ValueError(
-                "model.prism_tts.num_discrete_tokens must match "
-                f"data.dataset.discrete_stream_count ({dataset_stream_count})."
-            )
+    sample_discrete_stream_count = bool(dataset_cfg.get("sample_discrete_stream_count", False))
+    if sample_discrete_stream_count and dataset_stream_count_raw is None:
+        raise ValueError(
+            "data.dataset.sample_discrete_stream_count=true requires "
+            "data.dataset.discrete_stream_count to define maximum stream count."
+        )
 
     continuous_latent_size = int(prism_cfg["continuous_latent_size"])
     dataset_continuous_dim_raw = dataset_cfg.get("continuous_feature_dim")
@@ -257,14 +256,27 @@ def validate_config_consistency(config: dict[str, Any]) -> None:
 
 
 def build_model(config: dict[str, Any]) -> PrismTTS:
+    data_cfg = require_mapping(config, "data")
     model_cfg = require_mapping(config, "model")
     model_name = model_cfg.get("name", "prism_tts")
     if model_name != "prism_tts":
         raise ValueError(f"Unsupported model.name={model_name!r}. Only 'prism_tts' is supported.")
 
+    dataset_cfg = require_mapping(data_cfg, "dataset")
     prism_cfg = require_mapping(model_cfg, "prism_tts")
     backbone_spec = resolve_backbone_spec(model_cfg)
     backbone_cfg = dict(backbone_spec.config) if backbone_spec.config is not None else None
+    resolved_num_discrete_tokens = resolve_num_discrete_tokens(config)
+    dataset_stream_count_raw = dataset_cfg.get("discrete_stream_count")
+    configured_model_stream_count = prism_cfg.get("num_discrete_tokens")
+    if dataset_stream_count_raw is not None and configured_model_stream_count is not None:
+        configured_model_stream_count = int(configured_model_stream_count)
+        if configured_model_stream_count != resolved_num_discrete_tokens:
+            print(
+                "[train.py] data.dataset.discrete_stream_count is set; "
+                "overriding model.prism_tts.num_discrete_tokens "
+                f"({configured_model_stream_count} -> {resolved_num_discrete_tokens})."
+            )
 
     if backbone_spec.name == "llama" and backbone_cfg is not None:
         attn_impl = str(backbone_cfg.get("_attn_implementation", "eager")).lower()
@@ -284,7 +296,7 @@ def build_model(config: dict[str, Any]) -> PrismTTS:
 
     return PrismTTS(
         backbone_config=backbone_cfg,
-        num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
+        num_discrete_tokens=resolved_num_discrete_tokens,
         discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
         continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
@@ -304,6 +316,23 @@ def build_model(config: dict[str, Any]) -> PrismTTS:
         backbone_hf_strict=backbone_spec.hf_strict,
         backbone_hf_kwargs=backbone_spec.hf_kwargs,
     )
+
+
+def resolve_num_discrete_tokens(config: dict[str, Any]) -> int:
+    data_cfg = require_mapping(config, "data")
+    model_cfg = require_mapping(config, "model")
+    dataset_cfg = require_mapping(data_cfg, "dataset")
+    prism_cfg = require_mapping(model_cfg, "prism_tts")
+
+    dataset_stream_count_raw = dataset_cfg.get("discrete_stream_count")
+    if dataset_stream_count_raw is not None:
+        num_discrete_tokens = int(dataset_stream_count_raw)
+    else:
+        num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
+
+    if num_discrete_tokens < 1:
+        raise ValueError("num_discrete_tokens must be >= 1.")
+    return num_discrete_tokens
 
 
 def build_scheduler_factory(
@@ -426,16 +455,25 @@ def build_data_objects(
     if dataset_text_tokenizer is not None:
         dataset_kwargs["text_tokenizer"] = dataset_text_tokenizer
 
+    train_dataset_kwargs = dict(dataset_kwargs)
+    train_dataset_kwargs["sample_discrete_stream_count"] = bool(
+        dataset_cfg.get("sample_discrete_stream_count", False)
+    )
+    eval_dataset_kwargs = dict(dataset_kwargs)
+    eval_dataset_kwargs["sample_discrete_stream_count"] = bool(
+        dataset_cfg.get("sample_discrete_stream_count_for_eval", False)
+    )
+
     train_manifest = optional_path(data_cfg.get("train_manifest"))
     if train_manifest is None:
         raise ValueError("data.train_manifest must be set for training.")
-    train_dataset = PrismDataset(source=train_manifest, **dataset_kwargs)
+    train_dataset = PrismDataset(source=train_manifest, **train_dataset_kwargs)
 
     val_manifest = optional_path(data_cfg.get("val_manifest"))
-    val_dataset = PrismDataset(source=val_manifest, **dataset_kwargs) if val_manifest else None
+    val_dataset = PrismDataset(source=val_manifest, **eval_dataset_kwargs) if val_manifest else None
 
     test_manifest = optional_path(data_cfg.get("test_manifest"))
-    test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs) if test_manifest else None
+    test_dataset = PrismDataset(source=test_manifest, **eval_dataset_kwargs) if test_manifest else None
 
     collate = BatchCollate(
         text_pad_value=collate_cfg.get("text_pad_value"),
@@ -443,6 +481,7 @@ def build_data_objects(
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
+        discrete_stream_count=dataset_cfg.get("discrete_stream_count"),
     )
 
     num_workers = int(loader_cfg.get("num_workers", 0))

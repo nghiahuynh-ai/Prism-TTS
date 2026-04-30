@@ -54,7 +54,13 @@ data:
     # PrismDataset(...) arguments.
     append_eos_to_text: false
     cache_npy: false
-    discrete_stream_count: 1
+    # Maximum number of discrete streams (N). Each sample may use only a prefix of these streams.
+    discrete_stream_count: 4
+    # Training-time stream sampling:
+    # choose M uniformly in [1, N] per sample and keep the first M discrete streams.
+    sample_discrete_stream_count: true
+    # Keep evaluation deterministic by default.
+    sample_discrete_stream_count_for_eval: true
     continuous_feature_dim: 512
 
   collate:

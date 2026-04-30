@@ -226,6 +226,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         manifest_root: str | Path | None = None,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
         discrete_stream_count: int | None = None,
+        sample_discrete_stream_count: bool = False,
         continuous_feature_dim: int | None = None,
         append_eos_to_text: bool = False,
         text_tokenizer: Any | None = None,
@@ -267,11 +268,17 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         self.discrete_stream_count = (
             None if discrete_stream_count is None else int(discrete_stream_count)
         )
+        self.sample_discrete_stream_count = bool(sample_discrete_stream_count)
         self.continuous_feature_dim = (
             None if continuous_feature_dim is None else int(continuous_feature_dim)
         )
         if self.discrete_stream_count is not None and self.discrete_stream_count < 1:
             raise ValueError("discrete_stream_count must be >= 1 when provided.")
+        if self.sample_discrete_stream_count and self.discrete_stream_count is None:
+            raise ValueError(
+                "sample_discrete_stream_count=True requires discrete_stream_count "
+                "to define the maximum stream count N."
+            )
         if self.continuous_feature_dim is not None and self.continuous_feature_dim < 1:
             raise ValueError("continuous_feature_dim must be >= 1 when provided.")
 
@@ -301,8 +308,10 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if self._entries:
-            return self._build_manifest_sample(self._entries[index])
-        return _normalize_split_sample(self._samples[index])
+            sample = self._build_manifest_sample(self._entries[index])
+        else:
+            sample = _normalize_split_sample(self._samples[index])
+        return self._maybe_sample_discrete_streams(sample)
 
     def _load_manifest(self, manifest_path: Path) -> list[ManifestEntry]:
         entries: list[ManifestEntry] = []
@@ -465,11 +474,18 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                 f"{npy_path} length mismatch between modalities: "
                 f"discrete L={discrete.shape[0]}, continuous L={continuous.shape[0]}."
             )
-        if self.discrete_stream_count is not None and discrete.shape[1] != self.discrete_stream_count:
-            raise ValueError(
-                f"{npy_path} discrete shape mismatch: expected [L, {self.discrete_stream_count}], "
-                f"got {tuple(discrete.shape)}."
-            )
+        if self.discrete_stream_count is not None:
+            if self.sample_discrete_stream_count:
+                if discrete.shape[1] > self.discrete_stream_count:
+                    raise ValueError(
+                        f"{npy_path} discrete shape mismatch: expected stream count <= "
+                        f"{self.discrete_stream_count}, got {tuple(discrete.shape)}."
+                    )
+            elif discrete.shape[1] != self.discrete_stream_count:
+                raise ValueError(
+                    f"{npy_path} discrete shape mismatch: expected [L, {self.discrete_stream_count}], "
+                    f"got {tuple(discrete.shape)}."
+                )
         if self.continuous_feature_dim is not None and continuous.shape[1] != self.continuous_feature_dim:
             raise ValueError(
                 f"{npy_path} continuous shape mismatch: expected [L, {self.continuous_feature_dim}], "
@@ -482,6 +498,47 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         except Exception as exc:
             raise RuntimeError(f"tokenization failed for {field_name}: {exc}") from exc
         return _to_long_1d(encoded, field_name)
+
+    def _resolve_discrete_stream_count_for_sample(
+        self,
+        sample: Mapping[str, torch.Tensor],
+    ) -> int:
+        discrete_target = sample["discrete_target"]
+        discrete_prompt = sample["discrete_prompt"]
+        prompt_streams = int(discrete_prompt.shape[1])
+        target_streams = int(discrete_target.shape[1])
+        max_streams = min(prompt_streams, target_streams)
+        if self.discrete_stream_count is not None:
+            max_streams = min(max_streams, int(self.discrete_stream_count))
+        if max_streams < 1:
+            raise ValueError("Each sample must contain at least one discrete stream.")
+        if not self.sample_discrete_stream_count:
+            if (
+                self.discrete_stream_count is not None
+                and max_streams != int(self.discrete_stream_count)
+            ):
+                raise ValueError(
+                    "Sample discrete stream count must match configured "
+                    f"discrete_stream_count={self.discrete_stream_count}."
+                )
+            return max_streams
+        if max_streams == 1:
+            return 1
+        return int(torch.randint(1, max_streams + 1, (1,), dtype=torch.long).item())
+
+    def _maybe_sample_discrete_streams(
+        self,
+        sample: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        chosen_streams = self._resolve_discrete_stream_count_for_sample(sample)
+        current_streams = int(sample["discrete_prompt"].shape[1])
+        if chosen_streams == current_streams and current_streams == int(sample["discrete_target"].shape[1]):
+            return sample
+
+        sampled = dict(sample)
+        sampled["discrete_prompt"] = sample["discrete_prompt"][:, :chosen_streams].contiguous()
+        sampled["discrete_target"] = sample["discrete_target"][:, :chosen_streams].contiguous()
+        return sampled
 
     def _build_manifest_sample(self, entry: ManifestEntry) -> dict[str, torch.Tensor]:
         discrete_target, continuous_target = self._load_npy_features(entry.target_npy_path)
@@ -512,6 +569,7 @@ class BatchCollate:
         continuous_pad_value: float = 0.0,
         include_attention_mask: bool = True,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
+        discrete_stream_count: int | None = None,
     ) -> None:
         (
             self.eot_token_id,
@@ -526,6 +584,11 @@ class BatchCollate:
         self.continuous_pad_value = continuous_pad_value
         self.include_attention_mask = include_attention_mask
         self.discrete_token_count = int(discrete_token_count)
+        self.discrete_stream_count = (
+            None if discrete_stream_count is None else int(discrete_stream_count)
+        )
+        if self.discrete_stream_count is not None and self.discrete_stream_count < 1:
+            raise ValueError("discrete_stream_count must be >= 1 when provided.")
 
     def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         if not batch:
@@ -552,18 +615,16 @@ class BatchCollate:
 
         collated: dict[str, torch.Tensor] = {
             "text_prompt": _pad_1d([sample["text_prompt"] for sample in samples], self.text_pad_value),
-            "discrete_prompt": _pad_2d(
+            "discrete_prompt": self._pad_discrete_2d(
                 [sample["discrete_prompt"] for sample in samples],
-                self.discrete_pad_value,
             ),
             "continuous_prompt": _pad_2d(
                 [sample["continuous_prompt"] for sample in samples],
                 self.continuous_pad_value,
             ),
             "text_target": _pad_1d([sample["text_target"] for sample in samples], self.text_pad_value),
-            "discrete_target": _pad_2d(
+            "discrete_target": self._pad_discrete_2d(
                 [sample["discrete_target"] for sample in samples],
-                self.discrete_pad_value,
             ),
             "continuous_target": _pad_2d(
                 [sample["continuous_target"] for sample in samples],
@@ -611,6 +672,39 @@ class BatchCollate:
         self._collate_optional_1d(samples, collated, key="flow_timesteps", pad_value=0.0)
         self._collate_optional_2d(samples, collated, key="noise", pad_value=0.0)
         return collated
+
+    def _pad_discrete_2d(self, tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+        if not tensors:
+            raise ValueError("Cannot pad an empty tensor list.")
+        dtype = tensors[0].dtype
+        device = tensors[0].device
+        max_length = max(int(t.shape[0]) for t in tensors)
+        inferred_channels = max(int(t.shape[1]) for t in tensors)
+        channels = inferred_channels
+        if self.discrete_stream_count is not None:
+            channels = int(self.discrete_stream_count)
+            if inferred_channels > channels:
+                raise ValueError(
+                    "Batch includes samples with more discrete streams than configured "
+                    f"maximum ({channels})."
+                )
+        padded = torch.full(
+            (len(tensors), max_length, channels),
+            self.discrete_pad_value,
+            dtype=dtype,
+            device=device,
+        )
+        for idx, tensor in enumerate(tensors):
+            if tensor.dim() != 2:
+                raise ValueError(f"Expected 2D tensor, got shape {tuple(tensor.shape)}.")
+            tensor_channels = int(tensor.shape[1])
+            if tensor_channels > channels:
+                raise ValueError(
+                    f"Discrete tensor channel mismatch: expected <= {channels}, "
+                    f"got {tensor_channels}."
+                )
+            padded[idx, : tensor.shape[0], :tensor_channels] = tensor.to(device=device, dtype=dtype)
+        return padded
 
     def _validate_collate_sample(self, sample: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         required_keys = (
