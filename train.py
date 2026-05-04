@@ -428,12 +428,6 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
             "model.prism_tts.discrete_vocab_size is too small for shared token layout. "
             f"Need at least {text_offset}, got {discrete_vocab_size}."
         )
-    llama_vocab_size = int(llama_cfg["vocab_size"])
-    if discrete_vocab_size > llama_vocab_size:
-        raise ValueError(
-            "model.prism_tts.discrete_vocab_size must be <= model.llama_config.vocab_size "
-            "because text and discrete embeddings are unified."
-        )
 
     if "pad_token_id" in llama_cfg and int(llama_cfg["pad_token_id"]) != pad_id:
         raise ValueError(

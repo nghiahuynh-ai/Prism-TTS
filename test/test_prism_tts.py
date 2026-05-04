@@ -935,10 +935,12 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                     raise AssertionError("Unexpected hidden batch size in fixed head.")
                 return self.logits
 
-        model.discrete_lm_head = _FixedHead(fixed_logits)
+        model.discrete_lm_heads[0] = _FixedHead(fixed_logits)
+        speech_stream_ids = torch.zeros_like(token_ids)
         loss, logits_out = model._compute_discrete_loss(
             hidden_states=hidden_states,
             token_ids=token_ids,
+            speech_stream_ids=speech_stream_ids,
             masked_discrete_positions=masked_positions,
         )
 

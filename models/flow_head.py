@@ -125,7 +125,7 @@ class InputEmbedding(nn.Module):
         use_conv_pos_embedding: bool = True,
     ):
         super().__init__()
-        self.proj = nn.Linear(in_channels, model_channels)
+        self.proj = nn.Conv1d(in_channels, model_channels, kernel_size=3, padding=1)
         self.conv_pos_embed = (
             ConvPositionEmbedding(model_channels)
             if use_conv_pos_embedding
@@ -138,7 +138,10 @@ class InputEmbedding(nn.Module):
         *,
         mask: torch.BoolTensor | None = None,
     ) -> torch.Tensor:
-        h = self.proj(x)
+        h = x.transpose(1, 2)
+        if mask is not None:
+            h = h.masked_fill(~mask.unsqueeze(1), 0.0)
+        h = self.proj(h).transpose(1, 2)
         if self.conv_pos_embed is not None:
             h = h + self.conv_pos_embed(h, mask=mask)
         if mask is not None:
@@ -304,7 +307,7 @@ class FlowHead(nn.Module):
             ]
         )
         self.norm_out = AdaLayerNormFinal(model_channels)
-        self.proj_out = nn.Linear(model_channels, out_channels)
+        self.proj_out = nn.Conv1d(model_channels, out_channels, kernel_size=3, padding=1)
 
         self.initialize_weights()
 
@@ -334,7 +337,8 @@ class FlowHead(nn.Module):
         nn.init.constant_(self.norm_out.linear.weight, 0)
         nn.init.constant_(self.norm_out.linear.bias, 0)
         nn.init.constant_(self.proj_out.weight, 0)
-        nn.init.constant_(self.proj_out.bias, 0)
+        if self.proj_out.bias is not None:
+            nn.init.constant_(self.proj_out.bias, 0)
 
     @staticmethod
     def _normalize_inputs(
@@ -403,7 +407,7 @@ class FlowHead(nn.Module):
                 h = block(h, t_emb, mask=resolved_mask)
 
         h = self.norm_out(h, t_emb)
-        out = self.proj_out(h)
+        out = self.proj_out(h.transpose(1, 2)).transpose(1, 2)
         out = out.masked_fill(~resolved_mask.unsqueeze(-1), 0.0)
         if squeeze_seq_dim:
             out = out.squeeze(1)
