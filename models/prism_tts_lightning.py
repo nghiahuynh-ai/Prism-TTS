@@ -873,6 +873,7 @@ class PrismTTSLightning(pl.LightningModule):
                 "sample_id",
                 "generation_method",
                 "groundtruth_audio",
+                "groundtruth_from_discrete_audio",
                 "prior_audio",
                 "predicted_audio",
             ]
@@ -884,6 +885,12 @@ class PrismTTSLightning(pl.LightningModule):
             method = str(row["generation_method"])
             target_audio = np.asarray(row["target_audio"], dtype=np.float32)
             pred_audio = np.asarray(row["predicted_audio"], dtype=np.float32)
+            target_discrete_audio_raw = row.get("target_discrete_audio")
+            target_discrete_audio = (
+                None
+                if target_discrete_audio_raw is None
+                else np.asarray(target_discrete_audio_raw, dtype=np.float32)
+            )
             prior_audio_raw = row.get("prior_audio")
             prior_audio = (
                 None
@@ -901,6 +908,17 @@ class PrismTTSLightning(pl.LightningModule):
                     caption=(
                         f"{sample_source}_groundtruth_step_{step}_sample_{sample_idx}"
                     ),
+                ),
+                (
+                    None
+                    if target_discrete_audio is None
+                    else wandb.Audio(
+                        target_discrete_audio,
+                        sample_rate=self.audio_sample_rate,
+                        caption=(
+                            f"{sample_source}_groundtruth_discrete_step_{step}_sample_{sample_idx}"
+                        ),
+                    )
                 ),
                 (
                     None
@@ -1116,6 +1134,7 @@ class PrismTTSLightning(pl.LightningModule):
                             "sample_id": sample_idx,
                             "generation_method": method,
                             "target_audio": target_audio,
+                            "target_discrete_audio": target_audio,
                             "prior_audio": None,
                             "predicted_audio": pred_audio,
                         }
@@ -1124,6 +1143,8 @@ class PrismTTSLightning(pl.LightningModule):
 
             if batch_inputs.continuous_target is None:
                 continue
+            if batch_inputs.discrete_target is None:
+                continue
 
             target_continuous = normalize_continuous_latents(
                 batch_inputs.continuous_target,
@@ -1131,33 +1152,30 @@ class PrismTTSLightning(pl.LightningModule):
                 name="continuous_target",
                 continuous_latent_size=self.model.continuous_latent_size,
             )
+            target_discrete = normalize_discrete_tokens(
+                batch_inputs.discrete_target,
+                "discrete_target",
+                num_discrete_tokens=self.model.num_discrete_tokens,
+            )
 
-            normalized_generations: list[
-                tuple[str, torch.FloatTensor, Optional[torch.FloatTensor]]
-            ] = []
+            normalized_generations: list[tuple[str, torch.LongTensor]] = []
             for method_name, generation in generations.items():
-                continuous = generation.continuous_latents
-                if continuous is None:
+                if generation.discrete_ids is None:
                     continue
-                normalized = normalize_continuous_latents(
-                    continuous,
-                    expected_len=continuous.shape[1],
-                    name=f"generation[{method_name}].continuous_latents",
-                    continuous_latent_size=self.model.continuous_latent_size,
-                )
-                normalized_prior: Optional[torch.FloatTensor] = None
-                if generation.prior_latents is not None:
-                    normalized_prior = normalize_continuous_latents(
-                        generation.prior_latents,
-                        expected_len=generation.prior_latents.shape[1],
-                        name=f"generation[{method_name}].prior_latents",
-                        continuous_latent_size=self.model.continuous_latent_size,
+                normalized_generations.append(
+                    (
+                        str(method_name),
+                        normalize_discrete_tokens(
+                            generation.discrete_ids,
+                            f"generation[{method_name}].discrete_ids",
+                            num_discrete_tokens=self.model.num_discrete_tokens,
+                        ),
                     )
-                normalized_generations.append((str(method_name), normalized, normalized_prior))
+                )
             if not normalized_generations:
                 continue
 
-            sample_target_len = int(target_continuous.shape[1])
+            sample_target_len = min(int(target_continuous.shape[1]), int(target_discrete.shape[1]))
             if batch_inputs.speech_target_lengths is not None:
                 target_lengths = torch.as_tensor(
                     batch_inputs.speech_target_lengths,
@@ -1170,34 +1188,30 @@ class PrismTTSLightning(pl.LightningModule):
             if sample_target_len < 1:
                 continue
 
-            for method, pred_continuous, prior_continuous in normalized_generations:
-                if int(pred_continuous.shape[0]) < 1:
+            for method, pred_discrete in normalized_generations:
+                if int(pred_discrete.shape[0]) < 1:
                     continue
-                sample_eval_len = min(sample_target_len, int(pred_continuous.shape[1]))
-                if prior_continuous is not None:
-                    sample_eval_len = min(sample_eval_len, int(prior_continuous.shape[1]))
+                sample_eval_len = min(sample_target_len, int(pred_discrete.shape[1]))
                 if sample_eval_len < 1:
                     continue
 
                 sample_target_continuous = target_continuous[0, :sample_eval_len, :]
-                sample_pred_continuous = pred_continuous[0, :sample_eval_len, :]
+                sample_target_discrete = target_discrete[0, :sample_eval_len, :]
+                sample_pred_discrete = pred_discrete[0, :sample_eval_len, :]
                 target_audio = LU.decode_audio(
                     sample_target_continuous,
                     audio_decoder=self.audio_decoder,
                 )
+                target_discrete_audio = LU.decode_audio(
+                    sample_target_discrete,
+                    audio_decoder=self.audio_decoder,
+                )
                 pred_audio = LU.decode_audio(
-                    sample_pred_continuous,
+                    sample_pred_discrete,
                     audio_decoder=self.audio_decoder,
                 )
                 if target_audio is None or pred_audio is None:
                     continue
-                prior_audio = None
-                if prior_continuous is not None:
-                    sample_prior_continuous = prior_continuous[0, :sample_eval_len, :]
-                    prior_audio = LU.decode_audio(
-                        sample_prior_continuous,
-                        audio_decoder=self.audio_decoder,
-                    )
 
                 rows.append(
                     {
@@ -1205,7 +1219,8 @@ class PrismTTSLightning(pl.LightningModule):
                         "sample_id": sample_idx,
                         "generation_method": method,
                         "target_audio": target_audio,
-                        "prior_audio": prior_audio,
+                        "target_discrete_audio": target_discrete_audio,
+                        "prior_audio": None,
                         "predicted_audio": pred_audio,
                     }
                 )
