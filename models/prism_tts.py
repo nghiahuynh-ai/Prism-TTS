@@ -1592,6 +1592,8 @@ class PrismTTS(nn.Module):
         if needs_default_mimi_encoder:
             speech_encoder = MU.build_default_mimi_speech_encoder(
                 num_discrete_tokens=int(self.num_discrete_tokens),
+                continuous_latent_size=int(self.continuous_latent_size),
+                discrete_only=bool(self.discrete_only),
                 device=device,
                 continuous_dtype=continuous_dtype,
                 mimi_model_name_or_path=mimi_model_name_or_path,

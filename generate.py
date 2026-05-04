@@ -292,11 +292,20 @@ def main() -> None:
         prompt_codes = encoded.audio_codes
         if prompt_codes is None:
             raise RuntimeError("Mimi encode did not return audio_codes.")
-        prompt_latents = mimi_model.quantizer.decode(prompt_codes)
-        # prompt_codes: [B, N, T], prompt_latents: [B, C, T]
+        # prompt_codes: [B, N, T]
+        prompt_latents = None
+        if not bool(getattr(model, "discrete_only", False)):
+            prompt_latents = mimi_model.quantizer.decode(prompt_codes)
+            # prompt_latents: [B, C, T]
 
     raw_prompt_discrete = prompt_codes[0].transpose(0, 1).to(dtype=torch.long).cpu()
-    raw_prompt_continuous = prompt_latents[0].transpose(0, 1).to(dtype=torch.float32).cpu()
+    if prompt_latents is None:
+        raw_prompt_continuous = torch.zeros(
+            (int(raw_prompt_discrete.shape[0]), int(model.continuous_latent_size)),
+            dtype=torch.float32,
+        )
+    else:
+        raw_prompt_continuous = prompt_latents[0].transpose(0, 1).to(dtype=torch.float32).cpu()
 
     prompt_text_tokens = generate_utils.safe_tokenize(tokenizer, args.prompt_text, "prompt_text")
     target_text_tokens = generate_utils.safe_tokenize(tokenizer, args.text, "text")

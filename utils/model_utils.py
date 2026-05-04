@@ -285,6 +285,8 @@ def resample_audio_if_needed(
 def build_default_mimi_speech_encoder(
     *,
     num_discrete_tokens: int,
+    continuous_latent_size: int,
+    discrete_only: bool,
     device: torch.device,
     continuous_dtype: torch.dtype,
     mimi_model_name_or_path: str,
@@ -360,10 +362,16 @@ def build_default_mimi_speech_encoder(
         prompt_codes = encoded.audio_codes
         if prompt_codes is None:
             raise RuntimeError("Mimi encode did not return audio_codes.")
-        prompt_latents = mimi_model.quantizer.decode(prompt_codes)
-
         discrete = prompt_codes[0].transpose(0, 1).to(dtype=torch.long)
-        continuous = prompt_latents[0].transpose(0, 1).to(dtype=continuous_dtype)
+        if discrete_only:
+            continuous = torch.zeros(
+                (int(discrete.shape[0]), int(continuous_latent_size)),
+                device=device,
+                dtype=continuous_dtype,
+            )
+        else:
+            prompt_latents = mimi_model.quantizer.decode(prompt_codes)
+            continuous = prompt_latents[0].transpose(0, 1).to(dtype=continuous_dtype)
         return discrete, continuous
 
     return _default_speech_encoder
