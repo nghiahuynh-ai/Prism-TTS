@@ -149,16 +149,16 @@ def extract_tokenizer_from_loader(value: Any) -> Optional[Any]:
 
 
 def decode_audio(
-    latents: torch.Tensor,
+    representation: torch.Tensor,
     *,
     audio_decoder: Optional[Any],
 ) -> Optional[np.ndarray]:
-    """Decode latent speech representation into normalized mono waveform."""
+    """Decode speech representation into normalized mono waveform."""
     if audio_decoder is None:
         return None
 
     try:
-        decoded = audio_decoder(latents.detach())
+        decoded = audio_decoder(representation.detach())
     except Exception:
         return None
 

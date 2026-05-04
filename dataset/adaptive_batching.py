@@ -30,6 +30,7 @@ def _estimate_concat_sequence_length(
     text_target_length: int,
     speech_target_length: int,
     num_discrete_streams: int,
+    include_continuous_stream: bool,
 ) -> int:
     text_prompt_length = max(1, int(text_prompt_length))
     speech_prompt_length = max(1, int(speech_prompt_length))
@@ -37,7 +38,7 @@ def _estimate_concat_sequence_length(
     # Training collate appends one explicit terminal EOS speech block.
     speech_target_length = max(1, int(speech_target_length)) + 1
     num_discrete_streams = max(1, int(num_discrete_streams))
-    speech_block_size = num_discrete_streams + 1
+    speech_block_size = num_discrete_streams + (1 if include_continuous_stream else 0)
     return (
         text_prompt_length
         + 1  # EOT after text prompt
@@ -80,6 +81,7 @@ def estimate_prism_sample_lengths(
     dataset: Any,
     *,
     codec_frame_rate_hz: float,
+    include_continuous_stream: bool = True,
 ) -> list[int]:
     """Estimate concatenated sequence length for each Prism sample."""
     if codec_frame_rate_hz <= 0:
@@ -126,6 +128,7 @@ def estimate_prism_sample_lengths(
                     text_target_length=text_target_len,
                     speech_target_length=target_discrete_len,
                     num_discrete_streams=num_discrete_streams,
+                    include_continuous_stream=include_continuous_stream,
                 )
             )
         return lengths
@@ -158,6 +161,7 @@ def estimate_prism_sample_lengths(
                     text_target_length=text_target_len,
                     speech_target_length=target_discrete_len,
                     num_discrete_streams=num_discrete_streams,
+                    include_continuous_stream=include_continuous_stream,
                 )
             )
         return lengths

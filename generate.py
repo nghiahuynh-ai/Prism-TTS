@@ -464,31 +464,41 @@ def main() -> None:
         )
         print(sample_discrete_codes.tolist())
 
-    predicted_latents = generation.continuous_latents
-    if predicted_latents is None or predicted_latents.shape[0] == 0:
-        raise RuntimeError("Generation produced no continuous latents.")
-    sample_latents = predicted_latents[0]
-
-    latent_std = float(sample_latents.std(unbiased=False).item())
-    if sample_latents.shape[0] > 1:
-        latent_delta_std = float((sample_latents[1:] - sample_latents[:-1]).std(unbiased=False).item())
+    decode_input: torch.Tensor
+    generated_blocks: int
+    if bool(getattr(model, "discrete_only", False)):
+        if generation.discrete_ids is None or generation.discrete_ids.shape[0] == 0:
+            raise RuntimeError("Generation produced no discrete ids to decode.")
+        decode_input = generation.discrete_ids[0].detach().to(dtype=torch.long)
+        generated_blocks = int(decode_input.shape[-1])
     else:
-        latent_delta_std = 0.0
-    print(
-        "[generate.py] latent summary: "
-        f"std={latent_std:.6f}, delta_std={latent_delta_std:.6f}"
-    )
+        predicted_latents = generation.continuous_latents
+        if predicted_latents is None or predicted_latents.shape[0] == 0:
+            raise RuntimeError("Generation produced no continuous latents.")
+        sample_latents = predicted_latents[0]
 
-    if generation.discrete_ids is not None:
-        sample_discrete = generation.discrete_ids[0]
-        sample_latents = generate_utils.trim_latent_special_blocks(
-            latents=sample_latents,
-            discrete_ids=sample_discrete,
-            num_discrete_tokens=int(model.num_discrete_tokens),
-            special_token_ids=special_token_ids,
-            trim_head=bool(args.trim_leading_special_blocks),
-            trim_tail=bool(args.trim_tail_special_blocks),
+        latent_std = float(sample_latents.std(unbiased=False).item())
+        if sample_latents.shape[0] > 1:
+            latent_delta_std = float((sample_latents[1:] - sample_latents[:-1]).std(unbiased=False).item())
+        else:
+            latent_delta_std = 0.0
+        print(
+            "[generate.py] latent summary: "
+            f"std={latent_std:.6f}, delta_std={latent_delta_std:.6f}"
         )
+
+        if generation.discrete_ids is not None:
+            sample_discrete = generation.discrete_ids[0]
+            sample_latents = generate_utils.trim_latent_special_blocks(
+                latents=sample_latents,
+                discrete_ids=sample_discrete,
+                num_discrete_tokens=int(model.num_discrete_tokens),
+                special_token_ids=special_token_ids,
+                trim_head=bool(args.trim_leading_special_blocks),
+                trim_tail=bool(args.trim_tail_special_blocks),
+            )
+        decode_input = sample_latents.detach()
+        generated_blocks = int(sample_latents.shape[0])
 
     decoder = MimiPreUpsampleLatentDecoder(
         pretrained_model_name_or_path=args.mimi_model,
@@ -499,7 +509,7 @@ def main() -> None:
         token=args.hf_token,
     )
     with torch.no_grad():
-        decoded = decoder(sample_latents.detach())
+        decoded = decoder(decode_input)
 
     if isinstance(decoded, torch.Tensor):
         waveform = decoded.detach().cpu().float().numpy()
@@ -534,7 +544,7 @@ def main() -> None:
         print(f"[generate.py] wrote mel spectrogram: {mel_path}")
     print(
         "[generate.py] summary: "
-        f"prompt_blocks={text_prompt.shape[1]}, generated_blocks={int(sample_latents.shape[0])}, "
+        f"prompt_blocks={text_prompt.shape[1]}, generated_blocks={generated_blocks}, "
         f"sample_rate={output_sample_rate}"
     )
 

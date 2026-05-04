@@ -37,7 +37,7 @@ except ModuleNotFoundError:
 
 
 SchedulerFactory = Callable[[torch.optim.Optimizer], Any]
-AudioDecoder = Callable[[torch.FloatTensor], torch.Tensor | np.ndarray]
+AudioDecoder = Callable[[torch.Tensor], torch.Tensor | np.ndarray]
 
 PrismBatch = LU.PrismBatch
 PeriodicEvalSample = LU.PeriodicEvalSample
@@ -532,10 +532,12 @@ class PrismTTSLightning(pl.LightningModule):
         if (
             batch_inputs.text_prompt is None
             or batch_inputs.discrete_prompt is None
-            or batch_inputs.continuous_prompt is None
             or batch_inputs.text_target is None
             or batch_inputs.discrete_target is None
-            or batch_inputs.continuous_target is None
+        ):
+            return None
+        if (not self.model.discrete_only) and (
+            batch_inputs.continuous_prompt is None or batch_inputs.continuous_target is None
         ):
             return None
 
@@ -568,12 +570,23 @@ class PrismTTSLightning(pl.LightningModule):
             "discrete_prompt",
             num_discrete_tokens=self.model.num_discrete_tokens,
         )[:, :prompt_speech_len, :]
-        continuous_prompt = normalize_continuous_latents(
-            batch_inputs.continuous_prompt,
-            expected_len=int(batch_inputs.discrete_prompt.shape[-2]),
-            name="continuous_prompt",
-            continuous_latent_size=self.model.continuous_latent_size,
-        )[:, :prompt_speech_len, :]
+        if self.model.discrete_only:
+            continuous_prompt = torch.zeros(
+                (
+                    int(discrete_prompt.shape[0]),
+                    int(prompt_speech_len),
+                    int(self.model.continuous_latent_size),
+                ),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            continuous_prompt = normalize_continuous_latents(
+                batch_inputs.continuous_prompt,
+                expected_len=int(batch_inputs.discrete_prompt.shape[-2]),
+                name="continuous_prompt",
+                continuous_latent_size=self.model.continuous_latent_size,
+            )[:, :prompt_speech_len, :]
         text_target = batch_inputs.text_target[:, :target_text_len]
 
         generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
@@ -609,6 +622,7 @@ class PrismTTSLightning(pl.LightningModule):
         return PeriodicEvalSample(
             sample_source=str(sample_source),
             batch_inputs=PrismBatch(
+                discrete_target=batch_inputs.discrete_target,
                 continuous_target=batch_inputs.continuous_target,
                 speech_target_lengths=torch.tensor([target_speech_len], device=self.device),
             ),
@@ -1037,6 +1051,77 @@ class PrismTTSLightning(pl.LightningModule):
         for sample_idx, sample in enumerate(periodic_samples):
             batch_inputs = sample.batch_inputs
             generations = sample.generations
+            if self.model.discrete_only:
+                if batch_inputs.discrete_target is None:
+                    continue
+
+                target_discrete = normalize_discrete_tokens(
+                    batch_inputs.discrete_target,
+                    "discrete_target",
+                    num_discrete_tokens=self.model.num_discrete_tokens,
+                )
+                normalized_generations: list[tuple[str, torch.LongTensor]] = []
+                for method_name, generation in generations.items():
+                    if generation.discrete_ids is None:
+                        continue
+                    normalized_generations.append(
+                        (
+                            str(method_name),
+                            normalize_discrete_tokens(
+                                generation.discrete_ids,
+                                f"generation[{method_name}].discrete_ids",
+                                num_discrete_tokens=self.model.num_discrete_tokens,
+                            ),
+                        )
+                    )
+                if not normalized_generations:
+                    continue
+
+                sample_target_len = int(target_discrete.shape[1])
+                if batch_inputs.speech_target_lengths is not None:
+                    target_lengths = torch.as_tensor(
+                        batch_inputs.speech_target_lengths,
+                        device=self.device,
+                    )
+                    if target_lengths.dim() == 0:
+                        target_lengths = target_lengths.unsqueeze(0)
+                    if int(target_lengths.shape[0]) > 0:
+                        sample_target_len = min(sample_target_len, int(target_lengths[0].item()))
+                if sample_target_len < 1:
+                    continue
+
+                for method, pred_discrete in normalized_generations:
+                    if int(pred_discrete.shape[0]) < 1:
+                        continue
+                    sample_eval_len = min(sample_target_len, int(pred_discrete.shape[1]))
+                    if sample_eval_len < 1:
+                        continue
+
+                    sample_target_discrete = target_discrete[0, :sample_eval_len, :]
+                    sample_pred_discrete = pred_discrete[0, :sample_eval_len, :]
+                    target_audio = LU.decode_audio(
+                        sample_target_discrete,
+                        audio_decoder=self.audio_decoder,
+                    )
+                    pred_audio = LU.decode_audio(
+                        sample_pred_discrete,
+                        audio_decoder=self.audio_decoder,
+                    )
+                    if target_audio is None or pred_audio is None:
+                        continue
+
+                    rows.append(
+                        {
+                            "sample_source": str(sample.sample_source),
+                            "sample_id": sample_idx,
+                            "generation_method": method,
+                            "target_audio": target_audio,
+                            "prior_audio": None,
+                            "predicted_audio": pred_audio,
+                        }
+                    )
+                continue
+
             if batch_inputs.continuous_target is None:
                 continue
 

@@ -380,6 +380,12 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
     prism_cfg = _require_mapping(model_cfg, "prism_tts")
     llama_cfg = _require_mapping(model_cfg, "llama_config")
     dataset_cfg = _require_mapping(data_cfg, "dataset")
+    discrete_only = bool(prism_cfg.get("discrete_only", False))
+    dataset_discrete_only = bool(dataset_cfg.get("discrete_only", False))
+    if dataset_discrete_only != discrete_only:
+        raise ValueError(
+            "model.prism_tts.discrete_only must match data.dataset.discrete_only."
+        )
 
     num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
     dataset_stream_count_raw = dataset_cfg.get("discrete_stream_count")
@@ -393,7 +399,7 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
 
     continuous_latent_size = int(prism_cfg["continuous_latent_size"])
     dataset_continuous_dim_raw = dataset_cfg.get("continuous_feature_dim")
-    if dataset_continuous_dim_raw is not None:
+    if not discrete_only and dataset_continuous_dim_raw is not None:
         dataset_continuous_dim = int(dataset_continuous_dim_raw)
         if continuous_latent_size != dataset_continuous_dim:
             raise ValueError(
@@ -474,6 +480,7 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
         discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
         continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
+        discrete_only=bool(prism_cfg.get("discrete_only", False)),
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
@@ -735,6 +742,8 @@ def _build_data_objects(
     dataset_cfg = _require_mapping(data_cfg, "dataset")
     collate_cfg = _require_mapping(data_cfg, "collate")
     shared_layout = _require_mapping(data_cfg, "shared_layout")
+    prism_cfg = _require_mapping(_require_mapping(config, "model"), "prism_tts")
+    discrete_only = bool(prism_cfg.get("discrete_only", False))
 
     discrete_token_count = int(shared_layout["discrete_token_count"])
 
@@ -744,6 +753,7 @@ def _build_data_objects(
         "discrete_token_count": discrete_token_count,
         "discrete_stream_count": dataset_cfg.get("discrete_stream_count"),
         "continuous_feature_dim": dataset_cfg.get("continuous_feature_dim"),
+        "discrete_only": discrete_only,
         "append_eos_to_text": bool(dataset_cfg.get("append_eos_to_text", False)),
         "cache_npy": bool(dataset_cfg.get("cache_npy", False)),
     }
@@ -765,6 +775,7 @@ def _build_data_objects(
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
+        discrete_only=discrete_only,
     )
 
     num_workers = int(loader_cfg.get("num_workers", 0))
@@ -834,6 +845,7 @@ def _build_data_objects(
         sample_lengths = estimate_prism_sample_lengths(
             train_dataset,
             codec_frame_rate_hz=float(collate_cfg.get("codec_frame_rate_hz", 12.5)),
+            include_continuous_stream=not discrete_only,
         )
 
         reference_length = _length_quantile(sample_lengths, reference_quantile)

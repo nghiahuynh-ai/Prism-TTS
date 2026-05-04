@@ -1238,5 +1238,61 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             )
         )
 
+
+class TestPrismTTSDiscreteOnly(unittest.TestCase):
+    def test_discrete_only_forward_and_generate(self) -> None:
+        torch.manual_seed(0)
+        device = torch.device("cpu")
+        model = PrismTTS(
+            llama_config=make_small_config(),
+            num_discrete_tokens=2,
+            discrete_vocab_size=128,
+            continuous_latent_size=8,
+            discrete_only=True,
+            flow_sample_steps=2,
+            parallel_sample_steps=2,
+        ).to(device)
+        model.eval()
+
+        collate = BatchCollate(discrete_token_count=125, discrete_only=True)
+        batch = collate(
+            [
+                {
+                    "text_prompt": torch.tensor([10, 11], dtype=torch.long),
+                    "discrete_prompt": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+                    "text_target": torch.tensor([12], dtype=torch.long),
+                    "discrete_target": torch.tensor([[5, 6]], dtype=torch.long),
+                }
+            ]
+        )
+
+        outputs = model(
+            flat_token_ids=batch["flat_token_ids"].to(device),
+            flat_continuous_values=batch["flat_continuous_values"].to(device),
+            flat_token_type_ids=batch["flat_token_type_ids"].to(device),
+            flat_speech_stream_ids=batch["flat_speech_stream_ids"].to(device),
+            flat_target_block_ids=batch["flat_target_block_ids"].to(device),
+            flat_target_block_counts=batch["flat_target_block_counts"].to(device),
+            attention_mask=batch["attention_mask"].to(device),
+            return_dict=True,
+        )
+        self.assertTrue(torch.allclose(outputs.loss, outputs.discrete_loss))
+        self.assertEqual(float(outputs.continuous_loss.item()), 0.0)
+        self.assertEqual(float(outputs.flow_loss.item()), 0.0)
+
+        generation = model.generate(
+            text_prompt=batch["text_prompt"].to(device),
+            discrete_prompt=batch["discrete_prompt"].transpose(1, 2).to(device),
+            continuous_prompt=None,
+            text_target=batch["text_target"].to(device),
+            speech_target_lengths=torch.tensor([2], dtype=torch.long, device=device),
+            max_new_blocks=2,
+            do_sample=False,
+            return_dict=True,
+        )
+        self.assertIsNotNone(generation.discrete_ids)
+        self.assertIsNone(generation.continuous_latents)
+        self.assertEqual(tuple(generation.discrete_ids.shape), (1, 2, 2))
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,9 @@ data:
     # PrismDataset(...) arguments.
     append_eos_to_text: false
     cache_npy: false
-    discrete_stream_count: 1
+    # When true, continuous arrays in .npy are optional and can be synthesized.
+    discrete_only: true
+    discrete_stream_count: 4
     continuous_feature_dim: 512
 
   collate:

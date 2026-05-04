@@ -141,6 +141,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
     - discrete: int array, shape [L, N]
     - continuous: float array, shape [L, D]
     where N and D can be enforced via constructor configs.
+
+    When `discrete_only=True`, continuous arrays are optional and will be
+    synthesized as zero placeholders.
     """
 
     def __init__(
@@ -151,6 +154,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
         discrete_stream_count: int | None = None,
         continuous_feature_dim: int | None = None,
+        discrete_only: bool = False,
         append_eos_to_text: bool = False,
         cache_npy: bool = False,
         cache_npz: bool | None = None,
@@ -180,12 +184,17 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             cache_npy = bool(cache_npz)
         self.cache_npy = bool(cache_npy)
         self._npy_cache: dict[str, tuple[torch.LongTensor, torch.FloatTensor]] = {}
+        self.discrete_only = bool(discrete_only)
         self.discrete_stream_count = (
             None if discrete_stream_count is None else int(discrete_stream_count)
         )
-        self.continuous_feature_dim = (
-            None if continuous_feature_dim is None else int(continuous_feature_dim)
-        )
+        if continuous_feature_dim is None and self.discrete_only:
+            # Keep a stable placeholder channel for flat_collate tensors.
+            self.continuous_feature_dim = 1
+        else:
+            self.continuous_feature_dim = (
+                None if continuous_feature_dim is None else int(continuous_feature_dim)
+            )
         if self.discrete_stream_count is not None and self.discrete_stream_count < 1:
             raise ValueError("discrete_stream_count must be >= 1 when provided.")
         if self.continuous_feature_dim is not None and self.continuous_feature_dim < 1:
@@ -218,7 +227,29 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if self._entries:
             return self._build_manifest_sample(self._entries[index])
-        return _normalize_split_sample(self._samples[index])
+        sample = self._samples[index]
+        if (
+            self.discrete_only
+            and ("continuous_target" not in sample or "continuous_prompt" not in sample)
+        ):
+            discrete_target = _to_long_2d(sample["discrete_target"], "discrete_target")
+            discrete_prompt = _to_long_2d(sample["discrete_prompt"], "discrete_prompt")
+            continuous_dim = (
+                int(self.continuous_feature_dim)
+                if self.continuous_feature_dim is not None
+                else 1
+            )
+            normalized_sample = dict(sample)
+            normalized_sample["continuous_target"] = torch.zeros(
+                (int(discrete_target.shape[0]), continuous_dim),
+                dtype=torch.float32,
+            )
+            normalized_sample["continuous_prompt"] = torch.zeros(
+                (int(discrete_prompt.shape[0]), continuous_dim),
+                dtype=torch.float32,
+            )
+            return _normalize_split_sample(normalized_sample)
+        return _normalize_split_sample(sample)
 
     def _load_manifest(self, manifest_path: Path) -> list[ManifestEntry]:
         entries: list[ManifestEntry] = []
@@ -293,10 +324,13 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
     def _extract_modal_arrays_from_npy(
         payload: Any,
         npy_path: Path,
-    ) -> tuple[Any, Any]:
+        allow_missing_continuous: bool = False,
+    ) -> tuple[Any, Any | None]:
         if isinstance(payload, np.ndarray) and payload.dtype.names is not None:
             field_names = set(payload.dtype.names)
-            if "discrete" in field_names and "continuous" in field_names:
+            has_discrete = "discrete" in field_names
+            has_continuous = "continuous" in field_names
+            if has_discrete and has_continuous:
                 discrete = payload["discrete"]
                 continuous = payload["continuous"]
                 if (
@@ -312,14 +346,31 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                 ):
                     continuous = continuous.item()
                 return discrete, continuous
+            if allow_missing_continuous and has_discrete:
+                discrete = payload["discrete"]
+                if (
+                    isinstance(discrete, np.ndarray)
+                    and discrete.dtype == object
+                    and discrete.shape == ()
+                ):
+                    discrete = discrete.item()
+                return discrete, None
 
         if isinstance(payload, np.ndarray) and payload.dtype == object and payload.shape == ():
             value = payload.item()
             if isinstance(value, Mapping):
                 if "discrete" in value and "continuous" in value:
                     return value["discrete"], value["continuous"]
+                if allow_missing_continuous and "discrete" in value:
+                    return value["discrete"], None
             if isinstance(value, tuple) and len(value) == 2:
                 return value[0], value[1]
+            if allow_missing_continuous:
+                return value, None
+
+        if allow_missing_continuous and isinstance(payload, np.ndarray):
+            # Plain numeric arrays are interpreted as discrete-only storage.
+            return payload, None
 
         raise ValueError(
             f"{npy_path} must contain 'discrete' and 'continuous' arrays. "
@@ -344,9 +395,21 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             discrete_raw, continuous_raw = self._extract_modal_arrays_from_npy(
                 payload,
                 npy_path,
+                allow_missing_continuous=self.discrete_only,
             )
             discrete = _to_long_2d(discrete_raw, f"{npy_path}:discrete")
-            continuous = _to_float_2d(continuous_raw, f"{npy_path}:continuous")
+            if continuous_raw is None:
+                continuous_dim = (
+                    int(self.continuous_feature_dim)
+                    if self.continuous_feature_dim is not None
+                    else 1
+                )
+                continuous = torch.zeros(
+                    (int(discrete.shape[0]), continuous_dim),
+                    dtype=torch.float32,
+                )
+            else:
+                continuous = _to_float_2d(continuous_raw, f"{npy_path}:continuous")
         except Exception as exc:
             raise RuntimeError(f"Failed to load npy file {npy_path}: {exc}") from exc
 
@@ -429,6 +492,7 @@ class BatchCollate:
         continuous_pad_value: float = 0.0,
         include_attention_mask: bool = True,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
+        discrete_only: bool = False,
     ) -> None:
         (
             self.eot_token_id,
@@ -443,6 +507,7 @@ class BatchCollate:
         self.continuous_pad_value = continuous_pad_value
         self.include_attention_mask = include_attention_mask
         self.discrete_token_count = int(discrete_token_count)
+        self.discrete_only = bool(discrete_only)
 
     def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         if not batch:
@@ -530,14 +595,14 @@ class BatchCollate:
         return collated
 
     def _validate_collate_sample(self, sample: Mapping[str, Any]) -> dict[str, torch.Tensor]:
-        required_keys = (
+        required_keys = [
             "text_target",
             "discrete_target",
-            "continuous_target",
             "text_prompt",
             "discrete_prompt",
-            "continuous_prompt",
-        )
+        ]
+        if not self.discrete_only:
+            required_keys.extend(("continuous_target", "continuous_prompt"))
         missing = [key for key in required_keys if key not in sample]
         if missing:
             raise KeyError(f"Missing required keys in collate sample: {missing}")
@@ -555,10 +620,34 @@ class BatchCollate:
 
         text_target = require_tensor("text_target", 1)
         discrete_target = require_tensor("discrete_target", 2)
-        continuous_target = require_tensor("continuous_target", 2)
         text_prompt = require_tensor("text_prompt", 1)
         discrete_prompt = require_tensor("discrete_prompt", 2)
-        continuous_prompt = require_tensor("continuous_prompt", 2)
+
+        continuous_target = sample.get("continuous_target")
+        continuous_prompt = sample.get("continuous_prompt")
+        if continuous_target is None or continuous_prompt is None:
+            if not self.discrete_only:
+                raise KeyError("continuous_target and continuous_prompt are required.")
+            cont_dim = 1
+            continuous_target = torch.zeros(
+                (int(discrete_target.shape[0]), cont_dim),
+                dtype=torch.float32,
+                device=discrete_target.device,
+            )
+            continuous_prompt = torch.zeros(
+                (int(discrete_prompt.shape[0]), cont_dim),
+                dtype=torch.float32,
+                device=discrete_prompt.device,
+            )
+        else:
+            if not isinstance(continuous_target, torch.Tensor) or continuous_target.dim() != 2:
+                raise ValueError(
+                    "continuous_target must be a 2D torch.Tensor when provided."
+                )
+            if not isinstance(continuous_prompt, torch.Tensor) or continuous_prompt.dim() != 2:
+                raise ValueError(
+                    "continuous_prompt must be a 2D torch.Tensor when provided."
+                )
 
         if discrete_target.shape[1] != discrete_prompt.shape[1]:
             raise ValueError(
@@ -606,11 +695,13 @@ class BatchCollate:
 
     def _has_terminal_target_eos_block(self, sample: Mapping[str, torch.Tensor]) -> bool:
         discrete_target = sample["discrete_target"]
-        continuous_target = sample["continuous_target"]
         if int(discrete_target.shape[0]) < 1:
             return False
         if not bool(torch.eq(discrete_target[-1], self.eos_token_id).all().item()):
             return False
+        if self.discrete_only:
+            return True
+        continuous_target = sample["continuous_target"]
         last_continuous = continuous_target[-1]
         return bool(torch.le(last_continuous.abs().max(), 1e-8).item())
 
@@ -661,7 +752,9 @@ class BatchCollate:
         prompt_speech = int(sample["discrete_prompt"].shape[0])
         target_text = int(sample["text_target"].shape[0])
         target_speech = int(sample["discrete_target"].shape[0])
-        num_streams = int(sample["discrete_target"].shape[1]) + 1
+        num_streams = int(sample["discrete_target"].shape[1]) + (
+            0 if self.discrete_only else 1
+        )
         total = (
             prompt_text
             + 1
@@ -707,7 +800,9 @@ class BatchCollate:
         text_stream_idx = 0
         speech_discrete_stream_start_idx = 0
         speech_discrete_stream_end_idx = num_discrete_streams - 1
-        speech_continuous_stream_idx = num_discrete_streams
+        speech_continuous_stream_idx = (
+            num_discrete_streams if not self.discrete_only else -1
+        )
 
         zero_cont = torch.zeros(continuous_dim, dtype=torch.float32)
 
@@ -746,7 +841,8 @@ class BatchCollate:
                     stream_idx,
                     -1,
                 )
-            append_continuous(prompt_continuous[block_idx], -1)
+            if not self.discrete_only:
+                append_continuous(prompt_continuous[block_idx], -1)
         speech_prompt_end = len(token_ids)
         append_text(self.eos_token_id)
 
@@ -764,7 +860,8 @@ class BatchCollate:
                     stream_idx,
                     block_idx,
                 )
-            append_continuous(target_continuous[block_idx], block_idx)
+            if not self.discrete_only:
+                append_continuous(target_continuous[block_idx], block_idx)
         speech_target_end = len(token_ids)
         append_text(self.eos_token_id)
 

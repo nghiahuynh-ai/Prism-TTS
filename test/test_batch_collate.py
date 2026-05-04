@@ -119,3 +119,28 @@ def test_batch_collate_builds_split_parts_and_lengths_without_delay():
     assert int((final_block_token_ids == eos_token_id).sum().item()) == 2
     assert int((final_block_token_ids == pad_token_id).sum().item()) == 1
     assert torch.allclose(final_block_continuous, torch.zeros_like(final_block_continuous))
+
+
+def test_batch_collate_discrete_only_skips_continuous_stream_tokens():
+    collate = BatchCollate(discrete_token_count=100, discrete_only=True)
+    _, eos_token_id, _, _ = build_shared_token_layout(100)
+
+    sample = {
+        "text_prompt": torch.tensor([200, 201], dtype=torch.long),
+        "discrete_prompt": torch.tensor([[1, 11], [2, 12]], dtype=torch.long),
+        "text_target": torch.tensor([210], dtype=torch.long),
+        "discrete_target": torch.tensor([[3, 13]], dtype=torch.long),
+    }
+
+    out = collate([sample])
+    assert tuple(out["continuous_prompt"].shape) == (1, 2, 1)
+    assert tuple(out["continuous_target"].shape) == (1, 2, 1)
+    assert int((out["flat_token_type_ids"] == 2).sum().item()) == 0
+
+    final_block_id = int(out["flat_target_block_counts"][0].item()) - 1
+    final_block_positions = out["flat_target_block_ids"][0] == final_block_id
+    assert int(final_block_positions.sum().item()) == 2  # N streams, no continuous stream token.
+    assert torch.eq(
+        out["flat_token_ids"][0][final_block_positions],
+        eos_token_id,
+    ).all()

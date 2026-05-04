@@ -38,6 +38,9 @@ class MimiPreUpsampleLatentDecoder:
 
     This keeps only the decoder-side Mimi modules in memory:
     `upsample -> decoder_transformer -> decoder`.
+
+    The decoder also accepts discrete Mimi codec codes and internally runs
+    `quantizer.decode(codes)` before waveform synthesis.
     """
 
     def __init__(
@@ -75,13 +78,21 @@ class MimiPreUpsampleLatentDecoder:
         self.hidden_size = int(mimi.config.hidden_size)
         self.sample_rate = int(getattr(mimi.config, "sampling_rate", 24_000))
         self.device = torch.device(device)
+        self.num_codebooks = int(
+            getattr(mimi.config, "num_quantizers", 0)
+            or getattr(mimi.config, "num_codebooks", 0)
+            or 0
+        )
 
+        self.quantizer = mimi.quantizer
         self.upsample = mimi.upsample
         self.decoder_transformer = mimi.decoder_transformer
         self.decoder = mimi.decoder
         del mimi
 
         self._modules: list[nn.Module] = []
+        if self.quantizer is not None:
+            self._modules.append(self.quantizer)
         if self.upsample is not None:
             self._modules.append(self.upsample)
         self._modules.extend([self.decoder_transformer, self.decoder])
@@ -127,9 +138,78 @@ class MimiPreUpsampleLatentDecoder:
 
         return embeddings.to(device=self.device, dtype=self._module_dtype())
 
+    def _prepare_audio_codes(self, codes: torch.Tensor | np.ndarray) -> torch.Tensor:
+        if not torch.is_tensor(codes):
+            codes = torch.as_tensor(codes)
+        codes = codes.detach()
+
+        if codes.dim() == 2:
+            if self.num_codebooks > 0:
+                if int(codes.shape[0]) == self.num_codebooks:
+                    normalized = codes.unsqueeze(0)
+                elif int(codes.shape[1]) == self.num_codebooks:
+                    normalized = codes.transpose(0, 1).unsqueeze(0)
+                elif int(codes.shape[0]) <= int(codes.shape[1]):
+                    normalized = codes.unsqueeze(0)
+                else:
+                    normalized = codes.transpose(0, 1).unsqueeze(0)
+            elif int(codes.shape[0]) <= int(codes.shape[1]):
+                normalized = codes.unsqueeze(0)
+            else:
+                normalized = codes.transpose(0, 1).unsqueeze(0)
+        elif codes.dim() == 3:
+            if self.num_codebooks > 0:
+                if int(codes.shape[1]) == self.num_codebooks:
+                    normalized = codes
+                elif int(codes.shape[2]) == self.num_codebooks:
+                    normalized = codes.transpose(1, 2)
+                elif int(codes.shape[1]) <= int(codes.shape[2]):
+                    normalized = codes
+                else:
+                    normalized = codes.transpose(1, 2)
+            elif int(codes.shape[1]) <= int(codes.shape[2]):
+                normalized = codes
+            else:
+                normalized = codes.transpose(1, 2)
+        else:
+            raise ValueError(
+                "Expected codec codes with shape [N, T], [T, N], [B, N, T], or [B, T, N]."
+            )
+
+        return normalized.to(device=self.device, dtype=torch.long)
+
+    def _decode_codes_to_embeddings(self, codes: torch.Tensor | np.ndarray) -> torch.Tensor:
+        if self.quantizer is None:
+            raise RuntimeError("Mimi quantizer is not available for discrete-code decoding.")
+        audio_codes = self._prepare_audio_codes(codes)
+        embeddings = self.quantizer.decode(audio_codes)
+        if not torch.is_tensor(embeddings):
+            embeddings = torch.as_tensor(embeddings)
+        if embeddings.dim() != 3:
+            raise ValueError(
+                "Decoded Mimi quantizer output must have shape [B, C, T], "
+                f"got {tuple(embeddings.shape)}."
+            )
+        return embeddings.to(device=self.device, dtype=self._module_dtype())
+
+    def _looks_like_discrete_codes(self, value: torch.Tensor | np.ndarray) -> bool:
+        tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+        if not tensor.dtype.is_floating_point:
+            return True
+        if self.num_codebooks <= 0:
+            return False
+        if tensor.dim() == 2:
+            return int(tensor.shape[0]) == self.num_codebooks or int(tensor.shape[1]) == self.num_codebooks
+        if tensor.dim() == 3:
+            return int(tensor.shape[1]) == self.num_codebooks or int(tensor.shape[2]) == self.num_codebooks
+        return False
+
     @torch.inference_mode()
-    def __call__(self, latents: torch.Tensor | np.ndarray) -> torch.Tensor:
-        embeddings = self._prepare_embeddings(latents)
+    def __call__(self, representation: torch.Tensor | np.ndarray) -> torch.Tensor:
+        if self._looks_like_discrete_codes(representation):
+            embeddings = self._decode_codes_to_embeddings(representation)
+        else:
+            embeddings = self._prepare_embeddings(representation)
         if self.upsample is not None:
             embeddings = self.upsample(embeddings)
 
@@ -142,4 +222,3 @@ class MimiPreUpsampleLatentDecoder:
         if audio.dim() == 3 and audio.shape[1] == 1:
             audio = audio[:, 0, :]
         return audio
-

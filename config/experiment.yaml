@@ -13,10 +13,10 @@ experiment:
   # experiment-specific values here.
   trainer:
     logger:
-      name: masking
+      name: mask-disc
 
     checkpoint:
-      dirpath: checkpoints/masking
+      dirpath: checkpoints/mask-dsc
 
     distributed:
       enabled: true

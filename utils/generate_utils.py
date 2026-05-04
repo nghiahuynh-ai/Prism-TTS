@@ -94,6 +94,7 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
         num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
         discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
         continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
+        discrete_only=bool(prism_cfg.get("discrete_only", False)),
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
         flow_model_channels=prism_cfg.get("flow_model_channels"),
         flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
