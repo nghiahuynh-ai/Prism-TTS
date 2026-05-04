@@ -3,6 +3,7 @@ from __future__ import annotations
 from functools import lru_cache
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import torch
@@ -1164,6 +1165,72 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
                 rtol=1e-5,
             )
         )
+
+    def test_generation_uses_continuous_prompt_as_flow_prefix_context(self) -> None:
+        batch_size = 1
+        prompt_len = 3
+        generated_len = 3
+        text_vocab_upper = max(2, min(200, int(self.model.backbone.config.vocab_size)))
+
+        text_prompt = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, prompt_len),
+            device=self.device,
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size,
+            prompt_len,
+            self.continuous_latent_size,
+            device=self.device,
+        )
+        text_target = torch.randint(
+            0,
+            text_vocab_upper,
+            (batch_size, generated_len),
+            device=self.device,
+        )
+        speech_prompt_lengths = torch.tensor([prompt_len - 1], dtype=torch.long, device=self.device)
+
+        for generation_method in ("causal", "parallel", "parallel_stable"):
+            with torch.no_grad():
+                with mock.patch.object(
+                    self.model,
+                    "_sample_continuous_with_clean_context",
+                    wraps=self.model._sample_continuous_with_clean_context,
+                ) as flow_sampler_spy:
+                    _ = self.model.generate(
+                        text_prompt=text_prompt,
+                        discrete_prompt=discrete_prompt,
+                        continuous_prompt=continuous_prompt,
+                        text_target=text_target,
+                        speech_prompt_lengths=speech_prompt_lengths,
+                        max_new_blocks=generated_len,
+                        generation_method=generation_method,
+                        parallel_num_steps=2,
+                        flow_num_steps=2,
+                        do_sample=False,
+                        return_dict=True,
+                    )
+
+            self.assertGreater(
+                flow_sampler_spy.call_count,
+                0,
+                msg=f"Expected flow sampler calls for generation method '{generation_method}'.",
+            )
+            for call in flow_sampler_spy.call_args_list:
+                prompt_latents = call.kwargs.get("prompt_latents")
+                prompt_lengths = call.kwargs.get("prompt_lengths")
+                self.assertIsNotNone(prompt_latents)
+                self.assertIsNotNone(prompt_lengths)
+                self.assertTrue(torch.equal(prompt_lengths, speech_prompt_lengths))
+                self.assertTrue(torch.allclose(prompt_latents, continuous_prompt))
 
     def test_special_discrete_blocks_produce_silent_continuous_latents(self) -> None:
         batch_size = 1
