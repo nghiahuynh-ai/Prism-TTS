@@ -237,7 +237,7 @@ class PrismTTS(nn.Module):
         for stream_idx, discrete_lm_head in enumerate(self.discrete_lm_heads):
             stream_mask = stream_ids == stream_idx
             if stream_mask.any():
-                logits[stream_mask] = discrete_lm_head(hidden_states[stream_mask])
+                logits[stream_mask] = discrete_lm_head(hidden_states[stream_mask]).to(logits.dtype)
                 remaining[stream_mask] = False
         if remaining.any():
             unknown_stream_ids = torch.unique(stream_ids[remaining]).tolist()
