@@ -50,7 +50,7 @@ class PrismTTS(nn.Module):
             raise ValueError("discrete_vocab_size must be at least 1.")
         if discrete_vocab_size > llama_config.vocab_size:
             raise ValueError(
-                "discrete_vocab_size must be <= llama_config.vocab_size when text/discrete embeddings are shared."
+                "discrete_vocab_size must be <= llama_config.vocab_size for the shared token-id layout."
             )
         if continuous_latent_size < 1:
             raise ValueError("continuous_latent_size must be at least 1.")
@@ -92,7 +92,18 @@ class PrismTTS(nn.Module):
         self.parallel_sample_steps = int(parallel_sample_steps)
 
         self.backbone = LlamaBackbone(llama_config)
-        self.discrete_lm_head = nn.Linear(self.hidden_size, self.discrete_vocab_size, bias=False)
+        self.discrete_token_embeddings = nn.ModuleList(
+            [
+                nn.Embedding(self.discrete_vocab_size, self.hidden_size)
+                for _ in range(self.num_discrete_tokens)
+            ]
+        )
+        self.discrete_lm_heads = nn.ModuleList(
+            [
+                nn.Linear(self.hidden_size, self.discrete_vocab_size, bias=False)
+                for _ in range(self.num_discrete_tokens)
+            ]
+        )
         if self.discrete_only:
             self.continuous_proj = None
             self.continuous_prior_head = None
@@ -153,7 +164,10 @@ class PrismTTS(nn.Module):
     def reset_parameters(self) -> None:
         """Reinitialize trainable parameters using the configured initializer range."""
         std = getattr(self.backbone.config, "initializer_range", 0.02)
-        nn.init.normal_(self.discrete_lm_head.weight, mean=0.0, std=std)
+        for discrete_embedding in self.discrete_token_embeddings:
+            nn.init.normal_(discrete_embedding.weight, mean=0.0, std=std)
+        for discrete_lm_head in self.discrete_lm_heads:
+            nn.init.normal_(discrete_lm_head.weight, mean=0.0, std=std)
         if self.continuous_proj is not None:
             nn.init.normal_(self.continuous_proj.weight, mean=0.0, std=std)
         if self.continuous_prior_head is not None:
@@ -173,10 +187,65 @@ class PrismTTS(nn.Module):
         """Return the shared embedding table used for text tokens."""
         return self.backbone.embed_tokens
 
-    @property
-    def discrete_embedding(self) -> nn.Embedding:
-        """Return the shared embedding table used for discrete speech tokens."""
-        return self.backbone.embed_tokens
+    def _embed_discrete_tokens(
+        self,
+        token_ids: torch.LongTensor,
+        stream_ids: torch.LongTensor,
+    ) -> torch.FloatTensor:
+        """Embed discrete token ids with the stream-specific embedding table."""
+        if token_ids.shape[0] != stream_ids.shape[0]:
+            raise ValueError("token_ids and stream_ids must have the same flattened length.")
+        if token_ids.numel() == 0:
+            return self.token_type_embeddings.new_empty((0, self.hidden_size))
+
+        embedded = self.token_type_embeddings.new_empty((token_ids.shape[0], self.hidden_size))
+        remaining = torch.ones(
+            token_ids.shape[0],
+            dtype=torch.bool,
+            device=token_ids.device,
+        )
+        for stream_idx, embedding in enumerate(self.discrete_token_embeddings):
+            stream_mask = stream_ids == stream_idx
+            if stream_mask.any():
+                embedded[stream_mask] = embedding(token_ids[stream_mask])
+                remaining[stream_mask] = False
+        if remaining.any():
+            unknown_stream_ids = torch.unique(stream_ids[remaining]).tolist()
+            raise ValueError(
+                "Found invalid discrete stream ids while embedding tokens: "
+                f"{unknown_stream_ids}."
+            )
+        return embedded
+
+    def _project_discrete_hidden(
+        self,
+        hidden_states: torch.FloatTensor,
+        stream_ids: torch.LongTensor,
+    ) -> torch.FloatTensor:
+        """Project hidden states to logits using the stream-specific LM head."""
+        if hidden_states.shape[0] != stream_ids.shape[0]:
+            raise ValueError("hidden_states and stream_ids must have the same flattened length.")
+        if hidden_states.shape[0] == 0:
+            return hidden_states.new_empty((0, self.discrete_vocab_size))
+
+        logits = hidden_states.new_empty((hidden_states.shape[0], self.discrete_vocab_size))
+        remaining = torch.ones(
+            hidden_states.shape[0],
+            dtype=torch.bool,
+            device=hidden_states.device,
+        )
+        for stream_idx, discrete_lm_head in enumerate(self.discrete_lm_heads):
+            stream_mask = stream_ids == stream_idx
+            if stream_mask.any():
+                logits[stream_mask] = discrete_lm_head(hidden_states[stream_mask])
+                remaining[stream_mask] = False
+        if remaining.any():
+            unknown_stream_ids = torch.unique(stream_ids[remaining]).tolist()
+            raise ValueError(
+                "Found invalid discrete stream ids while projecting logits: "
+                f"{unknown_stream_ids}."
+            )
+        return logits
 
     def _build_inputs_embeds(
         self,
@@ -207,7 +276,15 @@ class PrismTTS(nn.Module):
         else:
             masked_continuous_positions = masked_target_token_mask & is_continuous
 
-        token_embeds = self.discrete_embedding(flat.token_ids)
+        token_embeds = self.text_embedding(flat.token_ids)
+        if is_discrete.any():
+            discrete_token_ids = flat.token_ids[is_discrete]
+            discrete_stream_ids = flat.speech_stream_ids[is_discrete]
+            token_embeds = token_embeds.clone()
+            token_embeds[is_discrete] = self._embed_discrete_tokens(
+                token_ids=discrete_token_ids,
+                stream_ids=discrete_stream_ids,
+            )
         base_embeds = token_embeds
         if not self.discrete_only:
             if self.continuous_proj is None:
@@ -269,6 +346,7 @@ class PrismTTS(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         token_ids: torch.LongTensor,
+        speech_stream_ids: torch.LongTensor,
         masked_discrete_positions: torch.BoolTensor,
     ) -> tuple[torch.Tensor, torch.FloatTensor]:
         """Compute weighted CE on masked discrete tokens and return selected logits."""
@@ -279,7 +357,11 @@ class PrismTTS(nn.Module):
 
         selected_hidden = hidden_states[masked_discrete_positions]
         selected_targets = token_ids[masked_discrete_positions]
-        selected_logits = self.discrete_lm_head(selected_hidden)
+        selected_stream_ids = speech_stream_ids[masked_discrete_positions]
+        selected_logits = self._project_discrete_hidden(
+            hidden_states=selected_hidden,
+            stream_ids=selected_stream_ids,
+        )
         per_token_loss = F.cross_entropy(
             selected_logits,
             selected_targets,
@@ -537,6 +619,7 @@ class PrismTTS(nn.Module):
         discrete_loss, _ = self._compute_discrete_loss(
             hidden_states=hidden_states,
             token_ids=flat.token_ids,
+            speech_stream_ids=flat.speech_stream_ids,
             masked_discrete_positions=masked_discrete_positions,
         )
         continuous_loss, flow_loss = self._compute_continuous_losses(
@@ -928,7 +1011,11 @@ class PrismTTS(nn.Module):
             step_discrete_positions = masked_discrete_positions & step_target_mask
             if step_discrete_positions.any():
                 discrete_hidden = hidden_states[step_discrete_positions]
-                discrete_logits = self.discrete_lm_head(discrete_hidden)
+                discrete_stream_idx = flat.speech_stream_ids[step_discrete_positions]
+                discrete_logits = self._project_discrete_hidden(
+                    hidden_states=discrete_hidden,
+                    stream_ids=discrete_stream_idx,
+                )
                 sampled_discrete = self._sample_discrete_ids(
                     discrete_logits,
                     temperature=temperature,
@@ -937,7 +1024,6 @@ class PrismTTS(nn.Module):
                     do_sample=do_sample,
                 )
                 discrete_batch_idx = batch_indices[step_discrete_positions]
-                discrete_stream_idx = flat.speech_stream_ids[step_discrete_positions]
                 predicted_discrete[discrete_batch_idx, step_idx, discrete_stream_idx] = (
                     sampled_discrete
                 )
@@ -1115,7 +1201,11 @@ class PrismTTS(nn.Module):
 
             if masked_discrete_positions.any():
                 discrete_hidden = hidden_states[masked_discrete_positions]
-                discrete_logits = self.discrete_lm_head(discrete_hidden)
+                discrete_stream_idx = flat.speech_stream_ids[masked_discrete_positions]
+                discrete_logits = self._project_discrete_hidden(
+                    hidden_states=discrete_hidden,
+                    stream_ids=discrete_stream_idx,
+                )
                 sampled_discrete = self._sample_discrete_ids(
                     discrete_logits,
                     temperature=temperature,
@@ -1125,7 +1215,6 @@ class PrismTTS(nn.Module):
                 )
                 discrete_batch_idx = batch_indices[masked_discrete_positions]
                 discrete_block_idx = flat.target_block_ids[masked_discrete_positions]
-                discrete_stream_idx = flat.speech_stream_ids[masked_discrete_positions]
                 predicted_discrete[discrete_batch_idx, discrete_block_idx, discrete_stream_idx] = sampled_discrete
 
                 sampled_log_probs = F.log_softmax(discrete_logits, dim=-1).gather(
@@ -1371,7 +1460,11 @@ class PrismTTS(nn.Module):
 
             if masked_discrete_positions.any():
                 discrete_hidden = hidden_states[masked_discrete_positions]
-                discrete_logits = self.discrete_lm_head(discrete_hidden)
+                discrete_stream_idx = flat.speech_stream_ids[masked_discrete_positions]
+                discrete_logits = self._project_discrete_hidden(
+                    hidden_states=discrete_hidden,
+                    stream_ids=discrete_stream_idx,
+                )
                 sampled_discrete = self._sample_discrete_ids(
                     discrete_logits,
                     temperature=temperature,
@@ -1381,7 +1474,6 @@ class PrismTTS(nn.Module):
                 )
                 discrete_batch_idx = batch_indices[masked_discrete_positions]
                 discrete_block_idx = flat.target_block_ids[masked_discrete_positions]
-                discrete_stream_idx = flat.speech_stream_ids[masked_discrete_positions]
                 candidate_discrete[discrete_batch_idx, discrete_block_idx, discrete_stream_idx] = (
                     sampled_discrete
                 )
