@@ -33,7 +33,7 @@ data:
       # null -> derive from train_batch_size and a reference sequence-length quantile.
       memory_budget: null
       # Optional direct target in "cost units"; overrides utilization*memory_budget.
-      target_batch_cost: 8e6
+      target_batch_cost: 6e6
       # Quantile used when deriving memory_budget automatically.
       reference_length_quantile: 0.95
       # Upper bound for dynamic batch size (allows adding samples when memory is underused).
