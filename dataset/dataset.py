@@ -347,6 +347,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             )
             discrete = _to_long_2d(discrete_raw, f"{npy_path}:discrete")
             continuous = _to_float_2d(continuous_raw, f"{npy_path}:continuous")
+            # Drop the final codec frame (~80ms at 12.5 Hz) from both modalities.
+            discrete = discrete[:-1]
+            continuous = continuous[:-1]
         except Exception as exc:
             raise RuntimeError(f"Failed to load npy file {npy_path}: {exc}") from exc
 

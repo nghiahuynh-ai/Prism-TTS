@@ -317,6 +317,9 @@ def _load_npy_features(npy_path: Path) -> tuple[torch.LongTensor, torch.FloatTen
             f"Length mismatch in {npy_path}: discrete L={discrete.shape[0]}, "
             f"continuous L={continuous.shape[0]}."
         )
+    # Match training data loading: drop the final codec frame (~80ms at 12.5 Hz).
+    discrete = discrete[:-1]
+    continuous = continuous[:-1]
     return discrete.contiguous(), continuous.contiguous()
 
 
