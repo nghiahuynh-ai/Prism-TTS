@@ -112,6 +112,8 @@ class PrismTTSLightning(pl.LightningModule):
         self._train_loader_iter: Optional[Iterator[Any]] = None
         self._cached_text_id_to_char: Optional[dict[int, str]] = None
         self._periodic_eval_active = False
+        self._text_eval_table: Optional[Any] = None
+        self._text_eval_row_ids: set[str] = set()
         self._ema_state: dict[str, torch.Tensor] = {}
         self._ema_updates = 0
         self._last_ema_step = -1
@@ -567,6 +569,7 @@ class PrismTTSLightning(pl.LightningModule):
             batch_inputs.discrete_prompt,
             "discrete_prompt",
             num_discrete_tokens=self.model.num_discrete_tokens,
+            allow_fewer_streams=True,
         )[:, :prompt_speech_len, :]
         continuous_prompt = normalize_continuous_latents(
             batch_inputs.continuous_prompt,
@@ -822,9 +825,10 @@ class PrismTTSLightning(pl.LightningModule):
         if run is None:
             return
 
+        step = int(self.global_step)
         audio_table = self._build_audio_table(periodic_samples)
         mel_table = self._build_mel_table(periodic_samples)
-        text_table = self._build_text_table(periodic_samples)
+        text_table = self._build_text_table(periodic_samples, step=step)
 
         payload: dict[str, Any] = {}
         if audio_table is not None:
@@ -836,7 +840,7 @@ class PrismTTSLightning(pl.LightningModule):
         if not payload:
             return
 
-        run.log(payload, step=int(self.global_step))
+        run.log(payload, step=step)
 
     def _build_audio_table(
         self,
@@ -992,14 +996,62 @@ class PrismTTSLightning(pl.LightningModule):
     def _build_text_table(
         self,
         periodic_samples: Sequence[PeriodicEvalSample],
+        *,
+        step: int,
     ) -> Optional[Any]:
+        rows = self._collect_text_rows(periodic_samples, step=step)
+        if not rows:
+            return None
+
+        table = self._ensure_text_eval_table()
+        if table is None:
+            return None
+        for row in rows:
+            row_id = str(row[-1])
+            if row_id in self._text_eval_row_ids:
+                continue
+            table.add_data(*row)
+            self._text_eval_row_ids.add(row_id)
+        return table
+
+    def _collect_text_rows(
+        self,
+        periodic_samples: Sequence[PeriodicEvalSample],
+        *,
+        step: int,
+    ) -> list[tuple[Any, ...]]:
+        rows: list[tuple[Any, ...]] = []
+        for sample_idx, sample in enumerate(periodic_samples):
+            sample_source = str(sample.sample_source)
+            for method_name, synthesized_text in sample.synthesized_text_by_method.items():
+                method = str(method_name)
+                row_id = (
+                    f"step_{step}:{sample_source}:sample_{sample_idx}:method_{method}"
+                )
+                rows.append(
+                    (
+                        step,
+                        sample_source,
+                        sample_idx,
+                        method,
+                        str(sample.text_prompt),
+                        str(sample.text_target),
+                        str(synthesized_text),
+                        row_id,
+                    )
+                )
+        return rows
+
+    def _ensure_text_eval_table(self) -> Optional[Any]:
+        if self._text_eval_table is not None:
+            return self._text_eval_table
+
         try:
             import wandb
         except ModuleNotFoundError:
             return None
 
-        step = int(self.global_step)
-        table = wandb.Table(
+        self._text_eval_table = wandb.Table(
             columns=[
                 "step",
                 "sample_source",
@@ -1008,24 +1060,11 @@ class PrismTTSLightning(pl.LightningModule):
                 "text_prompt",
                 "text_target",
                 "synthesized_text",
-            ]
+                "history_id",
+            ],
+            log_mode="INCREMENTAL",
         )
-
-        added = 0
-        for sample_idx, sample in enumerate(periodic_samples):
-            for method_name, synthesized_text in sample.synthesized_text_by_method.items():
-                table.add_data(
-                    step,
-                    str(sample.sample_source),
-                    sample_idx,
-                    str(method_name),
-                    sample.text_prompt,
-                    sample.text_target,
-                    str(synthesized_text),
-                )
-                added += 1
-
-        return table if added > 0 else None
+        return self._text_eval_table
 
     def _build_eval_media_rows(
         self,

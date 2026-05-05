@@ -61,8 +61,9 @@ def normalize_discrete_tokens(
     name: str,
     *,
     num_discrete_tokens: int,
+    allow_fewer_streams: bool = False,
 ) -> torch.LongTensor:
-    """Normalize discrete tokens to shape [batch, length, num_discrete_tokens]."""
+    """Normalize discrete tokens to shape [batch, length, num_streams]."""
     if discrete_tokens.dim() != 3:
         raise ValueError(
             f"{name} must have shape [batch, num_discrete_tokens, length] "
@@ -71,6 +72,24 @@ def normalize_discrete_tokens(
     if discrete_tokens.shape[1] == num_discrete_tokens:
         return discrete_tokens.transpose(1, 2).contiguous()
     if discrete_tokens.shape[-1] == num_discrete_tokens:
+        return discrete_tokens
+    if allow_fewer_streams:
+        if (
+            discrete_tokens.shape[1] > num_discrete_tokens
+            and discrete_tokens.shape[-1] > num_discrete_tokens
+        ):
+            raise ValueError(
+                f"{name} must contain a stream axis with size <= num_discrete_tokens="
+                f"{num_discrete_tokens}, got shape={tuple(discrete_tokens.shape)}."
+            )
+        if (
+            discrete_tokens.shape[1] <= num_discrete_tokens
+            and discrete_tokens.shape[-1] <= num_discrete_tokens
+        ):
+            # Ambiguous orientation; default to [batch, length, streams].
+            return discrete_tokens
+        if discrete_tokens.shape[1] <= num_discrete_tokens:
+            return discrete_tokens.transpose(1, 2).contiguous()
         return discrete_tokens
     raise ValueError(
         f"{name} must contain one axis with size num_discrete_tokens="
@@ -418,11 +437,20 @@ def assemble_flat_batch(
     eot_token_id: int,
     continuous_latent_size: int,
     num_discrete_tokens: int,
+    continuous_stream_id: Optional[int] = None,
 ) -> FlatBatch:
     """Assemble split prompt/target tensors into one flattened sequence representation."""
     batch_size = int(text_prompt.shape[0])
     device = text_prompt.device
     cont_dtype = continuous_prompt.dtype
+    if num_discrete_tokens < 1:
+        raise ValueError("num_discrete_tokens must be >= 1.")
+    if continuous_stream_id is None:
+        resolved_continuous_stream_id = int(num_discrete_tokens)
+    else:
+        resolved_continuous_stream_id = int(continuous_stream_id)
+        if resolved_continuous_stream_id < 0:
+            raise ValueError("continuous_stream_id must be >= 0.")
 
     token_ids_per_sample: list[torch.LongTensor] = []
     continuous_per_sample: list[torch.FloatTensor] = []
@@ -474,7 +502,7 @@ def assemble_flat_batch(
         ) -> None:
             sample_token_ids.append(pad_token_id)
             sample_types.append(SPEECH_CONTINUOUS_TOKEN_TYPE)
-            sample_stream_ids.append(num_discrete_tokens)
+            sample_stream_ids.append(resolved_continuous_stream_id)
             sample_target_block_ids.append(int(target_block_id))
             sample_continuous.append(value)
 

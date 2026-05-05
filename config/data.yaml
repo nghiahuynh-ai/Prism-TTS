@@ -54,7 +54,7 @@ data:
     # PrismDataset(...) arguments.
     append_eos_to_text: false
     cache_npy: false
-    discrete_stream_count: 4
+    discrete_stream_count: 8
     continuous_feature_dim: 512
 
   collate:
@@ -63,4 +63,9 @@ data:
     discrete_pad_value: null
     continuous_pad_value: 0.0
     include_attention_mask: true
+    # Training-time stream curriculum: sample one K for each train batch and
+    # keep only the first K discrete streams from all samples in that batch.
+    random_active_discrete_stream_count_train: true
+    min_active_discrete_stream_count: 1
+    max_active_discrete_stream_count: null
     codec_frame_rate_hz: 12.5

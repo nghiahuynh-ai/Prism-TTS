@@ -119,3 +119,40 @@ def test_batch_collate_builds_split_parts_and_lengths_without_delay():
     assert int((final_block_token_ids == eos_token_id).sum().item()) == 2
     assert int((final_block_token_ids == pad_token_id).sum().item()) == 1
     assert torch.allclose(final_block_continuous, torch.zeros_like(final_block_continuous))
+
+
+def test_batch_collate_random_active_streams_train_mode():
+    collate = BatchCollate(
+        discrete_token_count=100,
+        random_active_discrete_stream_count=True,
+        min_active_discrete_stream_count=1,
+        max_active_discrete_stream_count=4,
+        fixed_continuous_stream_idx=4,
+    )
+    torch.manual_seed(0)
+
+    sample_a = _make_sample(
+        text_prompt=[1],
+        discrete_prompt=[[1, 2, 3, 4], [5, 6, 7, 8]],
+        continuous_prompt=[[0.1], [0.2]],
+        text_target=[2],
+        discrete_target=[[9, 10, 11, 12], [13, 14, 15, 16]],
+        continuous_target=[[0.3], [0.4]],
+    )
+    sample_b = _make_sample(
+        text_prompt=[3],
+        discrete_prompt=[[1, 2, 3, 4]],
+        continuous_prompt=[[0.5]],
+        text_target=[4],
+        discrete_target=[[5, 6, 7, 8]],
+        continuous_target=[[0.6]],
+    )
+
+    out = collate([sample_a, sample_b])
+    active_k = int(out["active_discrete_stream_count"].item())
+
+    assert 1 <= active_k <= 4
+    assert int(out["discrete_prompt"].shape[2]) == active_k
+    assert int(out["discrete_target"].shape[2]) == active_k
+    # summary[13] is continuous stream id; fixed to max stream id (N=4).
+    assert int(out["flat_summary"][0, 13].item()) == 4

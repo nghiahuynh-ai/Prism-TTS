@@ -429,6 +429,10 @@ class BatchCollate:
         continuous_pad_value: float = 0.0,
         include_attention_mask: bool = True,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
+        random_active_discrete_stream_count: bool = True,
+        min_active_discrete_stream_count: int = 1,
+        max_active_discrete_stream_count: int | None = None,
+        fixed_continuous_stream_idx: int | None = None,
     ) -> None:
         (
             self.eot_token_id,
@@ -443,13 +447,44 @@ class BatchCollate:
         self.continuous_pad_value = continuous_pad_value
         self.include_attention_mask = include_attention_mask
         self.discrete_token_count = int(discrete_token_count)
+        self.random_active_discrete_stream_count = bool(random_active_discrete_stream_count)
+        self.min_active_discrete_stream_count = int(min_active_discrete_stream_count)
+        self.max_active_discrete_stream_count = (
+            None
+            if max_active_discrete_stream_count is None
+            else int(max_active_discrete_stream_count)
+        )
+        self.fixed_continuous_stream_idx = (
+            None if fixed_continuous_stream_idx is None else int(fixed_continuous_stream_idx)
+        )
+        if self.min_active_discrete_stream_count < 1:
+            raise ValueError("min_active_discrete_stream_count must be >= 1.")
+        if (
+            self.max_active_discrete_stream_count is not None
+            and self.max_active_discrete_stream_count < 1
+        ):
+            raise ValueError("max_active_discrete_stream_count must be >= 1 when provided.")
+        if (
+            self.max_active_discrete_stream_count is not None
+            and self.min_active_discrete_stream_count > self.max_active_discrete_stream_count
+        ):
+            raise ValueError(
+                "min_active_discrete_stream_count must be <= max_active_discrete_stream_count."
+            )
+        if self.fixed_continuous_stream_idx is not None and self.fixed_continuous_stream_idx < 0:
+            raise ValueError("fixed_continuous_stream_idx must be >= 0 when provided.")
 
     def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         if not batch:
             raise ValueError("BatchCollate received an empty batch.")
 
         normalized_samples = [self._validate_collate_sample(item) for item in batch]
-        samples = [self._append_target_eos_block(sample) for sample in normalized_samples]
+        active_discrete_stream_count = self._resolve_active_discrete_stream_count(normalized_samples)
+        reduced_samples = [
+            self._select_first_discrete_streams(sample, active_discrete_stream_count)
+            for sample in normalized_samples
+        ]
+        samples = [self._append_target_eos_block(sample) for sample in reduced_samples]
         text_prompt_lengths = torch.tensor(
             [int(sample["text_prompt"].shape[0]) for sample in samples],
             dtype=torch.long,
@@ -490,6 +525,10 @@ class BatchCollate:
             "speech_prompt_lengths": speech_prompt_lengths,
             "text_target_lengths": text_target_lengths,
             "speech_target_lengths": speech_target_lengths,
+            "active_discrete_stream_count": torch.tensor(
+                active_discrete_stream_count,
+                dtype=torch.long,
+            ),
         }
 
         flat_per_sample = [self._build_flat_sample(sample) for sample in samples]
@@ -528,6 +567,42 @@ class BatchCollate:
         self._collate_optional_1d(samples, collated, key="flow_timesteps", pad_value=0.0)
         self._collate_optional_2d(samples, collated, key="noise", pad_value=0.0)
         return collated
+
+    def _resolve_active_discrete_stream_count(
+        self,
+        samples: Sequence[dict[str, torch.Tensor]],
+    ) -> int:
+        available_streams = min(
+            int(sample["discrete_prompt"].shape[1])
+            for sample in samples
+        )
+        available_streams = min(
+            available_streams,
+            min(int(sample["discrete_target"].shape[1]) for sample in samples),
+        )
+        if available_streams < 1:
+            raise ValueError("At least one discrete stream is required for collation.")
+
+        upper = available_streams
+        if self.max_active_discrete_stream_count is not None:
+            upper = min(upper, self.max_active_discrete_stream_count)
+        lower = min(self.min_active_discrete_stream_count, upper)
+        if lower < 1:
+            raise ValueError("Resolved lower bound for active discrete streams must be >= 1.")
+
+        if not self.random_active_discrete_stream_count:
+            return int(upper)
+        return int(torch.randint(low=lower, high=upper + 1, size=(1,)).item())
+
+    @staticmethod
+    def _select_first_discrete_streams(
+        sample: dict[str, torch.Tensor],
+        active_discrete_stream_count: int,
+    ) -> dict[str, torch.Tensor]:
+        selected = dict(sample)
+        selected["discrete_prompt"] = sample["discrete_prompt"][:, :active_discrete_stream_count]
+        selected["discrete_target"] = sample["discrete_target"][:, :active_discrete_stream_count]
+        return selected
 
     def _validate_collate_sample(self, sample: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         required_keys = (
@@ -707,7 +782,11 @@ class BatchCollate:
         text_stream_idx = 0
         speech_discrete_stream_start_idx = 0
         speech_discrete_stream_end_idx = num_discrete_streams - 1
-        speech_continuous_stream_idx = num_discrete_streams
+        speech_continuous_stream_idx = (
+            num_discrete_streams
+            if self.fixed_continuous_stream_idx is None
+            else self.fixed_continuous_stream_idx
+        )
 
         zero_cont = torch.zeros(continuous_dim, dtype=torch.float32)
 

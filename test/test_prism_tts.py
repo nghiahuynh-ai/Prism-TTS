@@ -302,6 +302,86 @@ class TestPrismTTS(unittest.TestCase):
             self.assertGreaterEqual(ratio, 0.0)
             self.assertLess(ratio, 1.0)
 
+    def test_generate_supports_active_discrete_streams(self) -> None:
+        batch_size = 1
+        prompt_len = 2
+        generated_len = 3
+        active_streams = max(1, self.num_discrete_tokens - 1)
+        text_vocab_upper = max(2, min(200, self.text_vocab_size))
+
+        text_prompt = torch.randint(
+            0, text_vocab_upper, (batch_size, prompt_len), device=self.device
+        )
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, self.num_discrete_tokens, prompt_len),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size, prompt_len, self.continuous_latent_size, device=self.device
+        )
+        text_target = torch.randint(
+            0, text_vocab_upper, (batch_size, generated_len), device=self.device
+        )
+
+        outputs = self.model.generate(
+            text_prompt=text_prompt,
+            discrete_prompt=discrete_prompt,
+            continuous_prompt=continuous_prompt,
+            text_target=text_target,
+            active_discrete_streams=active_streams,
+            max_new_blocks=generated_len,
+            discrete_eos_token_id=-1,
+            do_sample=False,
+            return_dict=True,
+        )
+
+        self.assertEqual(
+            outputs.discrete_ids.shape,
+            (batch_size, active_streams, generated_len),
+        )
+
+    def test_generate_accepts_prompt_with_fewer_discrete_streams(self) -> None:
+        batch_size = 1
+        prompt_len = 2
+        generated_len = 2
+        active_streams = max(1, self.num_discrete_tokens - 1)
+        text_vocab_upper = max(2, min(200, self.text_vocab_size))
+
+        text_prompt = torch.randint(
+            0, text_vocab_upper, (batch_size, prompt_len), device=self.device
+        )
+        # [batch, length, streams] with streams < N.
+        discrete_prompt = torch.randint(
+            0,
+            self.discrete_vocab_size,
+            (batch_size, prompt_len, active_streams),
+            device=self.device,
+        )
+        continuous_prompt = torch.randn(
+            batch_size, prompt_len, self.continuous_latent_size, device=self.device
+        )
+        text_target = torch.randint(
+            0, text_vocab_upper, (batch_size, generated_len), device=self.device
+        )
+
+        outputs = self.model.generate(
+            text_prompt=text_prompt,
+            discrete_prompt=discrete_prompt,
+            continuous_prompt=continuous_prompt,
+            text_target=text_target,
+            max_new_blocks=generated_len,
+            discrete_eos_token_id=-1,
+            do_sample=False,
+            return_dict=True,
+        )
+
+        self.assertEqual(
+            outputs.discrete_ids.shape,
+            (batch_size, active_streams, generated_len),
+        )
+
     def test_generate_returns_expected_shapes(self):
         batch_size = 1
         prompt_len = 2
@@ -992,7 +1072,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
 
         raw_prompt_audio = torch.tensor([0.1, -0.2, 0.3, -0.4], device=self.device)
         with torch.no_grad():
-            outputs = self.model.generate_e2e(
+            outputs = self.model.generate(
                 raw_text_prompt="ab",
                 raw_speech_prompt=raw_prompt_audio,
                 raw_text_target="cd",
@@ -1048,7 +1128,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             torch.tensor([0.3, -0.3], device=self.device),
         ]
         with torch.no_grad():
-            outputs = self.model.generate_e2e(
+            outputs = self.model.generate(
                 raw_text_prompt=["hello", "yo"],
                 raw_speech_prompt=raw_prompts,
                 raw_text_target=["world", "ha"],

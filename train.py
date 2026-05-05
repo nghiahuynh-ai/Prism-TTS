@@ -380,6 +380,7 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
     prism_cfg = _require_mapping(model_cfg, "prism_tts")
     llama_cfg = _require_mapping(model_cfg, "llama_config")
     dataset_cfg = _require_mapping(data_cfg, "dataset")
+    collate_cfg = _require_mapping(data_cfg, "collate")
 
     num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
     dataset_stream_count_raw = dataset_cfg.get("discrete_stream_count")
@@ -390,6 +391,30 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
                 "model.prism_tts.num_discrete_tokens must match "
                 f"data.dataset.discrete_stream_count ({dataset_stream_count})."
             )
+
+    min_active_stream_count = int(collate_cfg.get("min_active_discrete_stream_count", 1))
+    if min_active_stream_count < 1:
+        raise ValueError("data.collate.min_active_discrete_stream_count must be >= 1.")
+    max_active_stream_count_raw = collate_cfg.get("max_active_discrete_stream_count")
+    if max_active_stream_count_raw is not None:
+        max_active_stream_count = int(max_active_stream_count_raw)
+        if max_active_stream_count < 1:
+            raise ValueError("data.collate.max_active_discrete_stream_count must be >= 1.")
+        if max_active_stream_count > num_discrete_tokens:
+            raise ValueError(
+                "data.collate.max_active_discrete_stream_count must be <= "
+                f"model.prism_tts.num_discrete_tokens ({num_discrete_tokens})."
+            )
+        if min_active_stream_count > max_active_stream_count:
+            raise ValueError(
+                "data.collate.min_active_discrete_stream_count must be <= "
+                "data.collate.max_active_discrete_stream_count."
+            )
+    elif min_active_stream_count > num_discrete_tokens:
+        raise ValueError(
+            "data.collate.min_active_discrete_stream_count must be <= "
+            f"model.prism_tts.num_discrete_tokens ({num_discrete_tokens})."
+        )
 
     continuous_latent_size = int(prism_cfg["continuous_latent_size"])
     dataset_continuous_dim_raw = dataset_cfg.get("continuous_feature_dim")
@@ -753,12 +778,43 @@ def _build_data_objects(
     test_manifest = _optional_path(data_cfg.get("test_manifest"))
     test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs) if test_manifest else None
 
-    collate = BatchCollate(
+    dataset_stream_count = dataset_cfg.get("discrete_stream_count")
+    max_discrete_stream_count = None
+    if dataset_stream_count is not None:
+        max_discrete_stream_count = int(dataset_stream_count)
+
+    max_active_stream_raw = collate_cfg.get("max_active_discrete_stream_count")
+    max_active_stream_count = (
+        max_discrete_stream_count
+        if max_active_stream_raw is None
+        else int(max_active_stream_raw)
+    )
+    min_active_stream_count = int(collate_cfg.get("min_active_discrete_stream_count", 1))
+    random_active_stream_train = bool(
+        collate_cfg.get("random_active_discrete_stream_count_train", True)
+    )
+
+    train_collate = BatchCollate(
         text_pad_value=collate_cfg.get("text_pad_value"),
         discrete_pad_value=collate_cfg.get("discrete_pad_value"),
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
+        random_active_discrete_stream_count=random_active_stream_train,
+        min_active_discrete_stream_count=min_active_stream_count,
+        max_active_discrete_stream_count=max_active_stream_count,
+        fixed_continuous_stream_idx=max_discrete_stream_count,
+    )
+    eval_collate = BatchCollate(
+        text_pad_value=collate_cfg.get("text_pad_value"),
+        discrete_pad_value=collate_cfg.get("discrete_pad_value"),
+        continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
+        include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
+        discrete_token_count=discrete_token_count,
+        random_active_discrete_stream_count=False,
+        min_active_discrete_stream_count=min_active_stream_count,
+        max_active_discrete_stream_count=max_discrete_stream_count,
+        fixed_continuous_stream_idx=max_discrete_stream_count,
     )
 
     num_workers = int(loader_cfg.get("num_workers", 0))
@@ -784,7 +840,6 @@ def _build_data_objects(
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "persistent_workers": persistent_workers,
-        "collate_fn": collate,
     }
     prefetch_factor = loader_cfg.get("prefetch_factor")
     if num_workers > 0 and prefetch_factor is not None:
@@ -874,6 +929,7 @@ def _build_data_objects(
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=train_batch_sampler,
+            collate_fn=train_collate,
             **common_loader_kwargs,
         )
 
@@ -892,6 +948,7 @@ def _build_data_objects(
             batch_size=train_batch_size,
             shuffle=shuffle_train,
             drop_last=drop_last_train,
+            collate_fn=train_collate,
             **common_loader_kwargs,
         )
 
@@ -902,6 +959,7 @@ def _build_data_objects(
             batch_size=int(loader_cfg.get("val_batch_size", 8)),
             shuffle=bool(loader_cfg.get("shuffle_val", False)),
             drop_last=False,
+            collate_fn=eval_collate,
             **common_loader_kwargs,
         )
 
@@ -912,6 +970,7 @@ def _build_data_objects(
             batch_size=int(loader_cfg.get("test_batch_size", 8)),
             shuffle=bool(loader_cfg.get("shuffle_test", False)),
             drop_last=False,
+            collate_fn=eval_collate,
             **common_loader_kwargs,
         )
 
