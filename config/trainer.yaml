@@ -8,7 +8,7 @@ trainer:
     learning_rate: 1.0e-4
     weight_decay: 0.01
     betas: [0.9, 0.95]
-    eval_every_n_steps: 50000
+    eval_every_n_steps: 100000
     audio_sample_rate: 24000
     max_audio_samples: 2
     log_media_on_validation_end: true
@@ -53,7 +53,7 @@ trainer:
     # With train_batch_size=2, this keeps effective batch ~= 8.
     accumulate_grad_batches: 1
     log_every_n_steps: 10
-    val_check_interval: 50000
+    val_check_interval: 100000
     num_sanity_val_steps: 2
     limit_train_batches: 1.0
     limit_val_batches: 1.0
@@ -70,7 +70,7 @@ trainer:
     mode: min
     save_top_k: 3
     save_last: true
-    every_n_train_steps: 50000
+    every_n_train_steps: 100000
     save_every_validation_stage: true
     every_val_filename: prism_tts-val-stage={val_stage:05d}-step={step:07d}
     every_val_save_weights_only: false
