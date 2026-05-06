@@ -47,7 +47,7 @@ trainer:
     devices: 1
     strategy: auto
     precision: bf16-mixed
-    max_steps: 1000000
+    max_steps: 2000000
     min_steps: 0
     gradient_clip_val: 1.0
     # With train_batch_size=2, this keeps effective batch ~= 8.

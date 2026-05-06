@@ -3,8 +3,8 @@
 # file_name|duration|transcript|target_npy|prompt_file_name|prompt_duration|prompt_transcript|prompt_npy
 
 data:
-  train_manifest: /astro/nghiahuynh/data/emilia/metadata-10000-train.txt
-  val_manifest: /astro/nghiahuynh/data/emilia/metadata-10000-val.txt
+  train_manifest: /astro/nghiahuynh/data/emilia/metadata-45k-train.txt
+  val_manifest: /astro/nghiahuynh/data/emilia/metadata-45k-val.txt
   test_manifest: null
   # Keep null to resolve relative paths against the manifest directory.
   manifest_root: null
