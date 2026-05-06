@@ -20,8 +20,8 @@ model:
     # regular = codec IDs, special = EOT/EOS/PAD.
     discrete_regular_token_loss_weight: 1.0
     discrete_special_token_loss_weight: 0.1
-    flow_sample_steps: 64
-    parallel_sample_steps: 64
+    flow_sample_steps: 128
+    parallel_sample_steps: 128
 
   llama_config:
     # Must be >= text_token_offset + num_text_vocab_tokens.

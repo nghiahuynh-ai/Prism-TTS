@@ -786,7 +786,7 @@ class PrismTTS(nn.Module):
         speech_prompt_lengths: Optional[torch.Tensor | int] = None,
         text_target_lengths: Optional[torch.Tensor | int] = None,
         speech_target_lengths: Optional[torch.Tensor | int] = None,
-        max_new_blocks: Optional[int] = 128,
+        max_new_blocks: Optional[int] = 375,
         discrete_eos_token_id: Optional[int] = 2049,
         temperature: float = 0.8,
         top_k: int = 50,
