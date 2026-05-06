@@ -76,6 +76,20 @@ def _safe_2d_length(value: Any, *, field_name: str) -> int:
     raise ValueError(f"Unsupported {field_name} value type: {type(value).__name__}.")
 
 
+def _iter_manifest_entries(dataset: Any):
+    iterator_fn = getattr(dataset, "iter_manifest_entries", None)
+    if callable(iterator_fn):
+        entries_iter = iterator_fn()
+        if entries_iter is not None:
+            return entries_iter
+
+    entries = getattr(dataset, "_entries", None)
+    if isinstance(entries, Sequence) and len(entries) > 0:
+        return iter(entries)
+
+    return None
+
+
 def estimate_prism_sample_lengths(
     dataset: Any,
     *,
@@ -85,14 +99,9 @@ def estimate_prism_sample_lengths(
     if codec_frame_rate_hz <= 0:
         raise ValueError("codec_frame_rate_hz must be > 0.")
 
-    entries = getattr(dataset, "_entries", None)
     tokenizer = getattr(dataset, "tokenizer", None)
-    if (
-        isinstance(entries, Sequence)
-        and len(entries) > 0
-        and tokenizer is not None
-        and hasattr(tokenizer, "char_to_id")
-    ):
+    manifest_entries = _iter_manifest_entries(dataset)
+    if manifest_entries is not None and tokenizer is not None and hasattr(tokenizer, "char_to_id"):
         char_to_id = getattr(tokenizer, "char_to_id")
         append_eos = bool(getattr(tokenizer, "append_eos", False))
         if not isinstance(char_to_id, Mapping):
@@ -100,7 +109,7 @@ def estimate_prism_sample_lengths(
         num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
 
         lengths: list[int] = []
-        for entry in entries:
+        for entry in manifest_entries:
             text_prompt_len = _estimate_text_token_count(
                 str(getattr(entry, "prompt_transcript")),
                 char_to_id=char_to_id,
@@ -128,7 +137,8 @@ def estimate_prism_sample_lengths(
                     num_discrete_streams=num_discrete_streams,
                 )
             )
-        return lengths
+        if lengths:
+            return lengths
 
     samples = getattr(dataset, "_samples", None)
     if isinstance(samples, Sequence) and len(samples) > 0:

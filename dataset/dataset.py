@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from array import array
+import os
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -193,6 +195,10 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
         self._entries: list[ManifestEntry] = []
         self._samples: list[Mapping[str, Any]] = []
+        self._manifest_line_offsets = array("Q")
+        self._manifest_line_numbers = array("I")
+        self._manifest_handle = None
+        self._manifest_handle_pid: int | None = None
 
         if isinstance(source, (str, Path)):
             manifest_path = Path(source).expanduser().resolve()
@@ -204,7 +210,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                 if manifest_root is not None
                 else manifest_path.parent
             )
-            self._entries = self._load_manifest(manifest_path)
+            self._build_manifest_index(manifest_path)
         else:
             self.manifest_path = None
             self.manifest_root = (
@@ -213,26 +219,119 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             self._samples = list(source)
 
     def __len__(self) -> int:
-        return len(self._entries) if self._entries else len(self._samples)
+        if self.manifest_path is not None:
+            return len(self._manifest_line_offsets)
+        return len(self._samples)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        if self._entries:
-            return self._build_manifest_sample(self._entries[index])
+        if self.manifest_path is not None:
+            manifest_index = self._normalize_manifest_index(int(index))
+            return self._build_manifest_sample(self._manifest_entry_at(manifest_index))
         return _normalize_split_sample(self._samples[index])
 
-    def _load_manifest(self, manifest_path: Path) -> list[ManifestEntry]:
-        entries: list[ManifestEntry] = []
-        with manifest_path.open("r", encoding="utf-8") as handle:
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        state["_manifest_handle"] = None
+        state["_manifest_handle_pid"] = None
+        return state
+
+    def __del__(self) -> None:
+        if hasattr(self, "_manifest_handle"):
+            self._close_manifest_handle()
+
+    def _close_manifest_handle(self) -> None:
+        if self._manifest_handle is not None:
+            self._manifest_handle.close()
+            self._manifest_handle = None
+            self._manifest_handle_pid = None
+
+    def _build_manifest_index(self, manifest_path: Path) -> None:
+        self._manifest_line_offsets = array("Q")
+        self._manifest_line_numbers = array("I")
+
+        line_number = 0
+        with manifest_path.open("rb") as handle:
+            while True:
+                offset = handle.tell()
+                raw_line = handle.readline()
+                if raw_line == b"":
+                    break
+                line_number += 1
+                line = raw_line.strip()
+                if not line or line.startswith(b"#"):
+                    continue
+                self._manifest_line_offsets.append(offset)
+                self._manifest_line_numbers.append(line_number)
+
+        if len(self._manifest_line_offsets) == 0:
+            raise ValueError(f"Manifest has no valid entries: {manifest_path}")
+
+    def _normalize_manifest_index(self, index: int) -> int:
+        index = int(index)
+        manifest_length = len(self._manifest_line_offsets)
+        if index < 0:
+            index += manifest_length
+        if index < 0 or index >= manifest_length:
+            raise IndexError(f"Manifest index out of range: {index}")
+        return int(index)
+
+    def _ensure_manifest_handle(self):
+        if self.manifest_path is None:
+            raise RuntimeError("Manifest handle requested for in-memory dataset.")
+
+        current_pid = os.getpid()
+        if self._manifest_handle is None or self._manifest_handle_pid != current_pid:
+            self._close_manifest_handle()
+            self._manifest_handle = self.manifest_path.open("rb")
+            self._manifest_handle_pid = current_pid
+        return self._manifest_handle
+
+    def _read_manifest_line(self, manifest_index: int) -> tuple[str, int]:
+        handle = self._ensure_manifest_handle()
+        offset = int(self._manifest_line_offsets[manifest_index])
+        line_number = int(self._manifest_line_numbers[manifest_index])
+
+        handle.seek(offset)
+        raw_line = handle.readline()
+        if raw_line == b"":
+            raise RuntimeError(
+                f"Unexpected EOF while reading manifest index {manifest_index} "
+                f"(line {line_number}) from {self.manifest_path}."
+            )
+
+        try:
+            line = raw_line.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"Manifest line {line_number} is not valid UTF-8 in {self.manifest_path}."
+            ) from exc
+        if not line or line.startswith("#"):
+            raise RuntimeError(
+                f"Manifest index drift at line {line_number} in {self.manifest_path}."
+            )
+        return line, line_number
+
+    def _manifest_entry_at(self, manifest_index: int) -> ManifestEntry:
+        line, line_number = self._read_manifest_line(manifest_index)
+        return self._parse_manifest_line(line, line_number)
+
+    def iter_manifest_entries(self):
+        if self.manifest_path is None:
+            return
+        with self.manifest_path.open("r", encoding="utf-8") as handle:
             for line_number, raw_line in enumerate(handle, start=1):
                 line = raw_line.strip()
                 if not line or line.startswith("#"):
                     continue
-                entries.append(self._parse_manifest_line(line, line_number))
-        if not entries:
-            raise ValueError(f"Manifest has no valid entries: {manifest_path}")
-        return entries
+                yield self._parse_manifest_line(line, line_number)
 
-    def _parse_manifest_line(self, line: str, line_number: int) -> ManifestEntry:
+    def _parse_manifest_line(
+        self,
+        line: str,
+        line_number: int,
+        *,
+        verify_npy_files: bool = False,
+    ) -> ManifestEntry:
         parts = [part.strip() for part in line.split("|")]
         # Some manifests include a trailing delimiter, producing an empty final field.
         while parts and parts[-1] == "":
@@ -258,11 +357,21 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             file_name=file_name,
             duration=self._parse_float(duration_str, line_number, "duration"),
             transcript=transcript,
-            target_npy_path=self._resolve_npy_path(target_npy_str, line_number, "target_npy"),
+            target_npy_path=self._resolve_npy_path(
+                target_npy_str,
+                line_number,
+                "target_npy",
+                verify_exists=verify_npy_files,
+            ),
             prompt_file_name=prompt_file_name,
             prompt_duration=self._parse_float(prompt_duration_str, line_number, "prompt_duration"),
             prompt_transcript=prompt_transcript,
-            prompt_npy_path=self._resolve_npy_path(prompt_npy_str, line_number, "prompt_npy"),
+            prompt_npy_path=self._resolve_npy_path(
+                prompt_npy_str,
+                line_number,
+                "prompt_npy",
+                verify_exists=verify_npy_files,
+            ),
         )
 
     def _parse_float(self, value: str, line_number: int, field_name: str) -> float:
@@ -273,7 +382,14 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                 f"Invalid {field_name} at line {line_number}: {value!r}."
             ) from exc
 
-    def _resolve_npy_path(self, raw_path: str, line_number: int, field_name: str) -> Path:
+    def _resolve_npy_path(
+        self,
+        raw_path: str,
+        line_number: int,
+        field_name: str,
+        *,
+        verify_exists: bool = False,
+    ) -> Path:
         path = Path(raw_path).expanduser()
         if not path.is_absolute():
             if self.manifest_root is None:
@@ -285,7 +401,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
         if path.suffix.lower() != ".npy":
             raise ValueError(f"{field_name} at line {line_number} must be a .npy path: {path}")
-        if not path.is_file():
+        if verify_exists and not path.is_file():
             raise FileNotFoundError(f"{field_name} file not found at line {line_number}: {path}")
         return path
 
