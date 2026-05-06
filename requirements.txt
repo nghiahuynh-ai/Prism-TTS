@@ -3,6 +3,7 @@ transformers>=4.40
 lightning>=2.2
 numpy>=1.24
 PyYAML>=6.0
+tqdm>=4.66
 
 # Used by default logger/eval flows and visualization scripts.
 wandb>=0.16

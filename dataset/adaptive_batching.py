@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import math
 import random
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from torch.utils.data import Sampler
+
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError:
+    tqdm = None
 
 
 def _estimate_text_token_count(text: str, char_to_id: Mapping[str, int], append_eos: bool) -> int:
@@ -90,6 +95,25 @@ def _iter_manifest_entries(dataset: Any):
     return None
 
 
+def _progress(
+    iterable: Iterable[Any],
+    *,
+    total: int | None,
+    desc: str,
+    unit: str,
+):
+    if tqdm is None:
+        return iterable
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        unit=unit,
+        dynamic_ncols=True,
+        leave=False,
+    )
+
+
 def estimate_prism_sample_lengths(
     dataset: Any,
     *,
@@ -107,9 +131,15 @@ def estimate_prism_sample_lengths(
         if not isinstance(char_to_id, Mapping):
             raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
         num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
+        total_entries = len(dataset) if hasattr(dataset, "__len__") else None
 
         lengths: list[int] = []
-        for entry in manifest_entries:
+        for entry in _progress(
+            manifest_entries,
+            total=total_entries,
+            desc="adaptive_batching: estimating lengths",
+            unit="sample",
+        ):
             text_prompt_len = _estimate_text_token_count(
                 str(getattr(entry, "prompt_transcript")),
                 char_to_id=char_to_id,
@@ -143,7 +173,12 @@ def estimate_prism_sample_lengths(
     samples = getattr(dataset, "_samples", None)
     if isinstance(samples, Sequence) and len(samples) > 0:
         lengths = []
-        for sample in samples:
+        for sample in _progress(
+            samples,
+            total=len(samples),
+            desc="adaptive_batching: estimating lengths",
+            unit="sample",
+        ):
             if not isinstance(sample, Mapping):
                 raise ValueError(
                     "Expected each in-memory dataset sample to be a mapping for adaptive batching."
