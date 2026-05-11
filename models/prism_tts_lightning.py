@@ -206,6 +206,15 @@ class PrismTTSLightning(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
+        self.log(
+            "train/anchor_loss",
+            outputs.anchor_loss,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=True,
+            batch_size=batch_size,
+            sync_dist=self.sync_dist_logging,
+        )
 
         discrete_ppl = torch.exp(outputs.discrete_loss.detach().clamp(max=20.0))
         self.log(
@@ -268,6 +277,15 @@ class PrismTTSLightning(pl.LightningModule):
         self.log(
             "val/flow_loss",
             outputs.flow_loss,
+            prog_bar=False,
+            on_step=False,
+            on_epoch=True,
+            batch_size=batch_size,
+            sync_dist=self.sync_dist_logging,
+        )
+        self.log(
+            "val/anchor_loss",
+            outputs.anchor_loss,
             prog_bar=False,
             on_step=False,
             on_epoch=True,

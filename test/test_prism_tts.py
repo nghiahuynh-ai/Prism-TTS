@@ -195,9 +195,10 @@ class TestPrismTTS(unittest.TestCase):
         self.assertIsNotNone(outputs.discrete_loss)
         self.assertIsNotNone(outputs.continuous_loss)
         self.assertIsNotNone(outputs.flow_loss)
+        self.assertIsNotNone(outputs.anchor_loss)
         self.assertEqual(
             tuple(outputs.keys()),
-            ("loss", "discrete_loss", "continuous_loss", "flow_loss"),
+            ("loss", "discrete_loss", "continuous_loss", "flow_loss", "anchor_loss"),
         )
 
     def test_forward_samples_mask_ratio_from_zero_to_one_when_unspecified(self):

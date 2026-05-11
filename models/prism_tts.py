@@ -350,7 +350,7 @@ class PrismTTS(nn.Module):
         masked_continuous_positions: torch.BoolTensor,
         flow_timesteps: Optional[torch.FloatTensor],
         noise: Optional[torch.FloatTensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute continuous losses with sequence-level latent mixing.
 
@@ -359,10 +359,11 @@ class PrismTTS(nn.Module):
         2) Build x0 = prior + eps and xt = t * x1 + (1 - t) * x0, where x1 is clean latent.
         3) Mix clean and noised-prior latents by replacing only masked blocks with xt.
         4) Run DiT flow head over the mixed sequence and compute flow loss on masked blocks only.
+        5) Reconstruct clean latents from flow prediction and compute anchor loss on masked blocks.
         """
         if not masked_continuous_positions.any():
             zero = hidden_states.new_zeros(())
-            return zero, zero
+            return zero, zero, zero
 
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
@@ -374,11 +375,11 @@ class PrismTTS(nn.Module):
             & (token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE)
         )
         if not target_continuous_positions.any():
-            return zero, zero
+            return zero, zero, zero
 
         max_target_blocks = int(target_block_counts.max().item()) if batch_size > 0 else 0
         if max_target_blocks <= 0:
-            return zero, zero
+            return zero, zero, zero
 
         batch_index_grid = (
             torch.arange(batch_size, device=hidden_states.device)
@@ -428,7 +429,7 @@ class PrismTTS(nn.Module):
         valid_by_block = valid_by_block & expected_valid
         masked_by_block = masked_by_block & valid_by_block
         if not masked_by_block.any():
-            return reconstruction_loss, zero
+            return reconstruction_loss, zero, zero
 
         if flow_timesteps is not None:
             if flow_timesteps.dim() != 2 or flow_timesteps.shape[0] != batch_size:
@@ -485,7 +486,12 @@ class PrismTTS(nn.Module):
             flow_prediction[masked_by_block],
             flow_target[masked_by_block],
         )
-        return reconstruction_loss, flow_loss
+        x1_prediction = mixed_inputs + (1.0 - t) * flow_prediction
+        anchor_loss = F.mse_loss(
+            x1_prediction[masked_by_block],
+            x1[masked_by_block],
+        )
+        return reconstruction_loss, flow_loss, anchor_loss
 
     def _sample_discrete_ids(
         self,
@@ -749,7 +755,7 @@ class PrismTTS(nn.Module):
             speech_stream_ids=flat.speech_stream_ids,
             masked_discrete_positions=masked_discrete_positions,
         )
-        continuous_loss, flow_loss = self._compute_continuous_losses(
+        continuous_loss, flow_loss, anchor_loss = self._compute_continuous_losses(
             hidden_states=hidden_states,
             continuous_values=flat.continuous_values,
             token_type_ids=flat.token_type_ids,
@@ -762,7 +768,7 @@ class PrismTTS(nn.Module):
         loss = (
             discrete_loss
             + self.continuous_loss_weight * continuous_loss
-            + self.flow_loss_weight * flow_loss
+            + self.flow_loss_weight * (flow_loss + anchor_loss)
         )
 
         if not return_dict:
@@ -773,6 +779,7 @@ class PrismTTS(nn.Module):
             discrete_loss=discrete_loss,
             continuous_loss=continuous_loss,
             flow_loss=flow_loss,
+            anchor_loss=anchor_loss,
         )
 
     @torch.no_grad()
