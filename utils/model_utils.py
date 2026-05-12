@@ -35,7 +35,6 @@ class PrismTTSOutput(ModelOutput):
     discrete_loss: Optional[torch.Tensor] = None
     continuous_loss: Optional[torch.Tensor] = None
     flow_loss: Optional[torch.Tensor] = None
-    anchor_loss: Optional[torch.Tensor] = None
 
 
 @dataclass
