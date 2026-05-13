@@ -8,6 +8,7 @@ import os
 import shutil
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -348,6 +349,164 @@ def _require_mapping(config: dict[str, Any], key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Missing required mapping '{key}' in merged config.")
     return value
+
+
+def _sanitize_run_name(name: str) -> str:
+    sanitized = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "-"
+        for character in name.strip()
+    )
+    sanitized = sanitized.strip("-.")
+    return sanitized or "prism_tts"
+
+
+def _resolve_experiment_root_dir(config: dict[str, Any]) -> Path:
+    raw_root: str | None = None
+    experiment_cfg = config.get("experiment")
+    if isinstance(experiment_cfg, dict):
+        for key in ("exp_root", "run_root", "output_root", "root_dir"):
+            raw_root = _maybe_str(experiment_cfg.get(key))
+            if raw_root is not None:
+                break
+    if raw_root is None:
+        for key in ("exp_root", "run_root", "output_root", "root_dir"):
+            raw_root = _maybe_str(config.get(key))
+            if raw_root is not None:
+                break
+
+    resolved = Path(raw_root or "exp").expanduser()
+    if not resolved.is_absolute():
+        resolved = (Path.cwd() / resolved).resolve()
+    else:
+        resolved = resolved.resolve()
+    return resolved
+
+
+def _resolve_experiment_name(config: dict[str, Any], *, fallback: str) -> str:
+    names: list[str] = []
+    root_name = _maybe_str(config.get("name"))
+    if root_name is not None:
+        names.append(root_name)
+
+    experiment_cfg = config.get("experiment")
+    if isinstance(experiment_cfg, dict):
+        nested_name = _maybe_str(experiment_cfg.get("name"))
+        if nested_name is not None:
+            names.append(nested_name)
+
+    trainer_cfg = config.get("trainer")
+    if isinstance(trainer_cfg, dict):
+        logger_cfg = trainer_cfg.get("logger")
+        if isinstance(logger_cfg, dict):
+            logger_name = _maybe_str(logger_cfg.get("name"))
+            if logger_name is not None:
+                names.append(logger_name)
+
+    if names:
+        return _sanitize_run_name(names[0])
+    return _sanitize_run_name(fallback)
+
+
+def _next_available_directory(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    version = 1
+    while True:
+        candidate = path.with_name(f"{path.name}-v{version}")
+        if not candidate.exists():
+            return candidate
+        version += 1
+
+
+def _to_yaml_text(payload: dict[str, Any]) -> str:
+    text = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
+    if text.strip() == "":
+        return "{}\n"
+    return text
+
+
+def _save_run_configs(
+    *,
+    config: dict[str, Any],
+    resolved: ResolvedConfigs,
+    run_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    config_dir = run_dir / "configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    source_configs: tuple[tuple[str, Path], ...] = (
+        ("trainer.yaml", resolved.trainer_config_path),
+        ("model.yaml", resolved.model_config_path),
+        ("data.yaml", resolved.data_config_path),
+        ("experiment.yaml", resolved.experiment_config_path),
+    )
+    for filename, source_path in source_configs:
+        target_path = config_dir / filename
+        if source_path.exists() and source_path.is_file():
+            shutil.copy2(source_path, target_path)
+        else:
+            target_path.write_text("{}\n", encoding="utf-8")
+
+    (config_dir / "merged.yaml").write_text(_to_yaml_text(config), encoding="utf-8")
+
+    cli_args = {
+        key: (str(value) if isinstance(value, Path) else value)
+        for key, value in vars(args).items()
+    }
+    metadata = {
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "cwd": str(Path.cwd()),
+        "run_dir": str(run_dir),
+        "cli_args": cli_args,
+        "source_config_paths": {
+            "trainer": str(resolved.trainer_config_path),
+            "model": str(resolved.model_config_path),
+            "data": str(resolved.data_config_path),
+            "experiment": str(resolved.experiment_config_path),
+        },
+    }
+    (config_dir / "meta.yaml").write_text(_to_yaml_text(metadata), encoding="utf-8")
+
+
+def _prepare_experiment_run_dir(
+    *,
+    config: dict[str, Any],
+    resolved: ResolvedConfigs,
+    args: argparse.Namespace,
+) -> Path:
+    experiment_root = _resolve_experiment_root_dir(config)
+    fallback_name = resolved.experiment_config_path.stem or "prism_tts"
+    experiment_name = _resolve_experiment_name(config, fallback=fallback_name)
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+
+    run_dir = _next_available_directory(experiment_root / experiment_name / timestamp)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    trainer_cfg = _require_mapping(config, "trainer")
+
+    logger_cfg_raw = trainer_cfg.get("logger")
+    logger_cfg: dict[str, Any]
+    if isinstance(logger_cfg_raw, dict):
+        logger_cfg = logger_cfg_raw
+    else:
+        logger_cfg = {}
+        trainer_cfg["logger"] = logger_cfg
+    logger_cfg["save_dir"] = str(run_dir / "logs")
+
+    checkpoint_cfg_raw = trainer_cfg.get("checkpoint")
+    checkpoint_cfg: dict[str, Any]
+    if isinstance(checkpoint_cfg_raw, dict):
+        checkpoint_cfg = checkpoint_cfg_raw
+    else:
+        checkpoint_cfg = {}
+        trainer_cfg["checkpoint"] = checkpoint_cfg
+    checkpoint_cfg["dirpath"] = str(run_dir / "checkpoints")
+
+    config["run_dir"] = str(run_dir)
+    _save_run_configs(config=config, resolved=resolved, run_dir=run_dir, args=args)
+    return run_dir
 
 
 def _coerce_betas(value: Any) -> tuple[float, float]:
@@ -1317,6 +1476,8 @@ def run(args: argparse.Namespace) -> None:
 
     _validate_config_consistency(config)
     _apply_distributed_training_config(config)
+    run_dir = _prepare_experiment_run_dir(config=config, resolved=resolved, args=args)
+    print(f"[train.py] experiment run directory: {run_dir}")
 
     trainer_cfg = _require_mapping(config, "trainer")
     seed = trainer_cfg.get("seed")

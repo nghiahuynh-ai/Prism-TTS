@@ -31,14 +31,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-config",
         type=Path,
-        default=Path("config/model.yaml"),
-        help="Path to model YAML config.",
+        default=None,
+        help=(
+            "Optional model YAML config path. If omitted, auto-load from checkpoint "
+            "experiment snapshot (exp/.../configs) and fall back to config/model.yaml."
+        ),
     )
     parser.add_argument(
         "--data-config",
         type=Path,
-        default=Path("config/data.yaml"),
-        help="Path to data YAML config.",
+        default=None,
+        help=(
+            "Optional data YAML config path. If omitted, auto-load from checkpoint "
+            "experiment snapshot (exp/.../configs) and fall back to config/data.yaml."
+        ),
     )
     parser.add_argument(
         "--text",
@@ -206,19 +212,116 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_path(path: Path) -> Path:
+    resolved = path.expanduser()
+    if not resolved.is_absolute():
+        resolved = (Path.cwd() / resolved).resolve()
+    else:
+        resolved = resolved.resolve()
+    return resolved
+
+
+def _discover_saved_config_dir(checkpoint_path: Path) -> Path | None:
+    current = checkpoint_path.parent
+    for _ in range(6):
+        candidate = current / "configs"
+        if candidate.is_dir():
+            return candidate.resolve()
+        if current == current.parent:
+            break
+        current = current.parent
+    return None
+
+
+def _load_inference_configs(
+    *,
+    checkpoint_path: Path,
+    model_config_arg: Path | None,
+    data_config_arg: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    snapshot_dir = _discover_saved_config_dir(checkpoint_path)
+    merged_snapshot_path: Path | None = None
+    merged_snapshot_cfg: dict[str, Any] | None = None
+    if snapshot_dir is not None:
+        candidate = snapshot_dir / "merged.yaml"
+        if candidate.is_file():
+            merged_snapshot_path = candidate
+            merged_snapshot_cfg = generate_utils.read_yaml(candidate)
+
+    model_config: dict[str, Any] | None = None
+    data_config: dict[str, Any] | None = None
+
+    if model_config_arg is not None:
+        model_path = _resolve_path(model_config_arg)
+        print(f"[generate.py] using --model-config: {model_path}")
+        model_config = generate_utils.read_yaml(model_path)
+    elif snapshot_dir is not None and (snapshot_dir / "model.yaml").is_file():
+        model_path = (snapshot_dir / "model.yaml").resolve()
+        print(f"[generate.py] using saved model config: {model_path}")
+        model_config = generate_utils.read_yaml(model_path)
+    elif (
+        merged_snapshot_cfg is not None
+        and isinstance(merged_snapshot_cfg.get("model"), dict)
+        and merged_snapshot_path is not None
+    ):
+        print(f"[generate.py] using merged snapshot config: {merged_snapshot_path.resolve()}")
+        model_config = merged_snapshot_cfg
+
+    if data_config_arg is not None:
+        data_path = _resolve_path(data_config_arg)
+        print(f"[generate.py] using --data-config: {data_path}")
+        data_config = generate_utils.read_yaml(data_path)
+    elif snapshot_dir is not None and (snapshot_dir / "data.yaml").is_file():
+        data_path = (snapshot_dir / "data.yaml").resolve()
+        print(f"[generate.py] using saved data config: {data_path}")
+        data_config = generate_utils.read_yaml(data_path)
+    elif (
+        merged_snapshot_cfg is not None
+        and isinstance(merged_snapshot_cfg.get("data"), dict)
+        and merged_snapshot_path is not None
+    ):
+        if model_config is None:
+            print(f"[generate.py] using merged snapshot config: {merged_snapshot_path.resolve()}")
+        data_config = merged_snapshot_cfg
+
+    if model_config is None:
+        fallback_model_path = _resolve_path(Path("config/model.yaml"))
+        print(
+            f"[generate.py] saved model config not found next to checkpoint; "
+            f"falling back to {fallback_model_path}"
+        )
+        model_config = generate_utils.read_yaml(fallback_model_path)
+    if data_config is None:
+        fallback_data_path = _resolve_path(Path("config/data.yaml"))
+        print(
+            f"[generate.py] saved data config not found next to checkpoint; "
+            f"falling back to {fallback_data_path}"
+        )
+        data_config = generate_utils.read_yaml(fallback_data_path)
+
+    return model_config, data_config
+
+
 def main() -> None:
     args = parse_args()
     if args.seed is not None:
         torch.manual_seed(int(args.seed))
         np.random.seed(int(args.seed))
 
+    checkpoint_path = _resolve_path(args.checkpoint)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
     device = generate_utils.resolve_device(args.device)
     model_dtype = generate_utils.resolve_torch_dtype(args.dtype)
 
-    model_config = generate_utils.read_yaml(args.model_config)
-    data_config = generate_utils.read_yaml(args.data_config)
+    model_config, data_config = _load_inference_configs(
+        checkpoint_path=checkpoint_path,
+        model_config_arg=args.model_config,
+        data_config_arg=args.data_config,
+    )
     model = generate_utils.build_model(model_config)
-    generate_utils.load_checkpoint(model, args.checkpoint, use_ema=bool(args.use_ema))
+    generate_utils.load_checkpoint(model, checkpoint_path, use_ema=bool(args.use_ema))
     model.to(device=device, dtype=model_dtype)
     model.eval()
 
