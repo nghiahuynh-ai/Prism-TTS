@@ -927,11 +927,15 @@ def _adaptive_lengths_cache_key(
     dataset: PrismDataset,
     *,
     codec_frame_rate_hz: float,
+    num_discrete_streams_override: int | None = None,
 ) -> str:
     tokenizer = getattr(dataset, "tokenizer", None)
     payload = {
-        "cache_version": 1,
+        "cache_version": 2,
         "codec_frame_rate_hz": float(codec_frame_rate_hz),
+        "num_discrete_streams_override": (
+            None if num_discrete_streams_override is None else int(num_discrete_streams_override)
+        ),
         "manifest": _path_signature(getattr(dataset, "manifest_path", None)),
         "vocab": _path_signature(getattr(dataset, "vocab_path", None)),
         "append_eos_to_text": bool(getattr(tokenizer, "append_eos", False)),
@@ -1006,17 +1010,20 @@ def _estimate_adaptive_lengths_once_per_run(
     dataset: PrismDataset,
     *,
     codec_frame_rate_hz: float,
+    num_discrete_streams_override: int | None = None,
 ) -> list[int]:
     rank, world_size = _distributed_rank_world_size()
     if world_size <= 1:
         return estimate_prism_sample_lengths(
             dataset,
             codec_frame_rate_hz=codec_frame_rate_hz,
+            num_discrete_streams_override=num_discrete_streams_override,
         )
 
     cache_key = _adaptive_lengths_cache_key(
         dataset,
         codec_frame_rate_hz=codec_frame_rate_hz,
+        num_discrete_streams_override=num_discrete_streams_override,
     )
     cache_path = _adaptive_lengths_cache_dir() / f"{cache_key}.json"
     expected_count = int(len(dataset))
@@ -1032,6 +1039,7 @@ def _estimate_adaptive_lengths_once_per_run(
         lengths = estimate_prism_sample_lengths(
             dataset,
             codec_frame_rate_hz=codec_frame_rate_hz,
+            num_discrete_streams_override=num_discrete_streams_override,
         )
         _write_adaptive_lengths_cache(cache_path, lengths)
         return [max(1, int(value)) for value in lengths]
@@ -1221,10 +1229,39 @@ def _build_data_objects(
                 "data.loader.adaptive_batching.reference_length_quantile must be in (0, 1]."
             )
 
-        sample_lengths = _estimate_adaptive_lengths_once_per_run(
-            train_dataset,
-            codec_frame_rate_hz=float(collate_cfg.get("codec_frame_rate_hz", 12.5)),
+        codec_frame_rate_hz = float(collate_cfg.get("codec_frame_rate_hz", 12.5))
+        stream_schedule_enabled = (
+            random_active_stream_train
+            and max_active_stream_count is not None
+            and max_active_stream_count > min_active_stream_count
         )
+        sample_lengths_by_stream_count: dict[int, list[int]] | None = None
+        if stream_schedule_enabled:
+            sample_lengths_by_stream_count = {}
+            for active_stream_count in range(
+                min_active_stream_count,
+                max_active_stream_count + 1,
+            ):
+                sample_lengths_by_stream_count[active_stream_count] = (
+                    _estimate_adaptive_lengths_once_per_run(
+                        train_dataset,
+                        codec_frame_rate_hz=codec_frame_rate_hz,
+                        num_discrete_streams_override=active_stream_count,
+                    )
+                )
+            sample_lengths = sample_lengths_by_stream_count[max_active_stream_count]
+            train_collate.random_active_discrete_stream_count = False
+        else:
+            sample_lengths = _estimate_adaptive_lengths_once_per_run(
+                train_dataset,
+                codec_frame_rate_hz=codec_frame_rate_hz,
+            )
+            if random_active_stream_train and max_active_stream_count is None:
+                print(
+                    "[train.py] Random active stream count is enabled but "
+                    "data.collate.max_active_discrete_stream_count is null; "
+                    "adaptive pre-built stream schedule is disabled."
+                )
 
         reference_length = _length_quantile(sample_lengths, reference_quantile)
         memory_budget_raw = adaptive_cfg.get("memory_budget")
@@ -1259,6 +1296,18 @@ def _build_data_objects(
         else:
             sampler_seed = int(adaptive_seed_raw)
 
+        train_batch_sampler_kwargs: dict[str, Any] = {}
+        if stream_schedule_enabled and sample_lengths_by_stream_count is not None:
+            train_batch_sampler_kwargs.update(
+                {
+                    "sample_lengths_by_stream_count": sample_lengths_by_stream_count,
+                    "random_active_discrete_stream_count": True,
+                    "min_active_discrete_stream_count": min_active_stream_count,
+                    "max_active_discrete_stream_count": max_active_stream_count,
+                    "yield_active_discrete_stream_count_with_indices": True,
+                }
+            )
+
         train_batch_sampler = AdaptiveMemoryBatchSampler(
             sample_lengths=sample_lengths,
             target_batch_cost=target_batch_cost,
@@ -1266,6 +1315,7 @@ def _build_data_objects(
             shuffle=shuffle_train,
             drop_last=drop_last_train,
             seed=sampler_seed,
+            **train_batch_sampler_kwargs,
         )
         train_loader = DataLoader(
             train_dataset,
@@ -1281,7 +1331,8 @@ def _build_data_objects(
             f"memory_budget={memory_budget}, "
             f"reference_length(q={reference_quantile:.2f})={reference_length}, "
             f"max_batch_size={max_batch_size}, "
-            f"seed={sampler_seed}."
+            f"seed={sampler_seed}, "
+            f"prebuilt_stream_schedule={stream_schedule_enabled}."
         )
     else:
         train_loader = DataLoader(

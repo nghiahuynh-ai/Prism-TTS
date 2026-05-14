@@ -36,7 +36,10 @@ def _expected_flat_len(text_len: int, speech_len: int, num_discrete_streams: int
 
 
 def test_batch_collate_builds_split_parts_and_lengths_without_delay():
-    collate = BatchCollate(discrete_token_count=100)
+    collate = BatchCollate(
+        discrete_token_count=100,
+        random_active_discrete_stream_count=False,
+    )
     _, eos_token_id, pad_token_id, _ = build_shared_token_layout(100)
 
     sample_a = _make_sample(

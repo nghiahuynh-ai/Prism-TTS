@@ -60,3 +60,4 @@ logs/
 checkpoints/
 synth/
 exp/
+.cache/

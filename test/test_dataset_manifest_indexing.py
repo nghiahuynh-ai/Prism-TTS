@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -88,3 +89,33 @@ def test_estimate_lengths_with_streamed_manifest_entries(tmp_path: Path):
     )
     lengths = estimate_prism_sample_lengths(dataset, codec_frame_rate_hz=12.5)
     assert lengths == [21, 25]
+
+
+def test_prism_dataset_supports_tuple_index_with_active_stream_count(tmp_path: Path):
+    vocab_path = tmp_path / "vocab.txt"
+    vocab_path.write_text("a\nb\nc\n", encoding="utf-8")
+
+    discrete = np.asarray([[1, 2], [3, 4], [5, 6]], dtype=np.int64)
+    continuous = np.asarray([[0.1], [0.2], [0.3]], dtype=np.float32)
+    for name in ("target_a", "prompt_a"):
+        _write_payload(tmp_path / f"{name}.npy", discrete=discrete, continuous=continuous)
+
+    manifest_path = tmp_path / "manifest.txt"
+    manifest_path.write_text(
+        "utt_a|0.16|abc|target_a.npy|pr_a|0.08|ab|prompt_a.npy\n",
+        encoding="utf-8",
+    )
+
+    dataset = PrismDataset(
+        source=manifest_path,
+        vocab_path=vocab_path,
+        discrete_stream_count=2,
+        continuous_feature_dim=1,
+    )
+
+    reduced = dataset[(0, 1)]
+    assert tuple(reduced["discrete_prompt"].shape) == (2, 1)
+    assert tuple(reduced["discrete_target"].shape) == (2, 1)
+
+    with pytest.raises(ValueError):
+        _ = dataset[(0, 3)]

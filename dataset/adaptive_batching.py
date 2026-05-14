@@ -335,10 +335,18 @@ def estimate_prism_sample_lengths(
     dataset: Any,
     *,
     codec_frame_rate_hz: float,
+    num_discrete_streams_override: int | None = None,
 ) -> list[int]:
     """Estimate concatenated sequence length for each Prism sample."""
     if codec_frame_rate_hz <= 0:
         raise ValueError("codec_frame_rate_hz must be > 0.")
+    if num_discrete_streams_override is not None and int(num_discrete_streams_override) < 1:
+        raise ValueError("num_discrete_streams_override must be >= 1 when provided.")
+
+    def _resolved_stream_count(default_stream_count: int) -> int:
+        if num_discrete_streams_override is not None:
+            return max(1, int(num_discrete_streams_override))
+        return max(1, int(default_stream_count))
 
     tokenizer = getattr(dataset, "tokenizer", None)
     manifest_path = getattr(dataset, "manifest_path", None)
@@ -347,7 +355,9 @@ def estimate_prism_sample_lengths(
         append_eos = bool(getattr(tokenizer, "append_eos", False))
         if not isinstance(char_to_id, Mapping):
             raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
-        num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
+        num_discrete_streams = _resolved_stream_count(
+            int(getattr(dataset, "discrete_stream_count", 1) or 1)
+        )
         total_entries = len(dataset) if hasattr(dataset, "__len__") else None
         resolved_manifest_path = Path(manifest_path).expanduser().resolve()
         lengths = _estimate_manifest_lengths_from_file(
@@ -367,7 +377,9 @@ def estimate_prism_sample_lengths(
         append_eos = bool(getattr(tokenizer, "append_eos", False))
         if not isinstance(char_to_id, Mapping):
             raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
-        num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
+        num_discrete_streams = _resolved_stream_count(
+            int(getattr(dataset, "discrete_stream_count", 1) or 1)
+        )
         total_entries = len(dataset) if hasattr(dataset, "__len__") else None
 
         lengths: list[int] = []
@@ -432,7 +444,9 @@ def estimate_prism_sample_lengths(
                 field_name="discrete_target",
             )
             discrete_prompt = sample.get("discrete_prompt")
-            num_discrete_streams = int(getattr(discrete_prompt, "shape", [1, 1])[1])
+            num_discrete_streams = _resolved_stream_count(
+                int(getattr(discrete_prompt, "shape", [1, 1])[1])
+            )
             lengths.append(
                 _estimate_concat_sequence_length(
                     text_prompt_length=text_prompt_len,
@@ -450,7 +464,7 @@ def estimate_prism_sample_lengths(
     )
 
 
-class AdaptiveMemoryBatchSampler(Sampler[list[int]]):
+class AdaptiveMemoryBatchSampler(Sampler[list[int] | list[tuple[int, int]]]):
     """
     Variable-size batch sampler targeting a memory budget proxy.
 
@@ -467,6 +481,11 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int]]):
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
+        sample_lengths_by_stream_count: Mapping[int, Sequence[int]] | None = None,
+        random_active_discrete_stream_count: bool = False,
+        min_active_discrete_stream_count: int = 1,
+        max_active_discrete_stream_count: int | None = None,
+        yield_active_discrete_stream_count_with_indices: bool = False,
     ) -> None:
         if not sample_lengths:
             raise ValueError("sample_lengths must not be empty.")
@@ -487,30 +506,138 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int]]):
         self.shuffle = bool(shuffle)
         self.drop_last = False
         self.seed = int(seed)
+        self.random_active_discrete_stream_count = bool(random_active_discrete_stream_count)
+        self.min_active_discrete_stream_count = int(min_active_discrete_stream_count)
+        self.max_active_discrete_stream_count = (
+            None
+            if max_active_discrete_stream_count is None
+            else int(max_active_discrete_stream_count)
+        )
+        self.yield_active_discrete_stream_count_with_indices = bool(
+            yield_active_discrete_stream_count_with_indices
+        )
+        if self.min_active_discrete_stream_count < 1:
+            raise ValueError("min_active_discrete_stream_count must be >= 1.")
+        if (
+            self.max_active_discrete_stream_count is not None
+            and self.max_active_discrete_stream_count < 1
+        ):
+            raise ValueError("max_active_discrete_stream_count must be >= 1 when provided.")
+        if (
+            self.max_active_discrete_stream_count is not None
+            and self.min_active_discrete_stream_count > self.max_active_discrete_stream_count
+        ):
+            raise ValueError(
+                "min_active_discrete_stream_count must be <= max_active_discrete_stream_count."
+            )
+
+        self._sample_lengths_by_stream_count: dict[int, list[int]] = {}
+        if sample_lengths_by_stream_count is not None:
+            if not isinstance(sample_lengths_by_stream_count, Mapping):
+                raise ValueError("sample_lengths_by_stream_count must be a mapping when provided.")
+            for stream_count_raw, lengths_raw in sample_lengths_by_stream_count.items():
+                stream_count = int(stream_count_raw)
+                if stream_count < 1:
+                    raise ValueError("sample_lengths_by_stream_count keys must be >= 1.")
+                normalized_stream_lengths = [max(1, int(length)) for length in lengths_raw]
+                if len(normalized_stream_lengths) != len(self.sample_lengths):
+                    raise ValueError(
+                        "sample_lengths_by_stream_count entries must match sample_lengths size."
+                    )
+                self._sample_lengths_by_stream_count[stream_count] = normalized_stream_lengths
+
+        if self.random_active_discrete_stream_count and not self._sample_lengths_by_stream_count:
+            raise ValueError(
+                "random_active_discrete_stream_count=True requires sample_lengths_by_stream_count."
+            )
+        if (
+            self.yield_active_discrete_stream_count_with_indices
+            and not self._sample_lengths_by_stream_count
+        ):
+            raise ValueError(
+                "yield_active_discrete_stream_count_with_indices=True requires "
+                "sample_lengths_by_stream_count."
+            )
+
+        self._active_stream_choices = self._resolve_active_stream_choices()
         self._epoch = 0
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
 
-    def _ordered_indices(self) -> list[int]:
+    def _ordered_indices_and_rng(self) -> tuple[list[int], random.Random]:
         indices = list(range(len(self.sample_lengths)))
+        rng = random.Random(self.seed + self._epoch)
         if self.shuffle:
-            rng = random.Random(self.seed + self._epoch)
             rng.shuffle(indices)
         self._epoch += 1
-        return indices
+        return indices, rng
 
-    def _build_batches(self, ordered_indices: Sequence[int]) -> list[list[int]]:
-        batches: list[list[int]] = []
+    def _resolve_active_stream_choices(self) -> list[int]:
+        if not self._sample_lengths_by_stream_count:
+            return []
+
+        sorted_stream_counts = sorted(self._sample_lengths_by_stream_count.keys())
+        upper_bound = (
+            sorted_stream_counts[-1]
+            if self.max_active_discrete_stream_count is None
+            else self.max_active_discrete_stream_count
+        )
+        return [
+            stream_count
+            for stream_count in sorted_stream_counts
+            if self.min_active_discrete_stream_count <= stream_count <= upper_bound
+        ]
+
+    def _sample_batch_stream_count(self, rng: random.Random) -> int | None:
+        if not self._sample_lengths_by_stream_count:
+            return None
+        if not self._active_stream_choices:
+            raise ValueError(
+                "No stream-count choices are available for adaptive batching. "
+                "Check min/max_active_discrete_stream_count and sample_lengths_by_stream_count."
+            )
+
+        if self.random_active_discrete_stream_count:
+            return int(rng.choice(self._active_stream_choices))
+        return int(self._active_stream_choices[-1])
+
+    def _sample_length_for(
+        self,
+        sample_idx: int,
+        *,
+        active_stream_count: int | None,
+    ) -> int:
+        if active_stream_count is None:
+            return self.sample_lengths[sample_idx]
+        stream_lengths = self._sample_lengths_by_stream_count.get(active_stream_count)
+        if stream_lengths is None:
+            raise ValueError(
+                "Missing sample lengths for stream count "
+                f"{active_stream_count} in sample_lengths_by_stream_count."
+            )
+        return stream_lengths[sample_idx]
+
+    def _build_batches(
+        self,
+        ordered_indices: Sequence[int],
+        *,
+        rng: random.Random,
+    ) -> list[list[int] | list[tuple[int, int]]]:
+        batches: list[list[int] | list[tuple[int, int]]] = []
         cursor = 0
         total = len(ordered_indices)
         while cursor < total:
+            active_stream_count = self._sample_batch_stream_count(rng)
             batch: list[int] = []
             batch_max_len = 0
 
             while cursor < total and len(batch) < self.max_batch_size:
                 sample_idx = int(ordered_indices[cursor])
-                sample_len = self.sample_lengths[sample_idx]
+                sample_len = self._sample_length_for(
+                    sample_idx,
+                    active_stream_count=active_stream_count,
+                )
 
                 next_batch_size = len(batch) + 1
                 next_max_len = max(batch_max_len, sample_len)
@@ -526,15 +653,24 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int]]):
                 batch = [int(ordered_indices[cursor])]
                 cursor += 1
 
-            batches.append(batch)
+            if (
+                self.yield_active_discrete_stream_count_with_indices
+                and active_stream_count is not None
+            ):
+                batches.append(
+                    [(sample_idx, int(active_stream_count)) for sample_idx in batch]
+                )
+            else:
+                batches.append(batch)
 
         return batches
 
     def __iter__(self):
-        ordered = self._ordered_indices()
-        for batch in self._build_batches(ordered):
+        ordered, rng = self._ordered_indices_and_rng()
+        for batch in self._build_batches(ordered, rng=rng):
             yield batch
 
     def __len__(self) -> int:
         ordered = list(range(len(self.sample_lengths)))
-        return len(self._build_batches(ordered))
+        rng = random.Random(self.seed)
+        return len(self._build_batches(ordered, rng=rng))

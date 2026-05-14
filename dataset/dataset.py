@@ -223,11 +223,53 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             return len(self._manifest_line_offsets)
         return len(self._samples)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, index: Any) -> dict[str, torch.Tensor]:
+        sample_index, active_discrete_stream_count = self._parse_sample_index(index)
         if self.manifest_path is not None:
-            manifest_index = self._normalize_manifest_index(int(index))
-            return self._build_manifest_sample(self._manifest_entry_at(manifest_index))
-        return _normalize_split_sample(self._samples[index])
+            manifest_index = self._normalize_manifest_index(sample_index)
+            sample = self._build_manifest_sample(self._manifest_entry_at(manifest_index))
+        else:
+            sample = _normalize_split_sample(self._samples[sample_index])
+        return self._select_first_discrete_streams(sample, active_discrete_stream_count)
+
+    @staticmethod
+    def _parse_sample_index(index: Any) -> tuple[int, int | None]:
+        if isinstance(index, (tuple, list)):
+            if len(index) != 2:
+                raise ValueError(
+                    "Tuple/list dataset indices must be (sample_index, active_discrete_stream_count)."
+                )
+            sample_index_raw, active_stream_raw = index
+            sample_index = int(sample_index_raw)
+            active_discrete_stream_count = int(active_stream_raw)
+            if active_discrete_stream_count < 1:
+                raise ValueError("active_discrete_stream_count must be >= 1 in dataset indices.")
+            return sample_index, active_discrete_stream_count
+        return int(index), None
+
+    @staticmethod
+    def _select_first_discrete_streams(
+        sample: dict[str, torch.Tensor],
+        active_discrete_stream_count: int | None,
+    ) -> dict[str, torch.Tensor]:
+        if active_discrete_stream_count is None:
+            return sample
+
+        prompt_streams = int(sample["discrete_prompt"].shape[1])
+        target_streams = int(sample["discrete_target"].shape[1])
+        available_streams = min(prompt_streams, target_streams)
+        if active_discrete_stream_count > available_streams:
+            raise ValueError(
+                "Requested active_discrete_stream_count exceeds available streams in sample: "
+                f"requested={active_discrete_stream_count}, available={available_streams}."
+            )
+        if active_discrete_stream_count == available_streams:
+            return sample
+
+        selected = dict(sample)
+        selected["discrete_prompt"] = sample["discrete_prompt"][:, :active_discrete_stream_count]
+        selected["discrete_target"] = sample["discrete_target"][:, :active_discrete_stream_count]
+        return selected
 
     def __getstate__(self) -> dict[str, Any]:
         state = self.__dict__.copy()
