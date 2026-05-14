@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import inspect
+import json
 import math
 import os
 import shutil
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -877,6 +880,185 @@ def _parse_env_int(name: str, default: int) -> int:
         return default
 
 
+def _parse_env_int_silent(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _parse_env_float_silent(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _distributed_rank_world_size() -> tuple[int, int]:
+    world_size = max(1, _parse_env_int_silent("WORLD_SIZE", 1))
+    rank = _parse_env_int_silent("RANK", 0)
+    rank = max(0, min(rank, world_size - 1))
+    return rank, world_size
+
+
+def _path_signature(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    resolved = path.expanduser().resolve()
+    signature: dict[str, Any] = {"path": str(resolved)}
+    try:
+        stat = resolved.stat()
+    except OSError:
+        signature["exists"] = False
+        return signature
+    signature["exists"] = True
+    signature["size"] = int(stat.st_size)
+    signature["mtime_ns"] = int(stat.st_mtime_ns)
+    return signature
+
+
+def _adaptive_lengths_cache_key(
+    dataset: PrismDataset,
+    *,
+    codec_frame_rate_hz: float,
+) -> str:
+    tokenizer = getattr(dataset, "tokenizer", None)
+    payload = {
+        "cache_version": 1,
+        "codec_frame_rate_hz": float(codec_frame_rate_hz),
+        "manifest": _path_signature(getattr(dataset, "manifest_path", None)),
+        "vocab": _path_signature(getattr(dataset, "vocab_path", None)),
+        "append_eos_to_text": bool(getattr(tokenizer, "append_eos", False)),
+        "char_vocab_size": int(len(getattr(tokenizer, "char_to_id", {}))),
+        "discrete_stream_count": getattr(dataset, "discrete_stream_count", None),
+        "sample_count": int(len(dataset)),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _adaptive_lengths_cache_dir() -> Path:
+    configured = os.environ.get("PRISM_TTS_ADAPTIVE_LENGTH_CACHE_DIR")
+    if configured:
+        cache_dir = Path(configured).expanduser()
+        if not cache_dir.is_absolute():
+            cache_dir = Path.cwd() / cache_dir
+        return cache_dir.resolve()
+    return (Path.cwd() / ".cache" / "prism_tts" / "adaptive_lengths").resolve()
+
+
+def _load_adaptive_lengths_cache(
+    cache_path: Path,
+    *,
+    expected_count: int,
+) -> list[int] | None:
+    if not cache_path.is_file():
+        return None
+
+    try:
+        raw = cache_path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    lengths_raw = payload.get("lengths")
+    if not isinstance(lengths_raw, list):
+        return None
+
+    if len(lengths_raw) != expected_count:
+        return None
+
+    lengths: list[int] = []
+    try:
+        for value in lengths_raw:
+            lengths.append(max(1, int(value)))
+    except (TypeError, ValueError):
+        return None
+    return lengths
+
+
+def _write_adaptive_lengths_cache(cache_path: Path, lengths: Sequence[int]) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = [max(1, int(value)) for value in lengths]
+    payload = {
+        "version": 1,
+        "sample_count": len(normalized),
+        "lengths": normalized,
+    }
+    temp_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp.{os.getpid()}")
+    temp_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    temp_path.replace(cache_path)
+
+
+def _estimate_adaptive_lengths_once_per_run(
+    dataset: PrismDataset,
+    *,
+    codec_frame_rate_hz: float,
+) -> list[int]:
+    rank, world_size = _distributed_rank_world_size()
+    if world_size <= 1:
+        return estimate_prism_sample_lengths(
+            dataset,
+            codec_frame_rate_hz=codec_frame_rate_hz,
+        )
+
+    cache_key = _adaptive_lengths_cache_key(
+        dataset,
+        codec_frame_rate_hz=codec_frame_rate_hz,
+    )
+    cache_path = _adaptive_lengths_cache_dir() / f"{cache_key}.json"
+    expected_count = int(len(dataset))
+
+    cached = _load_adaptive_lengths_cache(cache_path, expected_count=expected_count)
+    if cached is not None:
+        if rank == 0:
+            print(f"[train.py] Reusing adaptive length cache: {cache_path}")
+        return cached
+
+    if rank == 0:
+        print(f"[train.py] Estimating adaptive lengths on rank 0 and caching to: {cache_path}")
+        lengths = estimate_prism_sample_lengths(
+            dataset,
+            codec_frame_rate_hz=codec_frame_rate_hz,
+        )
+        _write_adaptive_lengths_cache(cache_path, lengths)
+        return [max(1, int(value)) for value in lengths]
+
+    timeout_seconds = max(
+        1.0,
+        _parse_env_float_silent("PRISM_TTS_ADAPTIVE_LENGTH_CACHE_TIMEOUT_SEC", 10800.0),
+    )
+    poll_seconds = max(
+        0.1,
+        _parse_env_float_silent("PRISM_TTS_ADAPTIVE_LENGTH_CACHE_POLL_SEC", 1.0),
+    )
+    print(f"[train.py] Rank {rank} waiting for adaptive length cache from rank 0: {cache_path}")
+    start_time = time.monotonic()
+    while True:
+        cached = _load_adaptive_lengths_cache(cache_path, expected_count=expected_count)
+        if cached is not None:
+            print(f"[train.py] Rank {rank} loaded adaptive length cache.")
+            return cached
+        if (time.monotonic() - start_time) >= timeout_seconds:
+            raise TimeoutError(
+                "Timed out waiting for adaptive length cache from rank 0. "
+                f"Expected cache file: {cache_path}"
+            )
+        time.sleep(poll_seconds)
+
+
 def _length_quantile(values: Sequence[int], quantile: float) -> int:
     if not values:
         raise ValueError("values must not be empty.")
@@ -1039,7 +1221,7 @@ def _build_data_objects(
                 "data.loader.adaptive_batching.reference_length_quantile must be in (0, 1]."
             )
 
-        sample_lengths = estimate_prism_sample_lengths(
+        sample_lengths = _estimate_adaptive_lengths_once_per_run(
             train_dataset,
             codec_frame_rate_hz=float(collate_cfg.get("codec_frame_rate_hz", 12.5)),
         )

@@ -18,8 +18,8 @@ experiment:
     checkpoint:
       dirpath: checkpoints/mask-dyn
 
-    distributed:
-      enabled: true
+    # distributed:
+    #   enabled: true
 
   # data:
   #   Optional per-experiment data overrides.

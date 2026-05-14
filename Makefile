@@ -34,6 +34,12 @@ WANDB_ENTITY ?=
 WANDB_GROUP ?=
 WANDB_TAGS ?=
 PYTORCH_CUDA_ALLOC_CONF ?= backend:cudaMallocAsync
+# Distributed debug defaults (override at runtime if needed).
+TORCH_DISTRIBUTED_DEBUG ?= DETAIL
+NCCL_DEBUG ?= INFO
+# Optional rendezvous overrides (needed for multi-node runs).
+MASTER_ADDR ?=
+MASTER_PORT ?=
 
 TRAIN_ARGS ?=
 VALIDATE_ARGS ?=
@@ -107,6 +113,10 @@ help:
 	@echo "  WANDB_GROUP=...        Override WandB group"
 	@echo "  WANDB_TAGS=a,b,c       Override WandB tags"
 	@echo "  PYTORCH_CUDA_ALLOC_CONF=...  CUDA allocator config (default: backend:cudaMallocAsync)"
+	@echo "  TORCH_DISTRIBUTED_DEBUG=...  DDP debug mode (default: DETAIL)"
+	@echo "  NCCL_DEBUG=...         NCCL debug mode (default: INFO)"
+	@echo "  MASTER_ADDR=...        Optional DDP rendezvous host (multi-node)"
+	@echo "  MASTER_PORT=...        Optional DDP rendezvous port (multi-node)"
 	@echo ""
 	@echo "Extra args:"
 	@echo "  TRAIN_ARGS='...'"
@@ -117,10 +127,20 @@ help:
 	@echo "  GENERATE_ARGS='...'"
 
 train:
+	@unset LOCAL_RANK RANK WORLD_SIZE NODE_RANK; \
+	if [ -z "$(strip $(MASTER_ADDR))" ]; then unset MASTER_ADDR; else export MASTER_ADDR="$(MASTER_ADDR)"; fi; \
+	if [ -z "$(strip $(MASTER_PORT))" ]; then unset MASTER_PORT; else export MASTER_PORT="$(MASTER_PORT)"; fi; \
+	export TORCH_DISTRIBUTED_DEBUG="$(TORCH_DISTRIBUTED_DEBUG)"; \
+	export NCCL_DEBUG="$(NCCL_DEBUG)"; \
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
 	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) $(CKPT_ARG) $(TRAIN_ARGS)
 
 validate:
+	@unset LOCAL_RANK RANK WORLD_SIZE NODE_RANK; \
+	if [ -z "$(strip $(MASTER_ADDR))" ]; then unset MASTER_ADDR; else export MASTER_ADDR="$(MASTER_ADDR)"; fi; \
+	if [ -z "$(strip $(MASTER_PORT))" ]; then unset MASTER_PORT; else export MASTER_PORT="$(MASTER_PORT)"; fi; \
+	export TORCH_DISTRIBUTED_DEBUG="$(TORCH_DISTRIBUTED_DEBUG)"; \
+	export NCCL_DEBUG="$(NCCL_DEBUG)"; \
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
 	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --validate-only $(CKPT_ARG) $(VALIDATE_ARGS)
 
@@ -128,6 +148,11 @@ test:
 	@if [ -z "$(CKPT)" ]; then \
 		echo "[make test] CKPT is empty: this will run fit before test."; \
 	fi
+	@unset LOCAL_RANK RANK WORLD_SIZE NODE_RANK; \
+	if [ -z "$(strip $(MASTER_ADDR))" ]; then unset MASTER_ADDR; else export MASTER_ADDR="$(MASTER_ADDR)"; fi; \
+	if [ -z "$(strip $(MASTER_PORT))" ]; then unset MASTER_PORT; else export MASTER_PORT="$(MASTER_PORT)"; fi; \
+	export TORCH_DISTRIBUTED_DEBUG="$(TORCH_DISTRIBUTED_DEBUG)"; \
+	export NCCL_DEBUG="$(NCCL_DEBUG)"; \
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
 	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --test-after-fit $(CKPT_ARG) $(TEST_ARGS)
 
