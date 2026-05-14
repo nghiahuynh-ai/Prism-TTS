@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import math
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor
 from collections.abc import Iterable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from torch.utils.data import Sampler
@@ -11,6 +14,11 @@ try:
     from tqdm.auto import tqdm
 except ModuleNotFoundError:
     tqdm = None
+
+_PARALLEL_CHAR_VOCAB: frozenset[str] | None = None
+_PARALLEL_APPEND_EOS = False
+_PARALLEL_CODEC_FRAME_RATE_HZ = 0.0
+_PARALLEL_NUM_DISCRETE_STREAMS = 1
 
 
 def _estimate_text_token_count(text: str, char_to_id: Mapping[str, int], append_eos: bool) -> int:
@@ -114,6 +122,215 @@ def _progress(
     )
 
 
+def _parse_env_int_silent(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(minimum, int(default))
+    try:
+        value = int(raw)
+    except ValueError:
+        return max(minimum, int(default))
+    return max(minimum, value)
+
+
+def _manifest_length_fields_from_line(raw_line: str, *, line_number: int) -> tuple[float, str, float, str]:
+    line = raw_line.strip()
+    parts = [part.strip() for part in line.split("|")]
+    # Some manifests include a trailing delimiter, producing an empty final field.
+    while parts and parts[-1] == "":
+        parts.pop()
+    if len(parts) != 8:
+        raise ValueError(
+            "Each manifest line must have exactly 8 fields separated by '|'. "
+            f"line={line_number}, fields={len(parts)}"
+        )
+
+    try:
+        duration = float(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"Invalid duration at line {line_number}: {parts[1]!r}.") from exc
+    try:
+        prompt_duration = float(parts[5])
+    except ValueError as exc:
+        raise ValueError(f"Invalid prompt_duration at line {line_number}: {parts[5]!r}.") from exc
+
+    transcript = parts[2]
+    prompt_transcript = parts[6]
+    return duration, transcript, prompt_duration, prompt_transcript
+
+
+def _iter_manifest_line_chunks(
+    manifest_path: Path,
+    *,
+    chunk_size: int,
+):
+    chunk: list[tuple[int, str]] = []
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            chunk.append((line_number, line))
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+    if chunk:
+        yield chunk
+
+
+def _parallel_manifest_length_worker_init(
+    char_vocab: frozenset[str],
+    append_eos: bool,
+    codec_frame_rate_hz: float,
+    num_discrete_streams: int,
+) -> None:
+    global _PARALLEL_CHAR_VOCAB
+    global _PARALLEL_APPEND_EOS
+    global _PARALLEL_CODEC_FRAME_RATE_HZ
+    global _PARALLEL_NUM_DISCRETE_STREAMS
+    _PARALLEL_CHAR_VOCAB = char_vocab
+    _PARALLEL_APPEND_EOS = bool(append_eos)
+    _PARALLEL_CODEC_FRAME_RATE_HZ = float(codec_frame_rate_hz)
+    _PARALLEL_NUM_DISCRETE_STREAMS = max(1, int(num_discrete_streams))
+
+
+def _estimate_lengths_for_manifest_chunk(
+    chunk: Sequence[tuple[int, str]],
+) -> list[int]:
+    if _PARALLEL_CHAR_VOCAB is None:
+        raise RuntimeError("Parallel manifest length worker is uninitialized.")
+
+    char_vocab = _PARALLEL_CHAR_VOCAB
+    append_eos = _PARALLEL_APPEND_EOS
+    codec_frame_rate_hz = _PARALLEL_CODEC_FRAME_RATE_HZ
+    num_discrete_streams = _PARALLEL_NUM_DISCRETE_STREAMS
+
+    lengths: list[int] = []
+    for line_number, raw_line in chunk:
+        duration, transcript, prompt_duration, prompt_transcript = _manifest_length_fields_from_line(
+            raw_line,
+            line_number=line_number,
+        )
+
+        text_prompt_len = 0
+        for char in prompt_transcript:
+            if char in char_vocab:
+                text_prompt_len += 1
+        if append_eos:
+            text_prompt_len += 1
+        text_prompt_len = max(1, text_prompt_len)
+
+        text_target_len = 0
+        for char in transcript:
+            if char in char_vocab:
+                text_target_len += 1
+        if append_eos:
+            text_target_len += 1
+        text_target_len = max(1, text_target_len)
+
+        prompt_discrete_len = _estimate_discrete_length(prompt_duration, codec_frame_rate_hz)
+        target_discrete_len = _estimate_discrete_length(duration, codec_frame_rate_hz)
+        lengths.append(
+            _estimate_concat_sequence_length(
+                text_prompt_length=text_prompt_len,
+                speech_prompt_length=prompt_discrete_len,
+                text_target_length=text_target_len,
+                speech_target_length=target_discrete_len,
+                num_discrete_streams=num_discrete_streams,
+            )
+        )
+    return lengths
+
+
+def _estimate_manifest_lengths_from_file(
+    *,
+    manifest_path: Path,
+    char_to_id: Mapping[str, int],
+    append_eos: bool,
+    codec_frame_rate_hz: float,
+    num_discrete_streams: int,
+    total_entries: int | None,
+) -> list[int]:
+    chunk_size = _parse_env_int_silent("PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE", 4096, minimum=64)
+    default_workers = min(16, max(1, os.cpu_count() or 1))
+    requested_workers = _parse_env_int_silent(
+        "PRISM_TTS_ADAPTIVE_LENGTH_WORKERS",
+        default_workers,
+        minimum=1,
+    )
+    min_parallel_samples = _parse_env_int_silent(
+        "PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES",
+        50_000,
+        minimum=1,
+    )
+    should_parallelize = (
+        requested_workers > 1
+        and total_entries is not None
+        and total_entries >= min_parallel_samples
+    )
+
+    char_vocab = frozenset(char_to_id.keys())
+    total_chunks = None
+    if total_entries is not None:
+        total_chunks = max(1, int(math.ceil(total_entries / float(chunk_size))))
+
+    def _run_sequential() -> list[int]:
+        _parallel_manifest_length_worker_init(
+            char_vocab,
+            append_eos,
+            codec_frame_rate_hz,
+            num_discrete_streams,
+        )
+        seq_lengths: list[int] = []
+        for chunk_lengths in _progress(
+            (
+                _estimate_lengths_for_manifest_chunk(chunk)
+                for chunk in _iter_manifest_line_chunks(manifest_path, chunk_size=chunk_size)
+            ),
+            total=total_chunks,
+            desc="adaptive_batching: estimating lengths",
+            unit="chunk",
+        ):
+            seq_lengths.extend(chunk_lengths)
+        return seq_lengths
+
+    if not should_parallelize:
+        lengths = _run_sequential()
+    else:
+        try:
+            lengths = []
+            with ProcessPoolExecutor(
+                max_workers=requested_workers,
+                initializer=_parallel_manifest_length_worker_init,
+                initargs=(
+                    char_vocab,
+                    append_eos,
+                    codec_frame_rate_hz,
+                    num_discrete_streams,
+                ),
+            ) as pool:
+                for chunk_lengths in _progress(
+                    pool.map(
+                        _estimate_lengths_for_manifest_chunk,
+                        _iter_manifest_line_chunks(manifest_path, chunk_size=chunk_size),
+                        chunksize=1,
+                    ),
+                    total=total_chunks,
+                    desc="adaptive_batching: estimating lengths",
+                    unit="chunk",
+                ):
+                    lengths.extend(chunk_lengths)
+        except (OSError, PermissionError):
+            lengths = _run_sequential()
+
+    if total_entries is not None and len(lengths) != total_entries:
+        raise ValueError(
+            "Adaptive length estimation produced a sample count mismatch: "
+            f"expected {total_entries}, got {len(lengths)}."
+        )
+    return lengths
+
+
 def estimate_prism_sample_lengths(
     dataset: Any,
     *,
@@ -124,6 +341,26 @@ def estimate_prism_sample_lengths(
         raise ValueError("codec_frame_rate_hz must be > 0.")
 
     tokenizer = getattr(dataset, "tokenizer", None)
+    manifest_path = getattr(dataset, "manifest_path", None)
+    if manifest_path is not None and tokenizer is not None and hasattr(tokenizer, "char_to_id"):
+        char_to_id = getattr(tokenizer, "char_to_id")
+        append_eos = bool(getattr(tokenizer, "append_eos", False))
+        if not isinstance(char_to_id, Mapping):
+            raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
+        num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
+        total_entries = len(dataset) if hasattr(dataset, "__len__") else None
+        resolved_manifest_path = Path(manifest_path).expanduser().resolve()
+        lengths = _estimate_manifest_lengths_from_file(
+            manifest_path=resolved_manifest_path,
+            char_to_id=char_to_id,
+            append_eos=append_eos,
+            codec_frame_rate_hz=codec_frame_rate_hz,
+            num_discrete_streams=num_discrete_streams,
+            total_entries=total_entries,
+        )
+        if lengths:
+            return lengths
+
     manifest_entries = _iter_manifest_entries(dataset)
     if manifest_entries is not None and tokenizer is not None and hasattr(tokenizer, "char_to_id"):
         char_to_id = getattr(tokenizer, "char_to_id")
