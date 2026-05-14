@@ -1223,13 +1223,13 @@ def _build_data_objects(
         if max_batch_size < 1:
             raise ValueError("data.loader.adaptive_batching.max_batch_size must be >= 1.")
 
+        codec_frame_rate_hz = float(collate_cfg.get("codec_frame_rate_hz", 12.5))
         reference_quantile = float(adaptive_cfg.get("reference_length_quantile", 0.95))
         if reference_quantile <= 0.0 or reference_quantile > 1.0:
             raise ValueError(
                 "data.loader.adaptive_batching.reference_length_quantile must be in (0, 1]."
             )
 
-        codec_frame_rate_hz = float(collate_cfg.get("codec_frame_rate_hz", 12.5))
         stream_schedule_enabled = (
             random_active_stream_train
             and max_active_stream_count is not None
@@ -1250,6 +1250,7 @@ def _build_data_objects(
                     )
                 )
             sample_lengths = sample_lengths_by_stream_count[max_active_stream_count]
+            # Stream count is already sampled and bound to indices by the batch sampler.
             train_collate.random_active_discrete_stream_count = False
         else:
             sample_lengths = _estimate_adaptive_lengths_once_per_run(
@@ -1661,7 +1662,7 @@ def _apply_distributed_training_config(config: dict[str, Any]) -> None:
         lightning_trainer_cfg["num_nodes"] = resolved_num_nodes
 
     requested_strategy = str(
-        distributed_cfg.get("strategy", "ddp_find_unused_parameters_false")
+        distributed_cfg.get("strategy", "ddp_find_unused_parameters_true")
     )
     device_count = _resolve_requested_device_count(
         accelerator=accelerator,
@@ -1688,6 +1689,18 @@ def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any])
     lightning_trainer_cfg = dict(_require_mapping(trainer_cfg, "lightning_trainer"))
     lightning_trainer_cfg["callbacks"] = callbacks
     lightning_trainer_cfg["logger"] = logger
+
+    data_cfg = config.get("data")
+    loader_cfg = data_cfg.get("loader") if isinstance(data_cfg, dict) else None
+    adaptive_cfg = loader_cfg.get("adaptive_batching") if isinstance(loader_cfg, dict) else None
+    adaptive_enabled = bool(adaptive_cfg.get("enabled", False)) if isinstance(adaptive_cfg, dict) else False
+    if adaptive_enabled and "use_distributed_sampler" not in lightning_trainer_cfg:
+        lightning_trainer_cfg["use_distributed_sampler"] = False
+        print(
+            "[train.py] Adaptive batching is enabled; setting "
+            "trainer.lightning_trainer.use_distributed_sampler=false so Lightning "
+            "does not replace the batch sampler."
+        )
 
     trainer_kwargs = _filter_kwargs_for_callable(
         pl.Trainer.__init__,
