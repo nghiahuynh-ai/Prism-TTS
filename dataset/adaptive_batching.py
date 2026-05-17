@@ -470,6 +470,9 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int] | list[tuple[int, int]]]):
 
     Memory estimate per candidate batch:
         estimated_cost = batch_size * (max_sequence_length_in_batch ** 2)
+
+    Optional length bucketing can reduce pad waste by keeping similarly sized
+    samples near each other before greedy packing.
     """
 
     def __init__(
@@ -481,6 +484,8 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int] | list[tuple[int, int]]]):
         shuffle: bool = True,
         drop_last: bool = False,
         seed: int = 0,
+        bucket_by_length: bool = True,
+        length_bucket_size: int | None = None,
         sample_lengths_by_stream_count: Mapping[int, Sequence[int]] | None = None,
         random_active_discrete_stream_count: bool = False,
         min_active_discrete_stream_count: int = 1,
@@ -506,6 +511,10 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int] | list[tuple[int, int]]]):
         self.shuffle = bool(shuffle)
         self.drop_last = False
         self.seed = int(seed)
+        self.bucket_by_length = bool(bucket_by_length)
+        self.length_bucket_size = (
+            None if length_bucket_size is None else int(length_bucket_size)
+        )
         self.random_active_discrete_stream_count = bool(random_active_discrete_stream_count)
         self.min_active_discrete_stream_count = int(min_active_discrete_stream_count)
         self.max_active_discrete_stream_count = (
@@ -530,6 +539,8 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int] | list[tuple[int, int]]]):
             raise ValueError(
                 "min_active_discrete_stream_count must be <= max_active_discrete_stream_count."
             )
+        if self.length_bucket_size is not None and self.length_bucket_size < 1:
+            raise ValueError("length_bucket_size must be >= 1 when provided.")
 
         self._sample_lengths_by_stream_count: dict[int, list[int]] = {}
         if sample_lengths_by_stream_count is not None:
@@ -569,9 +580,43 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int] | list[tuple[int, int]]]):
         indices = list(range(len(self.sample_lengths)))
         rng = random.Random(self.seed + self._epoch)
         if self.shuffle:
-            rng.shuffle(indices)
+            if self.bucket_by_length:
+                indices = self._length_bucketed_shuffle(indices, rng=rng)
+            else:
+                rng.shuffle(indices)
         self._epoch += 1
         return indices, rng
+
+    def _length_bucketed_shuffle(
+        self,
+        indices: Sequence[int],
+        *,
+        rng: random.Random,
+    ) -> list[int]:
+        if not indices:
+            return []
+
+        sorted_indices = sorted(indices, key=lambda idx: self.sample_lengths[idx])
+        auto_bucket_size = max(512, self.max_batch_size * 8)
+        bucket_size = (
+            auto_bucket_size
+            if self.length_bucket_size is None
+            else self.length_bucket_size
+        )
+
+        buckets = [
+            sorted_indices[start : start + bucket_size]
+            for start in range(0, len(sorted_indices), bucket_size)
+        ]
+        rng.shuffle(buckets)
+
+        ordered: list[int] = []
+        for bucket in buckets:
+            # Randomly reverse per bucket so we do not always walk short->long.
+            if rng.random() < 0.5:
+                bucket = list(reversed(bucket))
+            ordered.extend(bucket)
+        return ordered
 
     def _resolve_active_stream_choices(self) -> list[int]:
         if not self._sample_lengths_by_stream_count:

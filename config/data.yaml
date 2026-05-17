@@ -38,6 +38,10 @@ data:
       reference_length_quantile: 0.95
       # Upper bound for dynamic batch size (allows adding samples when memory is underused).
       max_batch_size: 1024
+      # Group nearby lengths before greedy cost packing to reduce pad waste.
+      bucket_by_length: true
+      # Optional bucket size for length bucketing; null -> auto (~8 * max_batch_size, min 512).
+      length_bucket_size: null
       # Sampler RNG seed; null falls back to trainer.seed (or 0).
       seed: null
 

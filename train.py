@@ -1222,6 +1222,17 @@ def _build_data_objects(
         max_batch_size = int(adaptive_cfg.get("max_batch_size", max(1, train_batch_size * 2)))
         if max_batch_size < 1:
             raise ValueError("data.loader.adaptive_batching.max_batch_size must be >= 1.")
+        bucket_by_length = bool(adaptive_cfg.get("bucket_by_length", True))
+        length_bucket_size_raw = adaptive_cfg.get("length_bucket_size")
+        length_bucket_size: int | None
+        if length_bucket_size_raw is None:
+            length_bucket_size = None
+        else:
+            length_bucket_size = int(length_bucket_size_raw)
+            if length_bucket_size < 1:
+                raise ValueError(
+                    "data.loader.adaptive_batching.length_bucket_size must be >= 1."
+                )
 
         codec_frame_rate_hz = float(collate_cfg.get("codec_frame_rate_hz", 12.5))
         reference_quantile = float(adaptive_cfg.get("reference_length_quantile", 0.95))
@@ -1316,6 +1327,8 @@ def _build_data_objects(
             shuffle=shuffle_train,
             drop_last=drop_last_train,
             seed=sampler_seed,
+            bucket_by_length=bucket_by_length,
+            length_bucket_size=length_bucket_size,
             **train_batch_sampler_kwargs,
         )
         train_loader = DataLoader(
@@ -1332,6 +1345,8 @@ def _build_data_objects(
             f"memory_budget={memory_budget}, "
             f"reference_length(q={reference_quantile:.2f})={reference_length}, "
             f"max_batch_size={max_batch_size}, "
+            f"bucket_by_length={bucket_by_length}, "
+            f"length_bucket_size={length_bucket_size}, "
             f"seed={sampler_seed}, "
             f"prebuilt_stream_schedule={stream_schedule_enabled}."
         )
@@ -1540,8 +1555,6 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
         del pl_module
         if trainer.sanity_checking:
             return
-        if not bool(getattr(trainer, "is_global_zero", True)):
-            return
 
         self._val_stage += 1
         format_values = {
@@ -1555,6 +1568,8 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
 
         self.dirpath.mkdir(parents=True, exist_ok=True)
         checkpoint_path = self._next_available_path(self.dirpath / filename)
+        # Lightning's Trainer.save_checkpoint contains an internal strategy
+        # barrier and must be called on every rank.
         trainer.save_checkpoint(str(checkpoint_path), weights_only=self.save_weights_only)
 
     @staticmethod
