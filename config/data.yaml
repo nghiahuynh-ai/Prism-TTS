@@ -33,7 +33,7 @@ data:
       # null -> derive from train_batch_size and a reference sequence-length quantile.
       memory_budget: null
       # Optional direct target in "cost units"; overrides utilization*memory_budget.
-      target_batch_cost: 80000000
+      target_batch_cost: 30000000
       # Quantile used when deriving memory_budget automatically.
       reference_length_quantile: 0.95
       # Upper bound for dynamic batch size (allows adding samples when memory is underused).
@@ -67,9 +67,13 @@ data:
     discrete_pad_value: null
     continuous_pad_value: 0.0
     include_attention_mask: true
-    # Training-time stream curriculum: sample one K for each train batch and
-    # keep only the first K discrete streams from all samples in that batch.
-    random_active_discrete_stream_count_train: true
+    # Train stream mode:
+    # - true: sample K per train batch and keep the first K discrete streams.
+    # - false: always train with a fixed K discrete streams.
+    dynamic_active_discrete_stream_count_train: true
+    # Used when dynamic_active_discrete_stream_count_train=false.
+    # null -> fallback to max_active_discrete_stream_count, then data.dataset.discrete_stream_count.
+    fixed_active_discrete_stream_count_train: null
     min_active_discrete_stream_count: 1
     max_active_discrete_stream_count: null
     codec_frame_rate_hz: 12.5

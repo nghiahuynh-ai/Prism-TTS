@@ -9,7 +9,7 @@ import math
 import os
 import shutil
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -518,6 +518,103 @@ def _coerce_betas(value: Any) -> tuple[float, float]:
     return float(value[0]), float(value[1])
 
 
+def _resolve_train_stream_policy(
+    collate_cfg: Mapping[str, Any],
+    *,
+    max_supported_stream_count: int | None,
+) -> tuple[bool, int, int | None, int | None]:
+    min_active_stream_count = int(collate_cfg.get("min_active_discrete_stream_count", 1))
+    if min_active_stream_count < 1:
+        raise ValueError("data.collate.min_active_discrete_stream_count must be >= 1.")
+
+    max_active_stream_raw = collate_cfg.get("max_active_discrete_stream_count")
+    max_active_stream_count: int | None
+    if max_active_stream_raw is None:
+        max_active_stream_count = None
+    else:
+        max_active_stream_count = int(max_active_stream_raw)
+        if max_active_stream_count < 1:
+            raise ValueError("data.collate.max_active_discrete_stream_count must be >= 1.")
+
+    if (
+        max_supported_stream_count is not None
+        and max_active_stream_count is not None
+        and max_active_stream_count > max_supported_stream_count
+    ):
+        raise ValueError(
+            "data.collate.max_active_discrete_stream_count must be <= "
+            f"supported discrete streams ({max_supported_stream_count})."
+        )
+
+    dynamic_stream_train_raw = collate_cfg.get("dynamic_active_discrete_stream_count_train")
+    if dynamic_stream_train_raw is None:
+        dynamic_stream_train = bool(
+            collate_cfg.get("random_active_discrete_stream_count_train", True)
+        )
+    else:
+        dynamic_stream_train = bool(dynamic_stream_train_raw)
+
+    fixed_stream_train_raw = collate_cfg.get("fixed_active_discrete_stream_count_train")
+    fixed_stream_train_count = (
+        None if fixed_stream_train_raw is None else int(fixed_stream_train_raw)
+    )
+    if fixed_stream_train_count is not None and fixed_stream_train_count < 1:
+        raise ValueError(
+            "data.collate.fixed_active_discrete_stream_count_train must be >= 1 when provided."
+        )
+    if (
+        max_supported_stream_count is not None
+        and fixed_stream_train_count is not None
+        and fixed_stream_train_count > max_supported_stream_count
+    ):
+        raise ValueError(
+            "data.collate.fixed_active_discrete_stream_count_train must be <= "
+            f"supported discrete streams ({max_supported_stream_count})."
+        )
+
+    if dynamic_stream_train:
+        resolved_max_active_stream_count = (
+            max_supported_stream_count
+            if max_active_stream_count is None
+            else max_active_stream_count
+        )
+        if (
+            resolved_max_active_stream_count is not None
+            and min_active_stream_count > resolved_max_active_stream_count
+        ):
+            raise ValueError(
+                "data.collate.min_active_discrete_stream_count must be <= "
+                "data.collate.max_active_discrete_stream_count."
+            )
+        return True, min_active_stream_count, max_active_stream_count, None
+
+    fixed_stream_count = fixed_stream_train_count
+    if fixed_stream_count is None:
+        fixed_stream_count = max_active_stream_count
+    if fixed_stream_count is None:
+        fixed_stream_count = max_supported_stream_count
+    if fixed_stream_count is None:
+        raise ValueError(
+            "data.collate.dynamic_active_discrete_stream_count_train=false requires one of: "
+            "data.collate.fixed_active_discrete_stream_count_train, "
+            "data.collate.max_active_discrete_stream_count, or "
+            "data.dataset.discrete_stream_count."
+        )
+
+    if max_active_stream_count is not None and fixed_stream_count > max_active_stream_count:
+        raise ValueError(
+            "data.collate.fixed_active_discrete_stream_count_train must be <= "
+            "data.collate.max_active_discrete_stream_count when both are set."
+        )
+    if min_active_stream_count > fixed_stream_count:
+        raise ValueError(
+            "data.collate.min_active_discrete_stream_count must be <= "
+            "the resolved fixed train stream count."
+        )
+
+    return False, fixed_stream_count, fixed_stream_count, fixed_stream_count
+
+
 def _validate_config_consistency(config: dict[str, Any]) -> None:
     data_cfg = _require_mapping(config, "data")
     model_cfg = _require_mapping(config, "model")
@@ -554,29 +651,10 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
                 f"data.dataset.discrete_stream_count ({dataset_stream_count})."
             )
 
-    min_active_stream_count = int(collate_cfg.get("min_active_discrete_stream_count", 1))
-    if min_active_stream_count < 1:
-        raise ValueError("data.collate.min_active_discrete_stream_count must be >= 1.")
-    max_active_stream_count_raw = collate_cfg.get("max_active_discrete_stream_count")
-    if max_active_stream_count_raw is not None:
-        max_active_stream_count = int(max_active_stream_count_raw)
-        if max_active_stream_count < 1:
-            raise ValueError("data.collate.max_active_discrete_stream_count must be >= 1.")
-        if max_active_stream_count > num_discrete_tokens:
-            raise ValueError(
-                "data.collate.max_active_discrete_stream_count must be <= "
-                f"model.prism_tts.num_discrete_tokens ({num_discrete_tokens})."
-            )
-        if min_active_stream_count > max_active_stream_count:
-            raise ValueError(
-                "data.collate.min_active_discrete_stream_count must be <= "
-                "data.collate.max_active_discrete_stream_count."
-            )
-    elif min_active_stream_count > num_discrete_tokens:
-        raise ValueError(
-            "data.collate.min_active_discrete_stream_count must be <= "
-            f"model.prism_tts.num_discrete_tokens ({num_discrete_tokens})."
-        )
+    _resolve_train_stream_policy(
+        collate_cfg,
+        max_supported_stream_count=num_discrete_tokens,
+    )
 
     continuous_latent_size = int(prism_cfg["continuous_latent_size"])
     dataset_continuous_dim_raw = dataset_cfg.get("continuous_feature_dim")
@@ -1098,6 +1176,8 @@ def _should_force_single_process_loader(num_workers: int) -> bool:
 def _build_data_objects(
     config: dict[str, Any],
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
+    model_cfg = _require_mapping(config, "model")
+    prism_cfg = _require_mapping(model_cfg, "prism_tts")
     data_cfg = _require_mapping(config, "data")
     loader_cfg = _require_mapping(data_cfg, "loader")
     dataset_cfg = _require_mapping(data_cfg, "dataset")
@@ -1131,16 +1211,20 @@ def _build_data_objects(
     max_discrete_stream_count = None
     if dataset_stream_count is not None:
         max_discrete_stream_count = int(dataset_stream_count)
-
-    max_active_stream_raw = collate_cfg.get("max_active_discrete_stream_count")
-    max_active_stream_count = (
-        max_discrete_stream_count
-        if max_active_stream_raw is None
-        else int(max_active_stream_raw)
+    max_supported_train_stream_count = (
+        int(prism_cfg["num_discrete_tokens"])
+        if max_discrete_stream_count is None
+        else max_discrete_stream_count
     )
-    min_active_stream_count = int(collate_cfg.get("min_active_discrete_stream_count", 1))
-    random_active_stream_train = bool(
-        collate_cfg.get("random_active_discrete_stream_count_train", True)
+
+    (
+        dynamic_stream_train,
+        train_min_active_stream_count,
+        train_max_active_stream_count,
+        fixed_train_stream_count,
+    ) = _resolve_train_stream_policy(
+        collate_cfg,
+        max_supported_stream_count=max_supported_train_stream_count,
     )
 
     train_collate = BatchCollate(
@@ -1149,9 +1233,9 @@ def _build_data_objects(
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
-        random_active_discrete_stream_count=random_active_stream_train,
-        min_active_discrete_stream_count=min_active_stream_count,
-        max_active_discrete_stream_count=max_active_stream_count,
+        random_active_discrete_stream_count=dynamic_stream_train,
+        min_active_discrete_stream_count=train_min_active_stream_count,
+        max_active_discrete_stream_count=train_max_active_stream_count,
         fixed_continuous_stream_idx=max_discrete_stream_count,
     )
     eval_collate = BatchCollate(
@@ -1161,7 +1245,7 @@ def _build_data_objects(
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
         random_active_discrete_stream_count=False,
-        min_active_discrete_stream_count=min_active_stream_count,
+        min_active_discrete_stream_count=train_min_active_stream_count,
         max_active_discrete_stream_count=max_discrete_stream_count,
         fixed_continuous_stream_idx=max_discrete_stream_count,
     )
@@ -1242,16 +1326,16 @@ def _build_data_objects(
             )
 
         stream_schedule_enabled = (
-            random_active_stream_train
-            and max_active_stream_count is not None
-            and max_active_stream_count > min_active_stream_count
+            dynamic_stream_train
+            and train_max_active_stream_count is not None
+            and train_max_active_stream_count > train_min_active_stream_count
         )
         sample_lengths_by_stream_count: dict[int, list[int]] | None = None
         if stream_schedule_enabled:
             sample_lengths_by_stream_count = {}
             for active_stream_count in range(
-                min_active_stream_count,
-                max_active_stream_count + 1,
+                train_min_active_stream_count,
+                train_max_active_stream_count + 1,
             ):
                 sample_lengths_by_stream_count[active_stream_count] = (
                     _estimate_adaptive_lengths_once_per_run(
@@ -1260,15 +1344,22 @@ def _build_data_objects(
                         num_discrete_streams_override=active_stream_count,
                     )
                 )
-            sample_lengths = sample_lengths_by_stream_count[max_active_stream_count]
+            sample_lengths = sample_lengths_by_stream_count[train_max_active_stream_count]
             # Stream count is already sampled and bound to indices by the batch sampler.
             train_collate.random_active_discrete_stream_count = False
         else:
+            deterministic_stream_count_override = None
+            if (
+                train_max_active_stream_count is not None
+                and train_max_active_stream_count == train_min_active_stream_count
+            ):
+                deterministic_stream_count_override = train_max_active_stream_count
             sample_lengths = _estimate_adaptive_lengths_once_per_run(
                 train_dataset,
                 codec_frame_rate_hz=codec_frame_rate_hz,
+                num_discrete_streams_override=deterministic_stream_count_override,
             )
-            if random_active_stream_train and max_active_stream_count is None:
+            if dynamic_stream_train and train_max_active_stream_count is None:
                 print(
                     "[train.py] Random active stream count is enabled but "
                     "data.collate.max_active_discrete_stream_count is null; "
@@ -1314,8 +1405,8 @@ def _build_data_objects(
                 {
                     "sample_lengths_by_stream_count": sample_lengths_by_stream_count,
                     "random_active_discrete_stream_count": True,
-                    "min_active_discrete_stream_count": min_active_stream_count,
-                    "max_active_discrete_stream_count": max_active_stream_count,
+                    "min_active_discrete_stream_count": train_min_active_stream_count,
+                    "max_active_discrete_stream_count": train_max_active_stream_count,
                     "yield_active_discrete_stream_count_with_indices": True,
                 }
             )
@@ -1348,6 +1439,8 @@ def _build_data_objects(
             f"bucket_by_length={bucket_by_length}, "
             f"length_bucket_size={length_bucket_size}, "
             f"seed={sampler_seed}, "
+            f"dynamic_train_streams={dynamic_stream_train}, "
+            f"fixed_train_stream_count={fixed_train_stream_count}, "
             f"prebuilt_stream_schedule={stream_schedule_enabled}."
         )
     else:
