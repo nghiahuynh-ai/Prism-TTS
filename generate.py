@@ -171,6 +171,15 @@ def parse_args() -> argparse.Namespace:
         help="Speech block generation strategy.",
     )
     parser.add_argument(
+        "--active-discrete-streams",
+        type=int,
+        default=None,
+        help=(
+            "Number of discrete streams to actively generate. "
+            "Defaults to all streams available in the prompt."
+        ),
+    )
+    parser.add_argument(
         "--force-silent-special-tokens",
         dest="force_silent_special_tokens",
         action="store_true",
@@ -424,12 +433,36 @@ def main() -> None:
         device=device,
         dtype=torch.long,
     )
+    prompt_discrete_stream_count = int(discrete_prompt.shape[1])
+    requested_active_discrete_streams = (
+        prompt_discrete_stream_count
+        if args.active_discrete_streams is None
+        else int(args.active_discrete_streams)
+    )
+    if (
+        requested_active_discrete_streams < 1
+        or requested_active_discrete_streams > int(model.num_discrete_tokens)
+    ):
+        raise ValueError(
+            "--active-discrete-streams must be in [1, model.num_discrete_tokens]. "
+            f"Got {requested_active_discrete_streams} with model.num_discrete_tokens="
+            f"{int(model.num_discrete_tokens)}."
+        )
+    if requested_active_discrete_streams > prompt_discrete_stream_count:
+        raise ValueError(
+            "--active-discrete-streams exceeds prompt discrete stream count: "
+            f"{requested_active_discrete_streams} > {prompt_discrete_stream_count}."
+        )
     continuous_prompt = raw_prompt_continuous.unsqueeze(0).to(
         device=device,
         dtype=model_dtype,
     )
     text_target = target_text_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
     special_token_ids = (eos_token_id, pad_token_id)
+    print(
+        "[generate.py] active discrete streams: "
+        f"{requested_active_discrete_streams}/{prompt_discrete_stream_count}"
+    )
 
     def _run_generation(
         *,
@@ -462,6 +495,7 @@ def main() -> None:
                 parallel_num_steps=args.parallel_num_steps,
                 generation_method=str(args.generation_method),
                 force_silent_special_tokens=bool(args.force_silent_special_tokens),
+                active_discrete_streams=requested_active_discrete_streams,
                 return_dict=True,
             )
 
@@ -480,7 +514,7 @@ def main() -> None:
             return None
         candidate_stats = generate_utils.summarize_discrete_generation(
             discrete_ids=candidate_generation.discrete_ids[0],
-            num_discrete_tokens=int(model.num_discrete_tokens),
+            num_discrete_tokens=requested_active_discrete_streams,
             special_token_ids=special_token_ids,
         )
         attempt_records.append(
@@ -587,7 +621,7 @@ def main() -> None:
         sample_latents = generate_utils.trim_latent_special_blocks(
             latents=sample_latents,
             discrete_ids=sample_discrete,
-            num_discrete_tokens=int(model.num_discrete_tokens),
+            num_discrete_tokens=requested_active_discrete_streams,
             special_token_ids=special_token_ids,
             trim_head=bool(args.trim_leading_special_blocks),
             trim_tail=bool(args.trim_tail_special_blocks),
