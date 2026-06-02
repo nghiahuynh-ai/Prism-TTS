@@ -12,6 +12,7 @@ from utils.model_utils import PrismTTSGenerationOutput
 
 @dataclass
 class PrismBatch:
+    active_discrete_stream_count: Optional[torch.Tensor] = None
     text_prompt_lengths: Optional[torch.LongTensor] = None
     speech_prompt_lengths: Optional[torch.LongTensor] = None
     text_target_lengths: Optional[torch.LongTensor] = None

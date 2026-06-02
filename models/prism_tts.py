@@ -104,6 +104,10 @@ class PrismTTS(nn.Module):
         self.speech_stream_embeddings = nn.Parameter(
             torch.empty(self.speech_block_size, self.hidden_size)
         )
+        self.active_stream_count_embedding = nn.Embedding(
+            self.num_discrete_tokens + 1,
+            self.hidden_size,
+        )
         self.masked_discrete_embeddings = nn.Parameter(
             torch.empty(self.num_discrete_tokens, self.hidden_size)
         )
@@ -154,6 +158,7 @@ class PrismTTS(nn.Module):
         nn.init.normal_(self.continuous_prior_head.weight, mean=0.0, std=std)
         nn.init.normal_(self.token_type_embeddings, mean=0.0, std=std)
         nn.init.normal_(self.speech_stream_embeddings, mean=0.0, std=std)
+        nn.init.zeros_(self.active_stream_count_embedding.weight)
         nn.init.normal_(self.masked_discrete_embeddings, mean=0.0, std=std)
         nn.init.normal_(self.masked_continuous_embedding, mean=0.0, std=std)
         if self.continuous_proj.bias is not None:
@@ -170,12 +175,10 @@ class PrismTTS(nn.Module):
         self,
         flat: MU.FlatBatch,
         masked_target_blocks: torch.BoolTensor,
+        active_discrete_stream_count: Optional[torch.Tensor | int] = None,
         inject_continuous_noise: bool = False,
     ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
         """Build model input embeddings and masks for masked discrete/continuous targets."""
-        batch_size, seq_len = flat.token_ids.shape
-        device = flat.token_ids.device
-
         is_speech = flat.token_type_ids != MU.TEXT_TOKEN_TYPE
         is_discrete = flat.token_type_ids == MU.SPEECH_DISCRETE_TOKEN_TYPE
         is_continuous = flat.token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE
@@ -249,12 +252,71 @@ class PrismTTS(nn.Module):
                 base_embeds,
             )
 
+        active_stream_count_ids = self._normalize_active_discrete_stream_count(
+            flat=flat,
+            active_discrete_stream_count=active_discrete_stream_count,
+        )
+        active_stream_embeds = self.active_stream_count_embedding(active_stream_count_ids)
+        base_embeds = base_embeds + active_stream_embeds.unsqueeze(1)
+
         return (
             base_embeds,
             masked_discrete_positions,
             masked_continuous_positions,
             masked_target_token_mask,
         )
+
+    def _normalize_active_discrete_stream_count(
+        self,
+        *,
+        flat: MU.FlatBatch,
+        active_discrete_stream_count: Optional[torch.Tensor | int],
+    ) -> torch.LongTensor:
+        batch_size = int(flat.token_ids.shape[0])
+        device = flat.token_ids.device
+        if active_discrete_stream_count is None:
+            discrete_mask = flat.token_type_ids == MU.SPEECH_DISCRETE_TOKEN_TYPE
+            inferred = torch.full(
+                (batch_size,),
+                fill_value=self.num_discrete_tokens,
+                dtype=torch.long,
+                device=device,
+            )
+            if discrete_mask.any():
+                observed_stream_ids = torch.where(
+                    discrete_mask,
+                    flat.speech_stream_ids,
+                    flat.speech_stream_ids.new_full(flat.speech_stream_ids.shape, -1),
+                )
+                has_discrete = discrete_mask.any(dim=1)
+                inferred_stream_count = observed_stream_ids.max(dim=1).values + 1
+                inferred = torch.where(
+                    has_discrete,
+                    inferred_stream_count.clamp(min=1),
+                    inferred,
+                )
+            return inferred
+
+        active_count = torch.as_tensor(
+            active_discrete_stream_count,
+            dtype=torch.long,
+            device=device,
+        )
+        if active_count.dim() == 0:
+            active_count = active_count.repeat(batch_size)
+        elif active_count.dim() == 1 and int(active_count.shape[0]) == 1 and batch_size != 1:
+            active_count = active_count.repeat(batch_size)
+        elif active_count.dim() != 1 or int(active_count.shape[0]) != batch_size:
+            raise ValueError(
+                "active_discrete_stream_count must be scalar or shape [batch]."
+            )
+
+        if ((active_count < 1) | (active_count > self.num_discrete_tokens)).any():
+            raise ValueError(
+                "active_discrete_stream_count must be in "
+                f"[1, {self.num_discrete_tokens}]."
+            )
+        return active_count
 
     def _compute_discrete_loss(
         self,
@@ -645,6 +707,7 @@ class PrismTTS(nn.Module):
         self,
         flat: MU.FlatBatch,
         masked_target_blocks: torch.BoolTensor,
+        active_discrete_stream_count: Optional[torch.Tensor | int] = None,
         attention_mask: Optional[torch.BoolTensor] = None,
         inject_continuous_noise: bool = False,
     ) -> tuple[
@@ -671,6 +734,7 @@ class PrismTTS(nn.Module):
             self._build_inputs_embeds(
                 flat=flat,
                 masked_target_blocks=masked_target_blocks,
+                active_discrete_stream_count=active_discrete_stream_count,
                 inject_continuous_noise=inject_continuous_noise,
             )
         )
@@ -700,6 +764,7 @@ class PrismTTS(nn.Module):
         flat_speech_stream_ids: torch.LongTensor,
         flat_target_block_ids: torch.LongTensor,
         flat_target_block_counts: Optional[torch.LongTensor] = None,
+        active_discrete_stream_count: Optional[torch.Tensor | int] = None,
         attention_mask: Optional[torch.Tensor] = None,
         flow_timesteps: Optional[torch.FloatTensor] = None,
         noise: Optional[torch.FloatTensor] = None,
@@ -740,6 +805,7 @@ class PrismTTS(nn.Module):
         ) = self._encode(
             flat=flat,
             masked_target_blocks=masked_blocks,
+            active_discrete_stream_count=active_discrete_stream_count,
             inject_continuous_noise=True,
         )
 

@@ -130,6 +130,7 @@ def generate_parallel_stable(
         hidden_states, masked_discrete_positions, masked_continuous_positions, _ = model._encode(
             flat=flat,
             masked_target_blocks=masked_blocks,
+            active_discrete_stream_count=num_active_streams,
         )
         batch_indices = (
             torch.arange(batch_size, device=device)

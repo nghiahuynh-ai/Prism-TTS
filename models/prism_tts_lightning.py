@@ -358,6 +358,7 @@ class PrismTTSLightning(pl.LightningModule):
             flat_speech_stream_ids=batch_inputs.flat_speech_stream_ids,
             flat_target_block_ids=batch_inputs.flat_target_block_ids,
             flat_target_block_counts=batch_inputs.flat_target_block_counts,
+            active_discrete_stream_count=batch_inputs.active_discrete_stream_count,
             attention_mask=batch_inputs.attention_mask,
             flow_timesteps=batch_inputs.flow_timesteps,
             noise=batch_inputs.noise,
@@ -391,6 +392,7 @@ class PrismTTSLightning(pl.LightningModule):
         )
         if all(key in batch for key in required):
             return PrismBatch(
+                active_discrete_stream_count=batch.get("active_discrete_stream_count"),
                 text_target=batch["text_target"],
                 discrete_target=batch["discrete_target"],
                 continuous_target=batch["continuous_target"],
@@ -414,6 +416,7 @@ class PrismTTSLightning(pl.LightningModule):
 
         if all(key in batch for key in required_flat):
             return PrismBatch(
+                active_discrete_stream_count=batch.get("active_discrete_stream_count"),
                 attention_mask=batch.get("attention_mask"),
                 flat_token_ids=batch.get("flat_token_ids"),
                 flat_continuous_values=batch.get("flat_continuous_values"),
@@ -432,6 +435,7 @@ class PrismTTSLightning(pl.LightningModule):
                 raise TypeError("`prompt` and `target` must be mappings.")
 
             return PrismBatch(
+                active_discrete_stream_count=batch.get("active_discrete_stream_count"),
                 text_target=target["text"],
                 discrete_target=target["discrete"],
                 continuous_target=target["continuous"],
@@ -466,8 +470,10 @@ class PrismTTSLightning(pl.LightningModule):
         attention_mask = batch[6] if len(batch) > 6 else None
         flow_timesteps = batch[7] if len(batch) > 7 else None
         noise = batch[8] if len(batch) > 8 else None
+        active_discrete_stream_count = batch[9] if len(batch) > 9 else None
 
         return PrismBatch(
+            active_discrete_stream_count=active_discrete_stream_count,
             text_target=batch[0],
             discrete_target=batch[1],
             continuous_target=batch[2],

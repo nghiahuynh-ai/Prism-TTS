@@ -110,3 +110,27 @@ def test_load_model_weights_non_strict_reports_incompatible_keys(tmp_path: Path)
 
     assert removed_key in missing
     assert "unexpected.weight" in unexpected
+
+
+def test_load_model_weights_non_strict_keeps_new_active_stream_embedding_init(
+    tmp_path: Path,
+) -> None:
+    model = _build_tiny_model()
+    source_state = _clone_state_dict(model)
+    removed_key = "active_stream_count_embedding.weight"
+    source_state.pop(removed_key)
+    checkpoint_path = tmp_path / "missing_active_stream_count.ckpt"
+    torch.save(source_state, checkpoint_path)
+
+    reinitialized = _build_tiny_model()
+
+    _, missing, unexpected = load_model_weights(
+        reinitialized,
+        checkpoint_path,
+        use_ema=False,
+        strict=False,
+    )
+
+    assert removed_key in missing
+    assert unexpected == []
+    assert torch.count_nonzero(reinitialized.active_stream_count_embedding.weight).item() == 0

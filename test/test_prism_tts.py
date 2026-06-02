@@ -302,6 +302,66 @@ class TestPrismTTS(unittest.TestCase):
             self.assertGreaterEqual(ratio, 0.0)
             self.assertLess(ratio, 1.0)
 
+    def test_active_stream_count_embedding_conditions_inputs(self) -> None:
+        collate = BatchCollate(
+            discrete_token_count=max(1, int(self.discrete_vocab_size) - 3),
+            random_active_discrete_stream_count=False,
+            fixed_continuous_stream_idx=self.num_discrete_tokens,
+        )
+        sample = {
+            "text_prompt": torch.tensor([1, 2], dtype=torch.long),
+            "discrete_prompt": torch.tensor([[3, 4], [5, 6]], dtype=torch.long),
+            "continuous_prompt": torch.randn(2, self.continuous_latent_size),
+            "text_target": torch.tensor([7], dtype=torch.long),
+            "discrete_target": torch.tensor([[8, 9]], dtype=torch.long),
+            "continuous_target": torch.randn(1, self.continuous_latent_size),
+        }
+        flat_batch = collate([sample])
+        active_k = int(flat_batch["active_discrete_stream_count"].item())
+        self.assertEqual(active_k, 2)
+
+        flat = prism_tts_module.MU.build_flat_batch_from_collate(
+            flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
+            flat_continuous_values=flat_batch["flat_continuous_values"].to(self.device),
+            flat_token_type_ids=flat_batch["flat_token_type_ids"].to(self.device),
+            flat_speech_stream_ids=flat_batch["flat_speech_stream_ids"].to(self.device),
+            flat_target_block_ids=flat_batch["flat_target_block_ids"].to(self.device),
+            flat_target_block_counts=flat_batch["flat_target_block_counts"].to(self.device),
+            attention_mask=flat_batch["attention_mask"].to(self.device),
+            continuous_latent_size=self.continuous_latent_size,
+        )
+        masked_target_blocks = torch.zeros(
+            (1, int(flat.target_block_counts.max().item())),
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            original = self.model.active_stream_count_embedding.weight.detach().clone()
+            try:
+                self.model.active_stream_count_embedding.weight.zero_()
+                baseline_embeds, *_ = self.model._build_inputs_embeds(
+                    flat=flat,
+                    masked_target_blocks=masked_target_blocks,
+                    active_discrete_stream_count=flat_batch["active_discrete_stream_count"].to(
+                        self.device
+                    ),
+                )
+                self.model.active_stream_count_embedding.weight.zero_()
+                self.model.active_stream_count_embedding.weight[active_k].fill_(0.25)
+                conditioned_embeds, *_ = self.model._build_inputs_embeds(
+                    flat=flat,
+                    masked_target_blocks=masked_target_blocks,
+                    active_discrete_stream_count=flat_batch["active_discrete_stream_count"].to(
+                        self.device
+                    ),
+                )
+            finally:
+                self.model.active_stream_count_embedding.weight.copy_(original)
+
+        diff = conditioned_embeds - baseline_embeds
+        self.assertTrue(torch.allclose(diff, torch.full_like(diff, 0.25)))
+
     def test_generate_supports_active_discrete_streams(self) -> None:
         batch_size = 1
         prompt_len = 2

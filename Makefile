@@ -24,6 +24,8 @@ endif
 
 CKPT ?=
 PRETRAINED ?=
+PRETRAINED_USE_EMA ?= false
+PRETRAINED_STRICT ?= false
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
@@ -93,6 +95,16 @@ endif
 
 ifneq ($(strip $(PRETRAINED)),)
 PRETRAINED_ARG := --pretrained-path $(PRETRAINED)
+ifeq ($(strip $(PRETRAINED_USE_EMA)),true)
+PRETRAINED_ARG += --pretrained-use-ema
+else
+PRETRAINED_ARG += --pretrained-no-ema
+endif
+ifeq ($(strip $(PRETRAINED_STRICT)),true)
+PRETRAINED_ARG += --pretrained-strict
+else
+PRETRAINED_ARG += --pretrained-non-strict
+endif
 else
 PRETRAINED_ARG :=
 endif
@@ -111,6 +123,8 @@ help:
 	@echo "Common overrides:"
 	@echo "  CKPT=<path>            Add --ckpt-path (resume Lightning trainer state)"
 	@echo "  PRETRAINED=<path>      Add --pretrained-path (model weights only)"
+	@echo "  PRETRAINED_USE_EMA=... Toggle EMA when PRETRAINED is set (default: false)"
+	@echo "  PRETRAINED_STRICT=...  Toggle strict pretrained loading (default: false)"
 	@echo "  EXPERIMENT=<name>      Use config/<name>.yaml as experiment config"
 	@echo "  EXPERIMENT_CONFIG=...  Override experiment config"
 	@echo "  TRAINER_CONFIG=...     Override trainer config"
