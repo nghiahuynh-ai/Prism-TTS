@@ -13,6 +13,7 @@ from transformers import LlamaConfig
 
 from dataset.dataset import SharedVocabTokenizer
 from models.prism_tts import PrismTTS
+from utils.checkpoint_utils import load_model_weights
 
 try:
     import yaml
@@ -109,52 +110,18 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
     )
 
 
-def _extract_model_state_dict(
-    checkpoint_payload: dict[str, Any],
-    *,
-    use_ema: bool,
-) -> dict[str, torch.Tensor]:
-    if use_ema:
-        ema_state = checkpoint_payload.get("ema_state")
-        if isinstance(ema_state, dict) and ema_state:
-            return dict(ema_state)
-
-    state_dict = checkpoint_payload.get("state_dict")
-    if isinstance(state_dict, dict) and state_dict:
-        stripped: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if key.startswith("model."):
-                stripped[key[len("model.") :]] = value
-            else:
-                stripped[key] = value
-        return stripped
-
-    if checkpoint_payload and all(isinstance(key, str) for key in checkpoint_payload):
-        if all(torch.is_tensor(value) for value in checkpoint_payload.values()):
-            return dict(checkpoint_payload)
-
-    raise ValueError("Unable to find a model state dict in checkpoint payload.")
-
-
 def load_checkpoint(
     model: PrismTTS,
     checkpoint_path: Path,
     *,
     use_ema: bool,
 ) -> None:
-    resolved = checkpoint_path.expanduser()
-    if not resolved.is_absolute():
-        resolved = Path.cwd() / resolved
-    resolved = resolved.resolve()
-    if not resolved.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {resolved}")
-
-    payload = torch.load(resolved, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError(f"Unsupported checkpoint payload type: {type(payload).__name__}.")
-
-    state_dict = _extract_model_state_dict(payload, use_ema=use_ema)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    _, missing, unexpected = load_model_weights(
+        model,
+        checkpoint_path,
+        use_ema=use_ema,
+        strict=False,
+    )
     if missing:
         missing_preview = ", ".join(missing[:10])
         raise RuntimeError(f"Missing model keys ({len(missing)}): {missing_preview}")

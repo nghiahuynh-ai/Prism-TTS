@@ -29,6 +29,7 @@ from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism
 from dataset.dataset import BatchCollate, PrismDataset, build_shared_token_layout
 from models.prism_tts import PrismTTS
 from models.prism_tts_lightning import PrismTTSLightning
+from utils.checkpoint_utils import load_model_weights
 
 try:
     import lightning.pytorch as pl
@@ -94,7 +95,43 @@ def parse_args() -> argparse.Namespace:
         "--ckpt-path",
         type=str,
         default=None,
-        help="Checkpoint path to resume from for fit/validate/test.",
+        help="Lightning checkpoint path to resume trainer/model state for fit/validate/test.",
+    )
+    parser.add_argument(
+        "--pretrained-path",
+        type=str,
+        default=None,
+        help=(
+            "Model checkpoint or state_dict path used only to initialize weights for a fresh "
+            "training/validation run. Unlike --ckpt-path, this does not restore optimizer, "
+            "scheduler, or trainer progress."
+        ),
+    )
+    parser.add_argument(
+        "--pretrained-use-ema",
+        dest="pretrained_use_ema",
+        action="store_true",
+        default=None,
+        help="When loading --pretrained-path, prefer EMA weights when available.",
+    )
+    parser.add_argument(
+        "--pretrained-no-ema",
+        dest="pretrained_use_ema",
+        action="store_false",
+        help="When loading --pretrained-path, disable EMA and load regular weights.",
+    )
+    parser.add_argument(
+        "--pretrained-strict",
+        dest="pretrained_strict",
+        action="store_true",
+        default=None,
+        help="Require pretrained weights to match model keys exactly.",
+    )
+    parser.add_argument(
+        "--pretrained-non-strict",
+        dest="pretrained_strict",
+        action="store_false",
+        help="Allow missing or unexpected model keys when loading pretrained weights.",
     )
     parser.add_argument(
         "--validate-only",
@@ -277,6 +314,33 @@ def _apply_wandb_cli_overrides(config: dict[str, Any], args: argparse.Namespace)
         logger_cfg["group"] = args.wandb_group
     if args.wandb_tags is not None:
         logger_cfg["tags"] = [tag.strip() for tag in args.wandb_tags.split(",") if tag.strip()]
+
+
+def _apply_pretrained_cli_overrides(config: dict[str, Any], args: argparse.Namespace) -> None:
+    if (
+        args.pretrained_path is None
+        and args.pretrained_use_ema is None
+        and args.pretrained_strict is None
+    ):
+        return
+
+    trainer_cfg = _require_mapping(config, "trainer")
+    pretrained_cfg_raw = trainer_cfg.get("pretrained_init")
+    pretrained_cfg: dict[str, Any]
+    if pretrained_cfg_raw is None:
+        pretrained_cfg = {}
+        trainer_cfg["pretrained_init"] = pretrained_cfg
+    elif isinstance(pretrained_cfg_raw, dict):
+        pretrained_cfg = pretrained_cfg_raw
+    else:
+        raise ValueError("trainer.pretrained_init must be a mapping when provided.")
+
+    if args.pretrained_path is not None:
+        pretrained_cfg["path"] = args.pretrained_path
+    if args.pretrained_use_ema is not None:
+        pretrained_cfg["use_ema"] = bool(args.pretrained_use_ema)
+    if args.pretrained_strict is not None:
+        pretrained_cfg["strict"] = bool(args.pretrained_strict)
 
 
 @dataclass
@@ -702,6 +766,43 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
         raise ValueError(
             f"model.llama_config.eos_token_id must equal data shared eos token id ({eos_id})."
         )
+
+
+def _resolve_pretrained_init(config: dict[str, Any]) -> tuple[str | None, bool, bool]:
+    trainer_cfg = _require_mapping(config, "trainer")
+    pretrained_cfg_raw = trainer_cfg.get("pretrained_init")
+    if pretrained_cfg_raw is None:
+        return None, False, True
+    if not isinstance(pretrained_cfg_raw, dict):
+        raise ValueError("trainer.pretrained_init must be a mapping when provided.")
+
+    return (
+        _maybe_str(pretrained_cfg_raw.get("path")),
+        bool(pretrained_cfg_raw.get("use_ema", False)),
+        bool(pretrained_cfg_raw.get("strict", True)),
+    )
+
+
+def _initialize_model_from_pretrained(config: dict[str, Any], model: PrismTTS) -> None:
+    pretrained_path, use_ema, strict = _resolve_pretrained_init(config)
+    if pretrained_path is None:
+        return
+
+    resolved_path, missing, unexpected = load_model_weights(
+        model,
+        pretrained_path,
+        use_ema=use_ema,
+        strict=strict,
+    )
+    print(
+        "[train.py] initialized model weights from "
+        f"{resolved_path} (use_ema={use_ema}, strict={strict}, "
+        f"missing_keys={len(missing)}, unexpected_keys={len(unexpected)})"
+    )
+    if missing:
+        print(f"[train.py] ignored missing pretrained keys: {', '.join(missing[:10])}")
+    if unexpected:
+        print(f"[train.py] ignored unexpected pretrained keys: {', '.join(unexpected[:10])}")
 
 
 def _build_model(config: dict[str, Any]) -> PrismTTS:
@@ -1827,6 +1928,16 @@ def run(args: argparse.Namespace) -> None:
             "'backend:cudaMallocAsync' to avoid NVML-related allocator assertions."
         )
     _apply_wandb_cli_overrides(config, args)
+    _apply_pretrained_cli_overrides(config, args)
+
+    pretrained_path, _, _ = _resolve_pretrained_init(config)
+    if args.ckpt_path is not None and pretrained_path is not None:
+        raise ValueError(
+            "Cannot combine --ckpt-path with pretrained initialization. "
+            "Use --ckpt-path to resume Lightning trainer progress, or use "
+            "trainer.pretrained_init.path/--pretrained-path to start a new run from "
+            "model weights only."
+        )
 
     _validate_config_consistency(config)
     _apply_distributed_training_config(config)
@@ -1840,6 +1951,7 @@ def run(args: argparse.Namespace) -> None:
 
     train_loader, val_loader, test_loader = _build_data_objects(config)
     model = _build_model(config)
+    _initialize_model_from_pretrained(config, model)
     lightning_module = _build_lightning_module(config, model=model)
 
     logger = _build_logger(_require_mapping(trainer_cfg, "logger"))

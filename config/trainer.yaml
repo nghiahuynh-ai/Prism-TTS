@@ -3,6 +3,13 @@
 trainer:
   seed: null
   seed_workers: true
+  pretrained_init:
+    # Model-only initialization for continual training or downstream finetuning.
+    # This is distinct from --ckpt-path / Trainer.fit(..., ckpt_path=...), which
+    # resumes Lightning trainer state such as optimizer, scheduler, and step progress.
+    path: null
+    use_ema: false
+    strict: true
 
   lightning_module:
     learning_rate: 1.0e-4

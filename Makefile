@@ -23,6 +23,7 @@ EXPERIMENT_CONFIG ?= config/experiment.yaml
 endif
 
 CKPT ?=
+PRETRAINED ?=
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
@@ -90,6 +91,12 @@ else
 CKPT_ARG :=
 endif
 
+ifneq ($(strip $(PRETRAINED)),)
+PRETRAINED_ARG := --pretrained-path $(PRETRAINED)
+else
+PRETRAINED_ARG :=
+endif
+
 help:
 	@echo "Prism-TTS workflow automation"
 	@echo ""
@@ -102,7 +109,8 @@ help:
 	@echo "  make generate   - Generate samples (TBD until generate.py is implemented)"
 	@echo ""
 	@echo "Common overrides:"
-	@echo "  CKPT=<path>            Add --ckpt-path"
+	@echo "  CKPT=<path>            Add --ckpt-path (resume Lightning trainer state)"
+	@echo "  PRETRAINED=<path>      Add --pretrained-path (model weights only)"
 	@echo "  EXPERIMENT=<name>      Use config/<name>.yaml as experiment config"
 	@echo "  EXPERIMENT_CONFIG=...  Override experiment config"
 	@echo "  TRAINER_CONFIG=...     Override trainer config"
@@ -143,7 +151,7 @@ train:
 	export PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE="$(PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE)"; \
 	export PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES="$(PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES)"; \
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) $(CKPT_ARG) $(TRAIN_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) $(PRETRAINED_ARG) $(CKPT_ARG) $(TRAIN_ARGS)
 
 validate:
 	@unset LOCAL_RANK RANK WORLD_SIZE NODE_RANK; \
@@ -155,7 +163,7 @@ validate:
 	export PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE="$(PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE)"; \
 	export PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES="$(PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES)"; \
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --validate-only $(CKPT_ARG) $(VALIDATE_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --validate-only $(PRETRAINED_ARG) $(CKPT_ARG) $(VALIDATE_ARGS)
 
 test:
 	@if [ -z "$(CKPT)" ]; then \
@@ -170,7 +178,7 @@ test:
 	export PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE="$(PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE)"; \
 	export PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES="$(PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES)"; \
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --test-after-fit $(CKPT_ARG) $(TEST_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --test-after-fit $(PRETRAINED_ARG) $(CKPT_ARG) $(TEST_ARGS)
 
 unit-test:
 	$(PYTHON) -m pytest test $(PYTEST_ARGS)
