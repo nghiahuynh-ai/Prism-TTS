@@ -32,11 +32,11 @@ trainer:
     sync_dist_logging: false
 
   distributed:
-    enabled: false
+    enabled: true
     accelerator: gpu
     devices: auto
     gpu_indices: null
-    strategy: ddp_find_unused_parameters_false
+    strategy: ddp_find_unused_parameters_true
     num_nodes: 1
     sync_dist_logging: true
 
@@ -69,6 +69,8 @@ trainer:
     enable_checkpointing: true
     enable_progress_bar: true
     enable_model_summary: true
+    # Require when train DataLoader uses adaptive batch_sampler / precomputed rank batches
+    use_distributed_sampler: false
 
   checkpoint:
     dirpath: checkpoints

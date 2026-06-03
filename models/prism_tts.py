@@ -786,7 +786,7 @@ class PrismTTS(nn.Module):
 
         if mask_ratio is None:
             # Default training behavior: sample mask ratio uniformly per forward pass.
-            effective_mask_ratio = 1 - float(torch.rand((), device=flat.token_ids.device).item())**2
+            effective_mask_ratio = float(torch.rand((), device=flat.token_ids.device).item())
         else:
             effective_mask_ratio = float(mask_ratio)
             if not (0.0 <= effective_mask_ratio <= 1.0):

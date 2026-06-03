@@ -33,11 +33,11 @@ data:
       # null -> derive from train_batch_size and a reference sequence-length quantile.
       memory_budget: null
       # Optional direct target in "cost units"; overrides utilization*memory_budget.
-      target_batch_cost: 30000000
+      target_batch_cost: 40000000
       # Quantile used when deriving memory_budget automatically.
       reference_length_quantile: 0.95
       # Upper bound for dynamic batch size (allows adding samples when memory is underused).
-      max_batch_size: 64
+      max_batch_size: 128
       # Group nearby lengths before greedy cost packing to reduce pad waste.
       bucket_by_length: true
       # Optional bucket size for length bucketing; null -> auto (~8 * max_batch_size, min 512).
@@ -70,7 +70,7 @@ data:
     # Train stream mode:
     # - true: sample K per train batch and keep the first K discrete streams.
     # - false: always train with a fixed K discrete streams.
-    dynamic_active_discrete_stream_count_train: true
+    dynamic_active_discrete_stream_count_train: false
     # Used when dynamic_active_discrete_stream_count_train=false.
     # null -> fallback to max_active_discrete_stream_count, then data.dataset.discrete_stream_count.
     fixed_active_discrete_stream_count_train: null
