@@ -13,10 +13,10 @@ experiment:
   # experiment-specific values here.
   trainer:
     logger:
-      name: mask-5fixed
+      name: mask
 
     checkpoint:
-      dirpath: checkpoints/mask-5fixed
+      dirpath: checkpoints/mask
 
     # distributed:
     #   enabled: true

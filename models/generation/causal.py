@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -26,7 +26,6 @@ def generate_causal(
     top_k: int,
     top_p: float,
     do_sample: bool,
-    flow_num_steps: Optional[int],
     parallel_num_steps: int,
     special_discrete_token_ids: tuple[int, ...],
     active_discrete_streams: int,
@@ -169,27 +168,7 @@ def generate_causal(
             prior_prediction = model.continuous_prior_head(continuous_hidden)
             continuous_batch_idx = batch_indices[step_continuous_positions]
             predicted_prior[continuous_batch_idx, step_idx, :] = prior_prediction
-            denoise_step_mask = torch.zeros(
-                (batch_size, step_idx + 1),
-                dtype=torch.bool,
-                device=device,
-            )
-            denoise_step_mask[continuous_batch_idx, step_idx] = True
-            denoised_step_context = model._sample_continuous_with_clean_context(
-                prior_target=predicted_prior[:, : step_idx + 1, :],
-                clean_target=predicted_continuous[:, : step_idx + 1, :],
-                denoise_target_mask=denoise_step_mask,
-                valid_target_mask=valid_target_mask[:, : step_idx + 1],
-                prompt_latents=continuous_prompt,
-                prompt_lengths=speech_prompt_lengths,
-                num_steps=flow_num_steps,
-                temperature=temperature,
-            )
-            predicted_continuous[continuous_batch_idx, step_idx, :] = denoised_step_context[
-                continuous_batch_idx,
-                step_idx,
-                :,
-            ]
+            predicted_continuous[continuous_batch_idx, step_idx, :] = prior_prediction
 
             if len(special_discrete_token_ids) > 0:
                 step_discrete = predicted_discrete[continuous_batch_idx, step_idx, :]

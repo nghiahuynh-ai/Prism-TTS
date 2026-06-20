@@ -3,7 +3,6 @@ from __future__ import annotations
 from functools import lru_cache
 import sys
 import unittest
-from unittest import mock
 from pathlib import Path
 
 import torch
@@ -84,10 +83,6 @@ class TestPrismTTS(unittest.TestCase):
             num_discrete_tokens=cls.num_discrete_tokens,
             discrete_vocab_size=cls.discrete_vocab_size,
             continuous_latent_size=cls.continuous_latent_size,
-            flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
-            flow_model_channels=prism_cfg.get("flow_model_channels"),
-            flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
-            flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
         ).to(cls.device)
         cls.model_num_params = sum(p.numel() for p in cls.model.parameters())
         cls._print_model_summary()
@@ -194,10 +189,9 @@ class TestPrismTTS(unittest.TestCase):
         self.assertIsNotNone(outputs.loss)
         self.assertIsNotNone(outputs.discrete_loss)
         self.assertIsNotNone(outputs.continuous_loss)
-        self.assertIsNotNone(outputs.flow_loss)
         self.assertEqual(
             tuple(outputs.keys()),
-            ("loss", "discrete_loss", "continuous_loss", "flow_loss"),
+            ("loss", "discrete_loss", "continuous_loss"),
         )
 
     def test_forward_samples_mask_ratio_from_zero_to_one_when_unspecified(self):
@@ -506,7 +500,6 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             num_discrete_tokens=self.num_discrete_tokens,
             discrete_vocab_size=self.discrete_vocab_size,
             continuous_latent_size=self.continuous_latent_size,
-            flow_sample_steps=2,
         ).to(self.device)
         self.model.eval()
 
@@ -1035,7 +1028,6 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             continuous_latent_size=8,
             discrete_regular_token_loss_weight=1.0,
             discrete_special_token_loss_weight=0.05,
-            flow_sample_steps=2,
         ).to(self.device)
         model.eval()
 
@@ -1308,7 +1300,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             )
         )
 
-    def test_generation_uses_continuous_prompt_as_flow_prefix_context(self) -> None:
+    def test_generation_uses_backbone_prior_for_continuous_latents(self) -> None:
         batch_size = 1
         prompt_len = 3
         generated_len = 3
@@ -1338,41 +1330,34 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
             (batch_size, generated_len),
             device=self.device,
         )
-        speech_prompt_lengths = torch.tensor([prompt_len - 1], dtype=torch.long, device=self.device)
 
         for generation_method in ("causal", "parallel", "parallel_stable"):
             with torch.no_grad():
-                with mock.patch.object(
-                    self.model,
-                    "_sample_continuous_with_clean_context",
-                    wraps=self.model._sample_continuous_with_clean_context,
-                ) as flow_sampler_spy:
-                    _ = self.model.generate(
-                        text_prompt=text_prompt,
-                        discrete_prompt=discrete_prompt,
-                        continuous_prompt=continuous_prompt,
-                        text_target=text_target,
-                        speech_prompt_lengths=speech_prompt_lengths,
-                        max_new_blocks=generated_len,
-                        generation_method=generation_method,
-                        parallel_num_steps=2,
-                        flow_num_steps=2,
-                        do_sample=False,
-                        return_dict=True,
-                    )
+                outputs = self.model.generate(
+                    text_prompt=text_prompt,
+                    discrete_prompt=discrete_prompt,
+                    continuous_prompt=continuous_prompt,
+                    text_target=text_target,
+                    max_new_blocks=generated_len,
+                    generation_method=generation_method,
+                    parallel_num_steps=2,
+                    do_sample=False,
+                    discrete_eos_token_id=-1,
+                    return_dict=True,
+                )
 
-            self.assertGreater(
-                flow_sampler_spy.call_count,
-                0,
-                msg=f"Expected flow sampler calls for generation method '{generation_method}'.",
+            self.assertTrue(
+                torch.allclose(
+                    outputs.continuous_latents,
+                    outputs.prior_latents,
+                    atol=1e-5,
+                    rtol=1e-5,
+                ),
+                msg=(
+                    "Expected continuous latents to come directly from the "
+                    f"backbone prior for generation method '{generation_method}'."
+                ),
             )
-            for call in flow_sampler_spy.call_args_list:
-                prompt_latents = call.kwargs.get("prompt_latents")
-                prompt_lengths = call.kwargs.get("prompt_lengths")
-                self.assertIsNotNone(prompt_latents)
-                self.assertIsNotNone(prompt_lengths)
-                self.assertTrue(torch.equal(prompt_lengths, speech_prompt_lengths))
-                self.assertTrue(torch.allclose(prompt_latents, continuous_prompt))
 
     def test_special_discrete_blocks_produce_silent_continuous_latents(self) -> None:
         batch_size = 1

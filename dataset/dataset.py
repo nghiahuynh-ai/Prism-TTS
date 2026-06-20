@@ -725,8 +725,6 @@ class BatchCollate:
                 False,
             ).to(dtype=torch.bool)
 
-        self._collate_optional_1d(samples, collated, key="flow_timesteps", pad_value=0.0)
-        self._collate_optional_2d(samples, collated, key="noise", pad_value=0.0)
         return collated
 
     def _resolve_active_discrete_stream_count(
@@ -824,20 +822,6 @@ class BatchCollate:
                 "BatchCollate now builds pad-only attention masks from concatenated parts."
             )
 
-        if "flow_timesteps" in sample and sample["flow_timesteps"] is not None:
-            flow_timesteps = sample["flow_timesteps"]
-            if not isinstance(flow_timesteps, torch.Tensor) or flow_timesteps.dim() != 1:
-                raise ValueError("flow_timesteps must be a 1D torch.Tensor when provided.")
-            normalized["flow_timesteps"] = flow_timesteps
-
-        if "noise" in sample and sample["noise"] is not None:
-            noise = sample["noise"]
-            if not isinstance(noise, torch.Tensor) or noise.dim() != 2:
-                raise ValueError("noise must be a 2D torch.Tensor when provided.")
-            if noise.shape[1] != continuous_target.shape[1]:
-                raise ValueError("noise channel size must match continuous_target channel size.")
-            normalized["noise"] = noise
-
         return normalized
 
     def _has_terminal_target_eos_block(self, sample: Mapping[str, torch.Tensor]) -> bool:
@@ -877,18 +861,6 @@ class BatchCollate:
         extended = dict(sample)
         extended["discrete_target"] = torch.cat([discrete_target, eos_discrete], dim=0)
         extended["continuous_target"] = torch.cat([continuous_target, eos_continuous], dim=0)
-
-        flow_timesteps = sample.get("flow_timesteps")
-        if flow_timesteps is not None:
-            extended["flow_timesteps"] = torch.cat(
-                [flow_timesteps, flow_timesteps.new_zeros((1,))],
-                dim=0,
-            )
-
-        noise = sample.get("noise")
-        if noise is not None:
-            eos_noise = noise.new_zeros((1, int(noise.shape[1])))
-            extended["noise"] = torch.cat([noise, eos_noise], dim=0)
 
         return extended
 
@@ -1037,31 +1009,3 @@ class BatchCollate:
             "attention_mask": torch.ones(seq_len, dtype=torch.bool),
             "summary": summary,
         }
-
-    @staticmethod
-    def _collate_optional_1d(
-        samples: Sequence[dict[str, torch.Tensor]],
-        output: dict[str, torch.Tensor],
-        key: str,
-        pad_value: float,
-    ) -> None:
-        presence = [key in sample for sample in samples]
-        if not any(presence):
-            return
-        if not all(presence):
-            raise ValueError(f"{key} must be provided for all samples or for none.")
-        output[key] = _pad_1d([sample[key] for sample in samples], pad_value)
-
-    @staticmethod
-    def _collate_optional_2d(
-        samples: Sequence[dict[str, torch.Tensor]],
-        output: dict[str, torch.Tensor],
-        key: str,
-        pad_value: float,
-    ) -> None:
-        presence = [key in sample for sample in samples]
-        if not any(presence):
-            return
-        if not all(presence):
-            raise ValueError(f"{key} must be provided for all samples or for none.")
-        output[key] = _pad_2d([sample[key] for sample in samples], pad_value)

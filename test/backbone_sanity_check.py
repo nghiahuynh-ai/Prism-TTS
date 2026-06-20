@@ -98,12 +98,6 @@ def parse_args() -> argparse.Namespace:
         help="Override generated block length. Defaults to aligned GT target length.",
     )
     parser.add_argument(
-        "--flow-num-steps",
-        type=int,
-        default=1,
-        help="Flow sampling steps during generation (1 is fastest for backbone-only checks).",
-    )
-    parser.add_argument(
         "--preview-blocks",
         type=int,
         default=32,
@@ -613,7 +607,6 @@ def main() -> None:
             top_k=1,
             top_p=1.0,
             do_sample=False,
-            flow_num_steps=int(args.flow_num_steps),
             force_silent_special_tokens=True,
             return_dict=True,
         )
@@ -669,7 +662,6 @@ def main() -> None:
             "seed": args.seed,
             "use_ema": bool(args.use_ema),
             "max_new_blocks": int(max_new_blocks),
-            "flow_num_steps": int(args.flow_num_steps),
             "num_discrete_tokens": int(model.num_discrete_tokens),
             "evaluated_discrete_streams": int(predicted_discrete.shape[1]),
             "continuous_latent_size": int(model.continuous_latent_size),

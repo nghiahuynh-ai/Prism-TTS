@@ -34,7 +34,6 @@ class PrismTTSOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     discrete_loss: Optional[torch.Tensor] = None
     continuous_loss: Optional[torch.Tensor] = None
-    flow_loss: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -827,40 +826,6 @@ def sample_discrete_ids(
     sample_shape = probs.shape[:-1]
     samples = torch.multinomial(probs.reshape(-1, probs.shape[-1]), num_samples=1)
     return samples.reshape(*sample_shape)
-
-
-def inject_continuous_backbone_noise(
-    clean_latents: torch.FloatTensor,
-) -> torch.FloatTensor:
-    """Inject random noise into continuous latents before backbone conditioning."""
-    k = torch.rand(
-        (*clean_latents.shape[:-1], 1),
-        device=clean_latents.device,
-        dtype=clean_latents.dtype,
-    )
-    e = torch.randn_like(clean_latents)
-    return torch.sqrt(k) * e + torch.sqrt(1.0 - k) * clean_latents
-
-
-def sample_flow_training_inputs(
-    continuous_targets: torch.FloatTensor,
-    flow_timesteps: Optional[torch.FloatTensor] = None,
-    noise: Optional[torch.FloatTensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample flow-matching mixtures and denoising targets for continuous latents."""
-    if flow_timesteps is None:
-        flow_timesteps = torch.rand(
-            continuous_targets.shape[:-1],
-            device=continuous_targets.device,
-            dtype=continuous_targets.dtype,
-        )
-    if noise is None:
-        noise = torch.randn_like(continuous_targets)
-
-    t = flow_timesteps.unsqueeze(-1)
-    flow_inputs = (1.0 - t) * noise + t * continuous_targets
-    flow_target = continuous_targets - noise
-    return flow_inputs, flow_target, flow_timesteps
 
 
 def get_time_shifted_steps(

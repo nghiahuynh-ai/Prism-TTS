@@ -29,9 +29,6 @@ def _build_tiny_model() -> PrismTTS:
         num_discrete_tokens=2,
         discrete_vocab_size=16,
         continuous_latent_size=8,
-        flow_num_res_blocks=1,
-        flow_model_channels=32,
-        flow_sample_steps=2,
         parallel_sample_steps=2,
     )
 

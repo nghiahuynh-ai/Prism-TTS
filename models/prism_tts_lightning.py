@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -37,7 +37,7 @@ except ModuleNotFoundError:
 
 
 SchedulerFactory = Callable[[torch.optim.Optimizer], Any]
-AudioDecoder = Callable[[torch.FloatTensor], torch.Tensor | np.ndarray]
+AudioDecoder = Callable[[torch.FloatTensor], Union[torch.Tensor, np.ndarray]]
 
 PrismBatch = LU.PrismBatch
 PeriodicEvalSample = LU.PeriodicEvalSample
@@ -197,15 +197,6 @@ class PrismTTSLightning(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
-        self.log(
-            "train/flow_loss",
-            outputs.flow_loss,
-            prog_bar=False,
-            on_step=True,
-            on_epoch=True,
-            batch_size=batch_size,
-            sync_dist=self.sync_dist_logging,
-        )
 
         discrete_ppl = torch.exp(outputs.discrete_loss.detach().clamp(max=20.0))
         self.log(
@@ -259,15 +250,6 @@ class PrismTTSLightning(pl.LightningModule):
         self.log(
             "val/continuous_loss",
             outputs.continuous_loss,
-            prog_bar=False,
-            on_step=False,
-            on_epoch=True,
-            batch_size=batch_size,
-            sync_dist=self.sync_dist_logging,
-        )
-        self.log(
-            "val/flow_loss",
-            outputs.flow_loss,
             prog_bar=False,
             on_step=False,
             on_epoch=True,
@@ -360,8 +342,6 @@ class PrismTTSLightning(pl.LightningModule):
             flat_target_block_counts=batch_inputs.flat_target_block_counts,
             active_discrete_stream_count=batch_inputs.active_discrete_stream_count,
             attention_mask=batch_inputs.attention_mask,
-            flow_timesteps=batch_inputs.flow_timesteps,
-            noise=batch_inputs.noise,
             return_dict=True,
         )
 
@@ -410,8 +390,6 @@ class PrismTTSLightning(pl.LightningModule):
                 flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
-                flow_timesteps=batch.get("flow_timesteps"),
-                noise=batch.get("noise"),
             )
 
         if all(key in batch for key in required_flat):
@@ -424,8 +402,6 @@ class PrismTTSLightning(pl.LightningModule):
                 flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
-                flow_timesteps=batch.get("flow_timesteps"),
-                noise=batch.get("noise"),
             )
 
         if "prompt" in batch and "target" in batch:
@@ -447,8 +423,6 @@ class PrismTTSLightning(pl.LightningModule):
                 text_target_lengths=batch.get("text_target_lengths"),
                 speech_target_lengths=batch.get("speech_target_lengths"),
                 attention_mask=batch.get("attention_mask"),
-                flow_timesteps=batch.get("flow_timesteps"),
-                noise=batch.get("noise"),
             )
 
         raise KeyError(
@@ -468,9 +442,7 @@ class PrismTTSLightning(pl.LightningModule):
             )
 
         attention_mask = batch[6] if len(batch) > 6 else None
-        flow_timesteps = batch[7] if len(batch) > 7 else None
-        noise = batch[8] if len(batch) > 8 else None
-        active_discrete_stream_count = batch[9] if len(batch) > 9 else None
+        active_discrete_stream_count = batch[7] if len(batch) > 7 else None
 
         return PrismBatch(
             active_discrete_stream_count=active_discrete_stream_count,
@@ -481,8 +453,6 @@ class PrismTTSLightning(pl.LightningModule):
             discrete_prompt=batch[4],
             continuous_prompt=batch[5],
             attention_mask=attention_mask,
-            flow_timesteps=flow_timesteps,
-            noise=noise,
         )
 
     def _current_lr(self) -> Optional[float]:

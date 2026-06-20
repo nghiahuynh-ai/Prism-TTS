@@ -152,12 +152,6 @@ def parse_args() -> argparse.Namespace:
         help="Enable stochastic sampling for discrete IDs.",
     )
     parser.add_argument(
-        "--flow-num-steps",
-        type=int,
-        default=64,
-        help="Override flow sampling steps for continuous latents.",
-    )
-    parser.add_argument(
         "--parallel-num-steps",
         type=int,
         default=64,
@@ -491,7 +485,6 @@ def main() -> None:
                 top_k=top_k,
                 top_p=top_p,
                 do_sample=do_sample,
-                flow_num_steps=args.flow_num_steps,
                 parallel_num_steps=args.parallel_num_steps,
                 generation_method=str(args.generation_method),
                 force_silent_special_tokens=bool(args.force_silent_special_tokens),

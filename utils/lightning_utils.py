@@ -30,8 +30,6 @@ class PrismBatch:
     flat_speech_stream_ids: Optional[torch.LongTensor] = None
     flat_target_block_ids: Optional[torch.LongTensor] = None
     flat_target_block_counts: Optional[torch.LongTensor] = None
-    flow_timesteps: Optional[torch.FloatTensor] = None
-    noise: Optional[torch.FloatTensor] = None
 
 
 @dataclass

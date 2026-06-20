@@ -90,16 +90,6 @@ def _normalize_split_sample(sample: Mapping[str, Any]) -> dict[str, torch.Tensor
         attention_mask = _to_bool_1d(sample["attention_mask"], "attention_mask")
         normalized["attention_mask"] = attention_mask
 
-    if "flow_timesteps" in sample and sample["flow_timesteps"] is not None:
-        flow_timesteps = _to_float_1d(sample["flow_timesteps"], "flow_timesteps")
-        normalized["flow_timesteps"] = flow_timesteps
-
-    if "noise" in sample and sample["noise"] is not None:
-        noise = _to_float_2d(sample["noise"], "noise")
-        if noise.shape[1] != continuous_target.shape[1]:
-            raise ValueError("noise channel size must match continuous_target channel size.")
-        normalized["noise"] = noise
-
     return normalized
 
 

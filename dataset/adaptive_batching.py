@@ -6,7 +6,7 @@ import random
 from concurrent.futures import ProcessPoolExecutor
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Union
 
 from torch.utils.data import Sampler
 
@@ -464,7 +464,7 @@ def estimate_prism_sample_lengths(
     )
 
 
-class AdaptiveMemoryBatchSampler(Sampler[list[int] | list[tuple[int, int]]]):
+class AdaptiveMemoryBatchSampler(Sampler[Union[list[int], list[tuple[int, int]]]]):
     """
     Variable-size batch sampler targeting a memory budget proxy.
 

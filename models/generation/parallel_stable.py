@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -27,7 +27,6 @@ def generate_parallel_stable(
     top_k: int,
     top_p: float,
     do_sample: bool,
-    flow_num_steps: Optional[int],
     parallel_num_steps: int,
     special_discrete_token_ids: tuple[int, ...],
     active_discrete_streams: int,
@@ -195,19 +194,9 @@ def generate_parallel_stable(
             continuous_batch_idx = batch_indices[masked_continuous_positions]
             continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
             candidate_prior[continuous_batch_idx, continuous_block_idx, :] = prior_prediction
-            denoise_target_mask = torch.zeros_like(masked_blocks)
-            denoise_target_mask[continuous_batch_idx, continuous_block_idx] = True
-            denoised_targets = model._sample_continuous_with_clean_context(
-                prior_target=candidate_prior,
-                clean_target=candidate_continuous,
-                denoise_target_mask=denoise_target_mask,
-                valid_target_mask=valid_target_mask,
-                prompt_latents=continuous_prompt,
-                prompt_lengths=speech_prompt_lengths,
-                num_steps=flow_num_steps,
-                temperature=temperature,
+            candidate_continuous[continuous_batch_idx, continuous_block_idx, :] = (
+                prior_prediction
             )
-            candidate_continuous[denoise_target_mask] = denoised_targets[denoise_target_mask]
 
             if len(special_discrete_token_ids) > 0:
                 step_discrete = candidate_discrete[continuous_batch_idx, continuous_block_idx, :]

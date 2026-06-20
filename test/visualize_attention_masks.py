@@ -93,8 +93,6 @@ def make_model(num_discrete_tokens: int) -> PrismTTS:
         num_discrete_tokens=num_discrete_tokens,
         discrete_vocab_size=32,
         continuous_latent_size=8,
-        flow_num_res_blocks=1,
-        flow_sample_steps=2,
     ).eval()
 
 
