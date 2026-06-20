@@ -865,17 +865,11 @@ class BatchCollate:
         return extended
 
     def _build_flat_attention_mask(self, sample: dict[str, torch.Tensor]) -> torch.BoolTensor:
-        prompt_text = int(sample["text_prompt"].shape[0])
-        prompt_speech = int(sample["discrete_prompt"].shape[0])
         target_text = int(sample["text_target"].shape[0])
         target_speech = int(sample["discrete_target"].shape[0])
         num_streams = int(sample["discrete_target"].shape[1]) + 1
         total = (
-            prompt_text
-            + 1
-            + prompt_speech * num_streams
-            + 1
-            + target_text
+            target_text
             + 1
             + target_speech * num_streams
             + 1
@@ -885,7 +879,7 @@ class BatchCollate:
     def _build_flat_sample(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """
         Flatten one split Prism sample into:
-        text_prompt -> EOT -> speech_prompt -> EOS -> text_target -> EOT -> speech_target -> EOS.
+        text_target -> EOT -> speech_target -> EOS.
         `speech_target` is expected to already include the terminal EOS speech block.
 
         Returns core flat tensors plus a compact summary tensor:
@@ -895,16 +889,14 @@ class BatchCollate:
          text_stream_idx, speech_discrete_stream_start_idx, speech_discrete_stream_end_idx,
          speech_continuous_stream_idx]
         where each *_start/*_end boundary is [start, end) in flattened token indices.
+        Prompt boundaries are retained as empty ranges for backward-compatible summaries.
         """
-        prompt_text = sample["text_prompt"].to(dtype=torch.long)
-        prompt_discrete = sample["discrete_prompt"].to(dtype=torch.long)
-        prompt_continuous = sample["continuous_prompt"].to(dtype=torch.float32)
         target_text = sample["text_target"].to(dtype=torch.long)
         target_discrete = sample["discrete_target"].to(dtype=torch.long)
         target_continuous = sample["continuous_target"].to(dtype=torch.float32)
 
-        num_discrete_streams = int(prompt_discrete.shape[1])
-        continuous_dim = int(prompt_continuous.shape[1])
+        num_discrete_streams = int(target_discrete.shape[1])
+        continuous_dim = int(target_continuous.shape[1])
 
         token_ids: list[int] = []
         token_type_ids: list[int] = []
@@ -945,22 +937,9 @@ class BatchCollate:
             continuous_values.append(value)
 
         text_prompt_start = len(token_ids)
-        for token in prompt_text.tolist():
-            append_text(token)
         text_prompt_end = len(token_ids)
-        append_text(self.eot_token_id)
-
         speech_prompt_start = len(token_ids)
-        for block_idx in range(int(prompt_discrete.shape[0])):
-            for stream_idx in range(num_discrete_streams):
-                append_discrete(
-                    int(prompt_discrete[block_idx, stream_idx].item()),
-                    stream_idx,
-                    -1,
-                )
-            append_continuous(prompt_continuous[block_idx], -1)
         speech_prompt_end = len(token_ids)
-        append_text(self.eos_token_id)
 
         text_target_start = len(token_ids)
         for token in target_text.tolist():

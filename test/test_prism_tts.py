@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import models.prism_tts as prism_tts_module
 from models.prism_tts import PrismTTS
 from dataset.dataset import BatchCollate
-from utils.model_utils import resolve_generation_discrete_eos_token_id
+from utils.model_utils import resolve_generation_discrete_eos_token_id, sample_masked_target_blocks
 
 
 MODEL_CONFIG_PATH = PROJECT_ROOT / "config" / "model.yaml"
@@ -194,7 +194,7 @@ class TestPrismTTS(unittest.TestCase):
             ("loss", "discrete_loss", "continuous_loss"),
         )
 
-    def test_forward_samples_mask_ratio_from_zero_to_one_when_unspecified(self):
+    def test_forward_samples_mask_ratio_from_point_three_to_one_when_unspecified(self):
         batch_size = 2
         prompt_len = 2
         target_len = 3
@@ -293,8 +293,35 @@ class TestPrismTTS(unittest.TestCase):
 
         self.assertEqual(len(captured_ratios), 2)
         for ratio in captured_ratios:
-            self.assertGreaterEqual(ratio, 0.0)
-            self.assertLess(ratio, 1.0)
+            self.assertGreaterEqual(ratio, 0.3)
+            self.assertLessEqual(ratio, 1.0)
+
+    def test_mask_sampler_keeps_first_thirty_percent_unmasked(self):
+        target_block_counts = torch.tensor([10, 4], dtype=torch.long, device=self.device)
+        masked = sample_masked_target_blocks(
+            target_block_counts=target_block_counts,
+            mask_ratio=1.0,
+            masked_target_blocks=None,
+        )
+
+        self.assertEqual(tuple(masked.shape), (2, 10))
+        self.assertFalse(masked[0, :3].any().item())
+        self.assertTrue(masked[0, 3:10].all().item())
+        self.assertFalse(masked[1, :2].any().item())
+        self.assertTrue(masked[1, 2:4].all().item())
+        self.assertFalse(masked[1, 4:].any().item())
+
+        provided = torch.ones((2, 10), dtype=torch.bool, device=self.device)
+        sanitized = sample_masked_target_blocks(
+            target_block_counts=target_block_counts,
+            mask_ratio=1.0,
+            masked_target_blocks=provided,
+        )
+        self.assertFalse(sanitized[0, :3].any().item())
+        self.assertTrue(sanitized[0, 3:10].all().item())
+        self.assertFalse(sanitized[1, :2].any().item())
+        self.assertTrue(sanitized[1, 2:4].all().item())
+        self.assertFalse(sanitized[1, 4:].any().item())
 
     def test_active_stream_count_embedding_conditions_inputs(self) -> None:
         collate = BatchCollate(

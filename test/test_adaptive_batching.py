@@ -48,7 +48,7 @@ def test_estimate_prism_sample_lengths_from_manifest_metadata():
         dataset,
         codec_frame_rate_hz=12.5,
     )
-    assert lengths == [19, 20]
+    assert lengths == [11, 12]
 
 
 def test_estimate_prism_sample_lengths_with_stream_override():
@@ -76,7 +76,7 @@ def test_estimate_prism_sample_lengths_with_stream_override():
         codec_frame_rate_hz=12.5,
         num_discrete_streams_override=3,
     )
-    assert lengths == [29, 30]
+    assert lengths == [17, 20]
 
 
 def test_adaptive_sampler_emits_stream_count_indices_when_prebuilt_stream_schedule_enabled():

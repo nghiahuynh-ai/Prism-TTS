@@ -371,18 +371,12 @@ def _save_overview_figure(
 
 
 def _expected_flat_length(sample: dict[str, torch.Tensor], num_discrete_streams: int) -> int:
-    text_prompt_len = int(sample["text_prompt"].shape[0])
-    speech_prompt_len = int(sample["discrete_prompt"].shape[0])
     text_target_len = int(sample["text_target"].shape[0])
     speech_target_len = int(sample["discrete_target"].shape[0])
 
     speech_block_size = num_discrete_streams + 1
     return (
-        text_prompt_len
-        + 1
-        + speech_prompt_len * speech_block_size
-        + 1
-        + text_target_len
+        text_target_len
         + 1
         + speech_target_len * speech_block_size
         + 1

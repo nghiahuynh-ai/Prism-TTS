@@ -38,25 +38,17 @@ def _estimate_discrete_length(duration_seconds: float, codec_frame_rate_hz: floa
 
 
 def _estimate_concat_sequence_length(
-    text_prompt_length: int,
-    speech_prompt_length: int,
     text_target_length: int,
     speech_target_length: int,
     num_discrete_streams: int,
 ) -> int:
-    text_prompt_length = max(1, int(text_prompt_length))
-    speech_prompt_length = max(1, int(speech_prompt_length))
     text_target_length = max(1, int(text_target_length))
     # Training collate appends one explicit terminal EOS speech block.
     speech_target_length = max(1, int(speech_target_length)) + 1
     num_discrete_streams = max(1, int(num_discrete_streams))
     speech_block_size = num_discrete_streams + 1
     return (
-        text_prompt_length
-        + 1  # EOT after text prompt
-        + speech_prompt_length * speech_block_size
-        + 1  # EOS after speech prompt
-        + text_target_length
+        text_target_length
         + 1  # EOT after text target
         + speech_target_length * speech_block_size
         + 1  # EOS after speech target
@@ -133,7 +125,7 @@ def _parse_env_int_silent(name: str, default: int, *, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
-def _manifest_length_fields_from_line(raw_line: str, *, line_number: int) -> tuple[float, str, float, str]:
+def _manifest_length_fields_from_line(raw_line: str, *, line_number: int) -> tuple[float, str]:
     line = raw_line.strip()
     parts = [part.strip() for part in line.split("|")]
     # Some manifests include a trailing delimiter, producing an empty final field.
@@ -149,14 +141,8 @@ def _manifest_length_fields_from_line(raw_line: str, *, line_number: int) -> tup
         duration = float(parts[1])
     except ValueError as exc:
         raise ValueError(f"Invalid duration at line {line_number}: {parts[1]!r}.") from exc
-    try:
-        prompt_duration = float(parts[5])
-    except ValueError as exc:
-        raise ValueError(f"Invalid prompt_duration at line {line_number}: {parts[5]!r}.") from exc
-
     transcript = parts[2]
-    prompt_transcript = parts[6]
-    return duration, transcript, prompt_duration, prompt_transcript
+    return duration, transcript
 
 
 def _iter_manifest_line_chunks(
@@ -207,18 +193,10 @@ def _estimate_lengths_for_manifest_chunk(
 
     lengths: list[int] = []
     for line_number, raw_line in chunk:
-        duration, transcript, prompt_duration, prompt_transcript = _manifest_length_fields_from_line(
+        duration, transcript = _manifest_length_fields_from_line(
             raw_line,
             line_number=line_number,
         )
-
-        text_prompt_len = 0
-        for char in prompt_transcript:
-            if char in char_vocab:
-                text_prompt_len += 1
-        if append_eos:
-            text_prompt_len += 1
-        text_prompt_len = max(1, text_prompt_len)
 
         text_target_len = 0
         for char in transcript:
@@ -228,12 +206,9 @@ def _estimate_lengths_for_manifest_chunk(
             text_target_len += 1
         text_target_len = max(1, text_target_len)
 
-        prompt_discrete_len = _estimate_discrete_length(prompt_duration, codec_frame_rate_hz)
         target_discrete_len = _estimate_discrete_length(duration, codec_frame_rate_hz)
         lengths.append(
             _estimate_concat_sequence_length(
-                text_prompt_length=text_prompt_len,
-                speech_prompt_length=prompt_discrete_len,
                 text_target_length=text_target_len,
                 speech_target_length=target_discrete_len,
                 num_discrete_streams=num_discrete_streams,
@@ -389,19 +364,10 @@ def estimate_prism_sample_lengths(
             desc="adaptive_batching: estimating lengths",
             unit="sample",
         ):
-            text_prompt_len = _estimate_text_token_count(
-                str(getattr(entry, "prompt_transcript")),
-                char_to_id=char_to_id,
-                append_eos=append_eos,
-            )
             text_target_len = _estimate_text_token_count(
                 str(getattr(entry, "transcript")),
                 char_to_id=char_to_id,
                 append_eos=append_eos,
-            )
-            prompt_discrete_len = _estimate_discrete_length(
-                float(getattr(entry, "prompt_duration")),
-                codec_frame_rate_hz,
             )
             target_discrete_len = _estimate_discrete_length(
                 float(getattr(entry, "duration")),
@@ -409,8 +375,6 @@ def estimate_prism_sample_lengths(
             )
             lengths.append(
                 _estimate_concat_sequence_length(
-                    text_prompt_length=text_prompt_len,
-                    speech_prompt_length=prompt_discrete_len,
                     text_target_length=text_target_len,
                     speech_target_length=target_discrete_len,
                     num_discrete_streams=num_discrete_streams,
@@ -433,24 +397,17 @@ def estimate_prism_sample_lengths(
                     "Expected each in-memory dataset sample to be a mapping for adaptive batching."
                 )
 
-            text_prompt_len = _safe_1d_length(sample.get("text_prompt"), field_name="text_prompt")
             text_target_len = _safe_1d_length(sample.get("text_target"), field_name="text_target")
-            prompt_discrete_len = _safe_2d_length(
-                sample.get("discrete_prompt"),
-                field_name="discrete_prompt",
-            )
             target_discrete_len = _safe_2d_length(
                 sample.get("discrete_target"),
                 field_name="discrete_target",
             )
-            discrete_prompt = sample.get("discrete_prompt")
+            discrete_target = sample.get("discrete_target")
             num_discrete_streams = _resolved_stream_count(
-                int(getattr(discrete_prompt, "shape", [1, 1])[1])
+                int(getattr(discrete_target, "shape", [1, 1])[1])
             )
             lengths.append(
                 _estimate_concat_sequence_length(
-                    text_prompt_length=text_prompt_len,
-                    speech_prompt_length=prompt_discrete_len,
                     text_target_length=text_target_len,
                     speech_target_length=target_discrete_len,
                     num_discrete_streams=num_discrete_streams,

@@ -23,8 +23,8 @@ class PrismTTS(nn.Module):
     """
     Prism-TTS masked reconstruction model.
 
-    Sequence layout (per sample):
-    text_prompt -> EOT -> speech_prompt -> EOS -> text_target -> EOT -> speech_target -> EOS
+    Training sequence layout (per sample):
+    text_target -> EOT -> speech_target -> EOS
 
     Speech is flattened block-wise. Each speech block has (N + 1) streams:
     N discrete streams + 1 continuous stream.
@@ -518,12 +518,14 @@ class PrismTTS(nn.Module):
         )
 
         if mask_ratio is None:
-            # Default training behavior: sample mask ratio uniformly per forward pass.
-            effective_mask_ratio = float(torch.rand((), device=flat.token_ids.device).item())
+            # Default training behavior: sample the eligible-region mask ratio uniformly.
+            effective_mask_ratio = float(
+                0.3 + 0.7 * torch.rand((), device=flat.token_ids.device).item()
+            )
         else:
             effective_mask_ratio = float(mask_ratio)
-            if not (0.0 <= effective_mask_ratio <= 1.0):
-                raise ValueError("mask_ratio must be in [0, 1].")
+            if not (0.3 <= effective_mask_ratio <= 1.0):
+                raise ValueError("mask_ratio must be in [0.3, 1.0].")
         masked_blocks = MU.sample_masked_target_blocks(
             target_block_counts=flat.target_block_counts,
             mask_ratio=effective_mask_ratio,
