@@ -372,11 +372,18 @@ class PrismTTS(nn.Module):
         ):
             raise ValueError("discrete_stream_ids contain out-of-range values.")
 
-        logits = hidden_states.new_empty((hidden_states.shape[0], self.discrete_vocab_size))
+        logits = None
         for stream_idx, lm_head in enumerate(self.discrete_lm_heads):
             stream_mask = discrete_stream_ids == stream_idx
             if stream_mask.any():
-                logits[stream_mask] = lm_head(hidden_states[stream_mask])
+                stream_logits = lm_head(hidden_states[stream_mask])
+                if logits is None:
+                    logits = stream_logits.new_empty(
+                        (hidden_states.shape[0], self.discrete_vocab_size)
+                    )
+                logits[stream_mask] = stream_logits
+        if logits is None:
+            return hidden_states.new_empty((0, self.discrete_vocab_size))
         return logits
 
     def _compute_continuous_losses(
@@ -390,15 +397,17 @@ class PrismTTS(nn.Module):
         if not masked_continuous_positions.any():
             return hidden_states.new_zeros(())
 
-        predicted_continuous_latents = self.continuous_prior_head(hidden_states)
         valid_masked_continuous = (
             masked_continuous_positions
             & (token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE)
         )
         if not valid_masked_continuous.any():
             return hidden_states.new_zeros(())
+        predicted_continuous_latents = self.continuous_prior_head(
+            hidden_states[valid_masked_continuous]
+        )
         return F.mse_loss(
-            predicted_continuous_latents[valid_masked_continuous],
+            predicted_continuous_latents,
             continuous_values[valid_masked_continuous],
         )
 

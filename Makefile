@@ -29,7 +29,7 @@ PRETRAINED_STRICT ?= false
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
-WANDB_NAME ?= mask-5fixed
+WANDB_NAME ?= mask
 WANDB_SAVE_DIR ?= logs
 WANDB_OFFLINE ?= false
 WANDB_LOG_MODEL ?= false
@@ -42,7 +42,7 @@ PRISM_TTS_ADAPTIVE_LENGTH_WORKERS ?= 16
 PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE ?= 8192
 PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES ?= 20000
 # Distributed debug defaults (override at runtime if needed).
-TORCH_DISTRIBUTED_DEBUG ?= DETAIL
+TORCH_DISTRIBUTED_DEBUG ?= OFF
 NCCL_DEBUG ?= INFO
 # Optional rendezvous overrides (needed for multi-node runs).
 MASTER_ADDR ?=
@@ -142,7 +142,7 @@ help:
 	@echo "  PRISM_TTS_ADAPTIVE_LENGTH_WORKERS=...            Adaptive length workers (default: 16)"
 	@echo "  PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE=...         Adaptive length chunk size (default: 8192)"
 	@echo "  PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES=...  Adaptive length parallel threshold (default: 20000)"
-	@echo "  TORCH_DISTRIBUTED_DEBUG=...  DDP debug mode (default: DETAIL)"
+	@echo "  TORCH_DISTRIBUTED_DEBUG=...  DDP debug mode (default: OFF)"
 	@echo "  NCCL_DEBUG=...         NCCL debug mode (default: INFO)"
 	@echo "  MASTER_ADDR=...        Optional DDP rendezvous host (multi-node)"
 	@echo "  MASTER_PORT=...        Optional DDP rendezvous port (multi-node)"

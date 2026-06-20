@@ -1899,7 +1899,7 @@ def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any])
     loader_cfg = data_cfg.get("loader") if isinstance(data_cfg, dict) else None
     adaptive_cfg = loader_cfg.get("adaptive_batching") if isinstance(loader_cfg, dict) else None
     adaptive_enabled = bool(adaptive_cfg.get("enabled", False)) if isinstance(adaptive_cfg, dict) else False
-    if adaptive_enabled and "use_distributed_sampler" not in lightning_trainer_cfg:
+    if adaptive_enabled and lightning_trainer_cfg.get("use_distributed_sampler") is not False:
         lightning_trainer_cfg["use_distributed_sampler"] = False
         print(
             "[train.py] Adaptive batching is enabled; setting "
