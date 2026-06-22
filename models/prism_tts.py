@@ -37,6 +37,7 @@ class PrismTTS(nn.Module):
         discrete_vocab_size: int,
         continuous_latent_size: int,
         continuous_loss_weight: float = 1.0,
+        continuous_magnitude_loss_weight: float = 0.1,
         discrete_regular_token_loss_weight: float = 1.0,
         discrete_special_token_loss_weight: float = 1.0,
         parallel_sample_steps: int = 64,
@@ -51,6 +52,8 @@ class PrismTTS(nn.Module):
             raise ValueError("continuous_latent_size must be at least 1.")
         if continuous_loss_weight < 0.0:
             raise ValueError("continuous_loss_weight must be >= 0.")
+        if continuous_magnitude_loss_weight < 0.0:
+            raise ValueError("continuous_magnitude_loss_weight must be >= 0.")
         if discrete_regular_token_loss_weight < 0.0:
             raise ValueError("discrete_regular_token_loss_weight must be >= 0.")
         if discrete_special_token_loss_weight < 0.0:
@@ -73,6 +76,7 @@ class PrismTTS(nn.Module):
         self.speech_block_size = self.num_discrete_tokens + 1
 
         self.continuous_loss_weight = float(continuous_loss_weight)
+        self.continuous_magnitude_loss_weight = float(continuous_magnitude_loss_weight)
         self.discrete_regular_token_loss_weight = float(discrete_regular_token_loss_weight)
         self.discrete_special_token_loss_weight = float(discrete_special_token_loss_weight)
         self.parallel_sample_steps = int(parallel_sample_steps)
@@ -87,7 +91,11 @@ class PrismTTS(nn.Module):
             for _ in range(self.num_discrete_tokens)
         )
         self.continuous_proj = nn.Linear(self.continuous_latent_size, self.hidden_size)
-        self.continuous_prior_head = nn.Linear(self.hidden_size, self.continuous_latent_size)
+        self.continuous_prior_head = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size),
+            nn.SiLU(),
+            nn.Linear(self.hidden_size, self.continuous_latent_size),
+        )
 
         self.token_type_embeddings = nn.Parameter(torch.empty(3, self.hidden_size))
         self.speech_stream_embeddings = nn.Parameter(
@@ -136,7 +144,11 @@ class PrismTTS(nn.Module):
         for lm_head in self.discrete_lm_heads:
             nn.init.normal_(lm_head.weight, mean=0.0, std=std)
         nn.init.normal_(self.continuous_proj.weight, mean=0.0, std=std)
-        nn.init.normal_(self.continuous_prior_head.weight, mean=0.0, std=std)
+        for layer in self.continuous_prior_head:
+            if isinstance(layer, nn.Linear):
+                nn.init.normal_(layer.weight, mean=0.0, std=std)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
         nn.init.normal_(self.token_type_embeddings, mean=0.0, std=std)
         nn.init.normal_(self.speech_stream_embeddings, mean=0.0, std=std)
         nn.init.zeros_(self.active_stream_count_embedding.weight)
@@ -144,8 +156,6 @@ class PrismTTS(nn.Module):
         nn.init.normal_(self.masked_continuous_embedding, mean=0.0, std=std)
         if self.continuous_proj.bias is not None:
             nn.init.zeros_(self.continuous_proj.bias)
-        if self.continuous_prior_head.bias is not None:
-            nn.init.zeros_(self.continuous_prior_head.bias)
 
     @property
     def text_embedding(self) -> nn.Embedding:
@@ -156,6 +166,7 @@ class PrismTTS(nn.Module):
         self,
         flat: MU.FlatBatch,
         masked_target_blocks: torch.BoolTensor,
+        masked_continuous_target_blocks: Optional[torch.BoolTensor] = None,
         active_discrete_stream_count: Optional[torch.Tensor | int] = None,
     ) -> tuple[torch.FloatTensor, torch.BoolTensor, torch.BoolTensor, torch.BoolTensor]:
         """Build model input embeddings and masks for masked discrete/continuous targets."""
@@ -164,15 +175,28 @@ class PrismTTS(nn.Module):
         is_continuous = flat.token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE
 
         target_token_mask = flat.target_block_ids >= 0
-        if masked_target_blocks.numel() == 0:
-            masked_target_token_mask = torch.zeros_like(target_token_mask)
-        else:
-            clamped_target_ids = flat.target_block_ids.clamp(min=0)
-            target_lookup = torch.gather(masked_target_blocks, 1, clamped_target_ids)
-            masked_target_token_mask = target_token_mask & target_lookup
+        clamped_target_ids = flat.target_block_ids.clamp(min=0)
 
-        masked_discrete_positions = masked_target_token_mask & is_discrete
-        masked_continuous_positions = masked_target_token_mask & is_continuous
+        if masked_target_blocks.numel() == 0:
+            disc_masked_token_mask = torch.zeros_like(target_token_mask)
+        else:
+            disc_lookup = torch.gather(masked_target_blocks, 1, clamped_target_ids)
+            disc_masked_token_mask = target_token_mask & disc_lookup
+
+        cont_blocks = (
+            masked_continuous_target_blocks
+            if masked_continuous_target_blocks is not None
+            else masked_target_blocks
+        )
+        if cont_blocks.numel() == 0:
+            cont_masked_token_mask = torch.zeros_like(target_token_mask)
+        else:
+            cont_lookup = torch.gather(cont_blocks, 1, clamped_target_ids)
+            cont_masked_token_mask = target_token_mask & cont_lookup
+
+        masked_discrete_positions = disc_masked_token_mask & is_discrete
+        masked_continuous_positions = cont_masked_token_mask & is_continuous
+        masked_target_token_mask = disc_masked_token_mask | cont_masked_token_mask
 
         token_embeds = self.text_embedding(flat.token_ids)
         if is_discrete.any():
@@ -234,7 +258,7 @@ class PrismTTS(nn.Module):
             active_discrete_stream_count=active_discrete_stream_count,
         )
         active_stream_embeds = self.active_stream_count_embedding(active_stream_count_ids)
-        base_embeds = base_embeds + active_stream_embeds.unsqueeze(1)
+        base_embeds = base_embeds + active_stream_embeds.unsqueeze(1) * is_speech.unsqueeze(-1).to(dtype=base_embeds.dtype)
 
         return (
             base_embeds,
@@ -390,26 +414,17 @@ class PrismTTS(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         continuous_values: torch.FloatTensor,
-        token_type_ids: torch.LongTensor,
         masked_continuous_positions: torch.BoolTensor,
     ) -> torch.Tensor:
         """Compute masked continuous latent reconstruction loss from backbone hidden states."""
         if not masked_continuous_positions.any():
             return hidden_states.new_zeros(())
 
-        valid_masked_continuous = (
-            masked_continuous_positions
-            & (token_type_ids == MU.SPEECH_CONTINUOUS_TOKEN_TYPE)
-        )
-        if not valid_masked_continuous.any():
-            return hidden_states.new_zeros(())
-        predicted_continuous_latents = self.continuous_prior_head(
-            hidden_states[valid_masked_continuous]
-        )
-        return F.mse_loss(
-            predicted_continuous_latents,
-            continuous_values[valid_masked_continuous],
-        )
+        predicted = self.continuous_prior_head(hidden_states[masked_continuous_positions])
+        targets = continuous_values[masked_continuous_positions]
+        cosine_loss = (1.0 - F.cosine_similarity(predicted, targets, dim=-1)).mean()
+        magnitude_loss = F.mse_loss(predicted.norm(dim=-1), targets.norm(dim=-1))
+        return cosine_loss + self.continuous_magnitude_loss_weight * magnitude_loss
 
     def _sample_discrete_ids(
         self,
@@ -444,6 +459,7 @@ class PrismTTS(nn.Module):
         self,
         flat: MU.FlatBatch,
         masked_target_blocks: torch.BoolTensor,
+        masked_continuous_target_blocks: Optional[torch.BoolTensor] = None,
         active_discrete_stream_count: Optional[torch.Tensor | int] = None,
         attention_mask: Optional[torch.BoolTensor] = None,
     ) -> tuple[
@@ -470,6 +486,7 @@ class PrismTTS(nn.Module):
             self._build_inputs_embeds(
                 flat=flat,
                 masked_target_blocks=masked_target_blocks,
+                masked_continuous_target_blocks=masked_continuous_target_blocks,
                 active_discrete_stream_count=active_discrete_stream_count,
             )
         )
@@ -517,19 +534,30 @@ class PrismTTS(nn.Module):
             continuous_latent_size=self.continuous_latent_size,
         )
 
+        batch_size = int(flat.token_ids.shape[0])
         if mask_ratio is None:
-            # Default training behavior: sample the eligible-region mask ratio uniformly.
-            effective_mask_ratio = float(
-                0.3 + 0.7 * torch.rand((), device=flat.token_ids.device).item()
+            discrete_mask_ratios = 0.3 + 0.7 * torch.rand(
+                batch_size, device=flat.token_ids.device
+            )
+            continuous_mask_ratios = 0.3 + 0.7 * torch.rand(
+                batch_size, device=flat.token_ids.device
             )
         else:
             effective_mask_ratio = float(mask_ratio)
             if not (0.3 <= effective_mask_ratio <= 1.0):
                 raise ValueError("mask_ratio must be in [0.3, 1.0].")
-        masked_blocks = MU.sample_masked_target_blocks(
+            discrete_mask_ratios = effective_mask_ratio
+            continuous_mask_ratios = effective_mask_ratio
+
+        discrete_masked_blocks = MU.sample_masked_target_blocks(
             target_block_counts=flat.target_block_counts,
-            mask_ratio=effective_mask_ratio,
+            mask_ratio=discrete_mask_ratios,
             masked_target_blocks=masked_target_blocks,
+        )
+        continuous_masked_blocks = MU.sample_masked_target_blocks(
+            target_block_counts=flat.target_block_counts,
+            mask_ratio=continuous_mask_ratios,
+            masked_target_blocks=None if mask_ratio is None else masked_target_blocks,
         )
 
         (
@@ -539,7 +567,8 @@ class PrismTTS(nn.Module):
             _,
         ) = self._encode(
             flat=flat,
-            masked_target_blocks=masked_blocks,
+            masked_target_blocks=discrete_masked_blocks,
+            masked_continuous_target_blocks=continuous_masked_blocks,
             active_discrete_stream_count=active_discrete_stream_count,
         )
 
@@ -552,7 +581,6 @@ class PrismTTS(nn.Module):
         continuous_loss = self._compute_continuous_losses(
             hidden_states=hidden_states,
             continuous_values=flat.continuous_values,
-            token_type_ids=flat.token_type_ids,
             masked_continuous_positions=masked_continuous_positions,
         )
         loss = discrete_loss + self.continuous_loss_weight * continuous_loss

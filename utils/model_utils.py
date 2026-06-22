@@ -633,11 +633,15 @@ def assemble_flat_batch(
 
 def sample_masked_target_blocks(
     target_block_counts: torch.LongTensor,
-    mask_ratio: float,
+    mask_ratio: "float | torch.Tensor",
     masked_target_blocks: Optional[torch.BoolTensor],
     protected_prefix_ratio: float = DEFAULT_PROTECTED_TARGET_PREFIX_RATIO,
 ) -> torch.BoolTensor:
-    """Sample (or validate provided) masked target-block indices for reconstruction."""
+    """Sample (or validate provided) masked target-block indices for reconstruction.
+
+    mask_ratio can be a scalar float or a per-sample [batch] tensor.
+    The terminal EOS block (last target block per sample) is always masked.
+    """
     batch_size = int(target_block_counts.shape[0])
     device = target_block_counts.device
     max_target_blocks = int(target_block_counts.max().item()) if batch_size > 0 else 0
@@ -645,6 +649,8 @@ def sample_masked_target_blocks(
         return torch.zeros((batch_size, 0), dtype=torch.bool, device=device)
     if not (0.0 <= float(protected_prefix_ratio) <= 1.0):
         raise ValueError("protected_prefix_ratio must be in [0, 1].")
+
+    is_scalar_ratio = isinstance(mask_ratio, float)
 
     if masked_target_blocks is not None:
         if masked_target_blocks.dim() != 2 or masked_target_blocks.shape[0] != batch_size:
@@ -662,6 +668,8 @@ def sample_masked_target_blocks(
                 out[sample_idx, :protected_count] = False
             if count < max_target_blocks:
                 out[sample_idx, count:] = False
+            if count > 0:
+                out[sample_idx, count - 1] = True
         return out
 
     out = torch.zeros((batch_size, max_target_blocks), dtype=torch.bool, device=device)
@@ -669,19 +677,24 @@ def sample_masked_target_blocks(
         count = int(target_block_counts[sample_idx].item())
         if count <= 0:
             continue
+        sample_ratio = (
+            float(mask_ratio)
+            if is_scalar_ratio
+            else float(mask_ratio[sample_idx].item())
+        )
         protected_count = int(math.ceil(float(count) * float(protected_prefix_ratio)))
         protected_count = min(count, max(0, protected_count))
         eligible_count = count - protected_count
-        if eligible_count <= 0:
-            continue
-        num_masked = int(round(mask_ratio * eligible_count))
-        if mask_ratio > 0.0:
-            num_masked = max(1, num_masked)
-        num_masked = min(eligible_count, max(0, num_masked))
-        if num_masked == 0:
-            continue
-        picked = torch.randperm(eligible_count, device=device)[:num_masked] + protected_count
-        out[sample_idx, picked] = True
+        if eligible_count > 0:
+            num_masked = int(round(sample_ratio * eligible_count))
+            if sample_ratio > 0.0:
+                num_masked = max(1, num_masked)
+            num_masked = min(eligible_count, max(0, num_masked))
+            if num_masked > 0:
+                picked = torch.randperm(eligible_count, device=device)[:num_masked] + protected_count
+                out[sample_idx, picked] = True
+        # Always mask the terminal EOS block regardless of random sampling
+        out[sample_idx, count - 1] = True
     return out
 
 
@@ -777,7 +790,7 @@ def build_two_level_rope_position_embeddings(
     device = inputs_embeds.device
 
     global_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    secondary_position_ids = speech_stream_ids.clamp(min=0)
+    secondary_position_ids = (speech_stream_ids + 1).clamp(min=0)
 
     global_cos, global_sin = rotary_emb(inputs_embeds, position_ids=global_position_ids)
     secondary_cos, secondary_sin = rotary_emb(

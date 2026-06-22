@@ -256,10 +256,13 @@ class TestPrismTTS(unittest.TestCase):
 
         def _capture_ratio(
             target_block_counts: torch.LongTensor,
-            mask_ratio: float,
+            mask_ratio,
             masked_target_blocks: torch.BoolTensor | None,
         ) -> torch.BoolTensor:
-            captured_ratios.append(float(mask_ratio))
+            if isinstance(mask_ratio, float):
+                captured_ratios.append(mask_ratio)
+            else:
+                captured_ratios.extend(mask_ratio.tolist())
             return original_sampler(
                 target_block_counts=target_block_counts,
                 mask_ratio=mask_ratio,
@@ -291,7 +294,8 @@ class TestPrismTTS(unittest.TestCase):
         finally:
             prism_tts_module.MU.sample_masked_target_blocks = original_sampler
 
-        self.assertEqual(len(captured_ratios), 2)
+        # 2 forward passes × 2 sampler calls (discrete + continuous) × batch_size samples
+        self.assertEqual(len(captured_ratios), 2 * 2 * batch_size)
         for ratio in captured_ratios:
             self.assertGreaterEqual(ratio, 0.3)
             self.assertLessEqual(ratio, 1.0)
@@ -331,15 +335,15 @@ class TestPrismTTS(unittest.TestCase):
         )
         sample = {
             "text_prompt": torch.tensor([1, 2], dtype=torch.long),
-            "discrete_prompt": torch.tensor([[3, 4], [5, 6]], dtype=torch.long),
+            "discrete_prompt": torch.tensor([[3], [4]], dtype=torch.long),
             "continuous_prompt": torch.randn(2, self.continuous_latent_size),
             "text_target": torch.tensor([7], dtype=torch.long),
-            "discrete_target": torch.tensor([[8, 9]], dtype=torch.long),
+            "discrete_target": torch.tensor([[8]], dtype=torch.long),
             "continuous_target": torch.randn(1, self.continuous_latent_size),
         }
         flat_batch = collate([sample])
         active_k = int(flat_batch["active_discrete_stream_count"].item())
-        self.assertEqual(active_k, 2)
+        self.assertEqual(active_k, self.num_discrete_tokens)
 
         flat = prism_tts_module.MU.build_flat_batch_from_collate(
             flat_token_ids=flat_batch["flat_token_ids"].to(self.device),
@@ -381,7 +385,9 @@ class TestPrismTTS(unittest.TestCase):
                 self.model.active_stream_count_embedding.weight.copy_(original)
 
         diff = conditioned_embeds - baseline_embeds
-        self.assertTrue(torch.allclose(diff, torch.full_like(diff, 0.25)))
+        is_speech = (flat.token_type_ids != 0).unsqueeze(-1).expand_as(diff)
+        self.assertTrue(torch.allclose(diff[is_speech], torch.full_like(diff[is_speech], 0.25)))
+        self.assertTrue(torch.allclose(diff[~is_speech], torch.zeros_like(diff[~is_speech])))
 
     def test_generate_supports_active_discrete_streams(self) -> None:
         batch_size = 1
