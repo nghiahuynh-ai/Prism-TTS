@@ -53,7 +53,7 @@ trainer:
     accelerator: auto
     devices: 1
     strategy: auto
-    precision: 32
+    precision: 16-mixed
     max_steps: 1500000
     min_steps: 0
     gradient_clip_val: 1.0
@@ -70,7 +70,7 @@ trainer:
     enable_progress_bar: true
     enable_model_summary: true
     # Require when train DataLoader uses adaptive batch_sampler / precomputed rank batches
-    use_distributed_sampler: false
+    use_distributed_sampler: true
 
   checkpoint:
     dirpath: checkpoints

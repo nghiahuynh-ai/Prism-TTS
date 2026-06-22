@@ -175,7 +175,7 @@ class PrismTTSLightning(pl.LightningModule):
             outputs.loss,
             prog_bar=True,
             on_step=True,
-            on_epoch=True,
+            on_epoch=False,
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
@@ -184,7 +184,7 @@ class PrismTTSLightning(pl.LightningModule):
             outputs.discrete_loss,
             prog_bar=False,
             on_step=True,
-            on_epoch=True,
+            on_epoch=False,
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
@@ -193,7 +193,7 @@ class PrismTTSLightning(pl.LightningModule):
             outputs.continuous_loss,
             prog_bar=False,
             on_step=True,
-            on_epoch=True,
+            on_epoch=False,
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
@@ -264,6 +264,8 @@ class PrismTTSLightning(pl.LightningModule):
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         del outputs, batch_idx
         self._maybe_update_ema()
+        if self.global_step % 1000 == 0:
+            torch.cuda.empty_cache()
         if self._periodic_eval_active:
             return
         trainer = self.trainer
@@ -704,7 +706,7 @@ class PrismTTSLightning(pl.LightningModule):
                 if shadow.device != param.device:
                     shadow = shadow.to(device=param.device)
                     self._ema_state[name] = shadow
-                shadow.mul_(decay).add_(param.detach().float(), alpha=1.0 - decay)
+                shadow.lerp_(param.detach().to(dtype=shadow.dtype), 1.0 - decay)
 
         self._ema_updates += 1
         self._last_ema_step = step
@@ -988,6 +990,8 @@ class PrismTTSLightning(pl.LightningModule):
                 continue
             table.add_data(*row)
             self._text_eval_row_ids.add(row_id)
+        if len(self._text_eval_row_ids) > 50_000:
+            self._text_eval_row_ids.clear()
         return table
 
     def _collect_text_rows(

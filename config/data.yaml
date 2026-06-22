@@ -13,9 +13,9 @@ data:
   loader:
     # Variable-length batches can spike attention memory; keep a conservative
     # per-device batch size and scale effective batch with grad accumulation.
-    train_batch_size: 32
-    val_batch_size: 32
-    test_batch_size: 32
+    train_batch_size: 16
+    val_batch_size: 16
+    test_batch_size: 16
     num_workers: 32
     pin_memory: true
     persistent_workers: true
@@ -26,7 +26,7 @@ data:
     shuffle_test: false
     adaptive_batching:
       # Set true to enable dynamic batch sizes based on estimated memory usage.
-      enabled: true
+      enabled: false
       # Target utilization against the configured/derived memory_budget.
       target_memory_utilization: 0.9
       # Optional absolute budget in "cost units" (batch_size * max_len^2).
@@ -58,7 +58,7 @@ data:
     # PrismDataset(...) arguments.
     append_eos_to_text: false
     cache_npy: false
-    discrete_stream_count: 4
+    discrete_stream_count: 1
     continuous_feature_dim: 512
 
   collate:

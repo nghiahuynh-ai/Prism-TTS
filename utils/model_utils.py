@@ -439,7 +439,10 @@ def assemble_flat_batch(
     num_discrete_tokens: int,
     continuous_stream_id: Optional[int] = None,
 ) -> FlatBatch:
-    """Assemble split prompt/target tensors into one flattened sequence representation."""
+    """
+    Assemble generation tensors as:
+    text_prompt -> text_target -> EOT -> speech_prompt -> speech_target -> EOS.
+    """
     batch_size = int(text_prompt.shape[0])
     device = text_prompt.device
     cont_dtype = continuous_prompt.dtype
@@ -515,6 +518,8 @@ def assemble_flat_batch(
 
         for token in prompt_text.tolist():
             append_text_token(token)
+        for token in target_text.tolist():
+            append_text_token(token)
         append_text_token(eot_token_id)
 
         for block_idx in range(l2):
@@ -528,12 +533,6 @@ def assemble_flat_batch(
                 value=prompt_continuous[block_idx],
                 target_block_id=-1,
             )
-        append_text_token(eos_token_id)
-
-        for token in target_text.tolist():
-            append_text_token(token)
-        append_text_token(eot_token_id)
-
         for block_idx in range(l4):
             for stream_idx in range(num_discrete_tokens):
                 append_speech_discrete(

@@ -17,7 +17,7 @@ from typing import Any
 
 _DEFAULTED_CUDA_ALLOC_CONF = False
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     _DEFAULTED_CUDA_ALLOC_CONF = True
 
 import torch
@@ -1921,7 +1921,8 @@ def run(args: argparse.Namespace) -> None:
     if _DEFAULTED_CUDA_ALLOC_CONF:
         print(
             "[train.py] PYTORCH_CUDA_ALLOC_CONF was unset; defaulting to "
-            "'backend:cudaMallocAsync' to avoid NVML-related allocator assertions."
+            "'expandable_segments:True' to reduce CUDA allocator fragmentation "
+            "from variable-length sequences."
         )
     _apply_wandb_cli_overrides(config, args)
     _apply_pretrained_cli_overrides(config, args)

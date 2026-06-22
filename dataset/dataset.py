@@ -897,12 +897,8 @@ class BatchCollate:
 
         num_discrete_streams = int(target_discrete.shape[1])
         continuous_dim = int(target_continuous.shape[1])
-
-        token_ids: list[int] = []
-        token_type_ids: list[int] = []
-        speech_stream_ids: list[int] = []
-        target_block_ids: list[int] = []
-        continuous_values: list[torch.Tensor] = []
+        num_speech_blocks = int(target_discrete.shape[0])
+        num_text_tokens = int(target_text.shape[0])
 
         text_stream_idx = 0
         speech_discrete_stream_start_idx = 0
@@ -913,53 +909,62 @@ class BatchCollate:
             else self.fixed_continuous_stream_idx
         )
 
-        zero_cont = torch.zeros(continuous_dim, dtype=torch.float32)
+        # Preallocate all output tensors to avoid per-token Python list appends.
+        block_size = num_discrete_streams + 1
+        seq_len = num_text_tokens + 1 + num_speech_blocks * block_size + 1
 
-        def append_text(token_id: int) -> None:
-            token_ids.append(int(token_id))
-            token_type_ids.append(TEXT_TOKEN_TYPE)
-            speech_stream_ids.append(text_stream_idx)
-            target_block_ids.append(-1)
-            continuous_values.append(zero_cont)
+        token_ids = torch.empty(seq_len, dtype=torch.long)
+        token_type_ids = torch.empty(seq_len, dtype=torch.long)
+        speech_stream_ids = torch.empty(seq_len, dtype=torch.long)
+        target_block_ids = torch.full((seq_len,), -1, dtype=torch.long)
+        continuous_values = torch.zeros(seq_len, continuous_dim, dtype=torch.float32)
 
-        def append_discrete(token_id: int, stream_id: int, block_id: int) -> None:
-            token_ids.append(int(token_id))
-            token_type_ids.append(SPEECH_DISCRETE_TOKEN_TYPE)
-            speech_stream_ids.append(int(stream_id))
-            target_block_ids.append(int(block_id))
-            continuous_values.append(zero_cont)
+        text_prompt_start = 0
+        text_prompt_end = 0
+        speech_prompt_start = 0
+        speech_prompt_end = 0
 
-        def append_continuous(value: torch.Tensor, block_id: int) -> None:
-            token_ids.append(self.pad_token_id)
-            token_type_ids.append(SPEECH_CONTINUOUS_TOKEN_TYPE)
-            speech_stream_ids.append(speech_continuous_stream_idx)
-            target_block_ids.append(int(block_id))
-            continuous_values.append(value)
+        # --- Text target ---
+        text_target_start = 0
+        text_target_end = num_text_tokens
+        token_ids[:num_text_tokens] = target_text
+        token_type_ids[:num_text_tokens] = TEXT_TOKEN_TYPE
+        speech_stream_ids[:num_text_tokens] = text_stream_idx
+        # target_block_ids and continuous_values already zero/−1
 
-        text_prompt_start = len(token_ids)
-        text_prompt_end = len(token_ids)
-        speech_prompt_start = len(token_ids)
-        speech_prompt_end = len(token_ids)
+        # --- EOT ---
+        eot_pos = num_text_tokens
+        token_ids[eot_pos] = self.eot_token_id
+        token_type_ids[eot_pos] = TEXT_TOKEN_TYPE
+        speech_stream_ids[eot_pos] = text_stream_idx
 
-        text_target_start = len(token_ids)
-        for token in target_text.tolist():
-            append_text(token)
-        text_target_end = len(token_ids)
-        append_text(self.eot_token_id)
+        # --- Speech target: vectorised over all blocks per stream ---
+        speech_target_start = eot_pos + 1
+        speech_base = speech_target_start
+        block_indices = torch.arange(num_speech_blocks, dtype=torch.long)
 
-        speech_target_start = len(token_ids)
-        for block_idx in range(int(target_discrete.shape[0])):
-            for stream_idx in range(num_discrete_streams):
-                append_discrete(
-                    int(target_discrete[block_idx, stream_idx].item()),
-                    stream_idx,
-                    block_idx,
-                )
-            append_continuous(target_continuous[block_idx], block_idx)
-        speech_target_end = len(token_ids)
-        append_text(self.eos_token_id)
+        for stream_idx in range(num_discrete_streams):
+            disc_pos = speech_base + block_indices * block_size + stream_idx
+            token_ids[disc_pos] = target_discrete[:, stream_idx]
+            token_type_ids[disc_pos] = SPEECH_DISCRETE_TOKEN_TYPE
+            speech_stream_ids[disc_pos] = stream_idx
+            target_block_ids[disc_pos] = block_indices
 
-        seq_len = len(token_ids)
+        cont_pos = speech_base + block_indices * block_size + num_discrete_streams
+        token_ids[cont_pos] = self.pad_token_id
+        token_type_ids[cont_pos] = SPEECH_CONTINUOUS_TOKEN_TYPE
+        speech_stream_ids[cont_pos] = speech_continuous_stream_idx
+        target_block_ids[cont_pos] = block_indices
+        continuous_values[cont_pos] = target_continuous
+
+        speech_target_end = speech_base + num_speech_blocks * block_size
+
+        # --- EOS ---
+        eos_pos = speech_target_end
+        token_ids[eos_pos] = self.eos_token_id
+        token_type_ids[eos_pos] = TEXT_TOKEN_TYPE
+        speech_stream_ids[eos_pos] = text_stream_idx
+
         summary = torch.tensor(
             [
                 text_prompt_start,
@@ -980,11 +985,11 @@ class BatchCollate:
             dtype=torch.long,
         )
         return {
-            "token_ids": torch.tensor(token_ids, dtype=torch.long),
-            "continuous_values": torch.stack(continuous_values, dim=0).to(dtype=torch.float32),
-            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
-            "speech_stream_ids": torch.tensor(speech_stream_ids, dtype=torch.long),
-            "target_block_ids": torch.tensor(target_block_ids, dtype=torch.long),
+            "token_ids": token_ids,
+            "continuous_values": continuous_values,
+            "token_type_ids": token_type_ids,
+            "speech_stream_ids": speech_stream_ids,
+            "target_block_ids": target_block_ids,
             "attention_mask": torch.ones(seq_len, dtype=torch.bool),
             "summary": summary,
         }

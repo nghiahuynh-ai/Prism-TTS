@@ -36,7 +36,7 @@ WANDB_LOG_MODEL ?= false
 WANDB_ENTITY ?=
 WANDB_GROUP ?=
 WANDB_TAGS ?=
-PYTORCH_CUDA_ALLOC_CONF ?= backend:cudaMallocAsync
+PYTORCH_CUDA_ALLOC_CONF ?= expandable_segments:True
 # Adaptive length-estimation parallelism defaults.
 PRISM_TTS_ADAPTIVE_LENGTH_WORKERS ?= 16
 PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE ?= 8192
@@ -138,7 +138,7 @@ help:
 	@echo "  WANDB_ENTITY=...       Override WandB entity"
 	@echo "  WANDB_GROUP=...        Override WandB group"
 	@echo "  WANDB_TAGS=a,b,c       Override WandB tags"
-	@echo "  PYTORCH_CUDA_ALLOC_CONF=...  CUDA allocator config (default: backend:cudaMallocAsync)"
+	@echo "  PYTORCH_CUDA_ALLOC_CONF=...  CUDA allocator config (default: expandable_segments:True)"
 	@echo "  PRISM_TTS_ADAPTIVE_LENGTH_WORKERS=...            Adaptive length workers (default: 16)"
 	@echo "  PRISM_TTS_ADAPTIVE_LENGTH_CHUNK_SIZE=...         Adaptive length chunk size (default: 8192)"
 	@echo "  PRISM_TTS_ADAPTIVE_LENGTH_MIN_PARALLEL_SAMPLES=...  Adaptive length parallel threshold (default: 20000)"
