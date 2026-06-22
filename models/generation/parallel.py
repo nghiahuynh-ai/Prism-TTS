@@ -80,13 +80,6 @@ def generate_parallel(
         < speech_target_lengths.unsqueeze(1)
     )
     maskable_target_mask = valid_target_mask.clone()
-    has_target = speech_target_lengths > 0
-    if has_target.any():
-        eos_sample_idx = torch.nonzero(has_target, as_tuple=False).squeeze(1)
-        eos_block_idx = speech_target_lengths[eos_sample_idx] - 1
-        predicted_discrete[eos_sample_idx, eos_block_idx, :] = terminal_discrete_id
-        predicted_continuous[eos_sample_idx, eos_block_idx, :] = 0.0
-        maskable_target_mask[eos_sample_idx, eos_block_idx] = False
 
     masked_blocks = maskable_target_mask.clone()
     block_confidence = torch.full(
@@ -235,7 +228,7 @@ def generate_parallel(
         )
         for sample_idx in range(batch_size):
             target_len = int(speech_target_lengths[sample_idx].item())
-            maskable_len = max(0, target_len - 1)
+            maskable_len = target_len
             if maskable_len <= 0:
                 continue
 
@@ -256,6 +249,12 @@ def generate_parallel(
         masked_blocks = next_masked_blocks & maskable_target_mask
 
     generated_lengths = speech_target_lengths.clone()
+    all_eos = (predicted_discrete == terminal_discrete_id).all(dim=-1)
+    for sample_idx in range(batch_size):
+        max_len = int(speech_target_lengths[sample_idx].item())
+        eos_hits = torch.nonzero(all_eos[sample_idx, :max_len], as_tuple=False)
+        if eos_hits.numel() > 0:
+            generated_lengths[sample_idx] = int(eos_hits[0].item()) + 1
     return (
         predicted_discrete,
         predicted_continuous,

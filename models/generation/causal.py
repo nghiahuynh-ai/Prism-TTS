@@ -36,7 +36,7 @@ def generate_causal(
     torch.LongTensor,
     list[torch.Tensor],
 ]:
-    """Causal left-to-right generation with a fixed terminal EOS speech block."""
+    """Causal left-to-right generation; EOS block is predicted by the model."""
     del parallel_num_steps
     batch_size = int(text_prompt.shape[0])
     device = text_prompt.device
@@ -79,20 +79,13 @@ def generate_causal(
         < speech_target_lengths.unsqueeze(1)
     )
     maskable_target_mask = valid_target_mask.clone()
-    has_target = speech_target_lengths > 0
-    if has_target.any():
-        eos_sample_idx = torch.nonzero(has_target, as_tuple=False).squeeze(1)
-        eos_block_idx = speech_target_lengths[eos_sample_idx] - 1
-        predicted_discrete[eos_sample_idx, eos_block_idx, :] = terminal_discrete_id
-        predicted_continuous[eos_sample_idx, eos_block_idx, :] = 0.0
-        maskable_target_mask[eos_sample_idx, eos_block_idx] = False
 
     step_indices = torch.arange(max_target, device=device).view(max_target, 1, 1)
     block_indices = torch.arange(max_target, device=device).view(1, 1, max_target)
     left_to_right_masks = block_indices >= step_indices
     mask_schedule = maskable_target_mask.unsqueeze(0) & left_to_right_masks
 
-    maskable_lengths = torch.clamp(speech_target_lengths - 1, min=0)
+    maskable_lengths = speech_target_lengths.clone()
     finished = maskable_lengths <= 0
     for step_idx in range(max_target):
         masked_blocks = mask_schedule[step_idx] & (~finished).unsqueeze(1)
@@ -192,6 +185,12 @@ def generate_causal(
         collected_logits.append(step_logits)
 
     generated_lengths = speech_target_lengths.clone()
+    all_eos = (predicted_discrete == terminal_discrete_id).all(dim=-1)
+    for sample_idx in range(batch_size):
+        max_len = int(speech_target_lengths[sample_idx].item())
+        eos_hits = torch.nonzero(all_eos[sample_idx, :max_len], as_tuple=False)
+        if eos_hits.numel() > 0:
+            generated_lengths[sample_idx] = int(eos_hits[0].item()) + 1
     return (
         predicted_discrete,
         predicted_continuous,

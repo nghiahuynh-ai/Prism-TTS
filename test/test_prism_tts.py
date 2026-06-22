@@ -515,7 +515,7 @@ class TestPrismTTS(unittest.TestCase):
             outputs.prior_latents.shape,
             (batch_size, generated_len, self.continuous_latent_size),
         )
-        self.assertEqual(len(outputs.discrete_logits), max(0, generated_len - 1))
+        self.assertEqual(len(outputs.discrete_logits), generated_len)
         self.assertEqual(
             outputs.discrete_logits[0].shape,
             (batch_size, self.num_discrete_tokens, self.discrete_vocab_size),
@@ -688,19 +688,10 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
 
         self.assertEqual(outputs.discrete_ids.shape[-1], max_new_blocks)
         self.assertEqual(outputs.continuous_latents.shape[1], max_new_blocks)
-        self.assertEqual(len(outputs.discrete_logits), max(0, max_new_blocks - 1))
+        self.assertEqual(len(outputs.discrete_logits), max_new_blocks)
+        # Mock always returns content_id — all blocks should be content_id, no EOS detected.
         self.assertTrue(
-            torch.eq(outputs.discrete_ids[0, :, max_new_blocks - 1], eos_id).all()
-        )
-        if max_new_blocks > 1:
-            self.assertTrue(
-                torch.eq(outputs.discrete_ids[0, :, : max_new_blocks - 1], content_id).all()
-            )
-        self.assertTrue(
-            torch.eq(
-                outputs.continuous_latents[0, max_new_blocks - 1, :],
-                0.0,
-            ).all()
+            torch.eq(outputs.discrete_ids[0, :, :], content_id).all()
         )
 
     def test_generate_parallel_returns_expected_shapes(self) -> None:
@@ -1175,7 +1166,7 @@ class TestPrismTTSGenerationAlignment(unittest.TestCase):
         self.assertLessEqual(outputs.discrete_ids.shape[-1], 3)
         self.assertEqual(
             len(outputs.discrete_logits),
-            max(0, int(outputs.discrete_ids.shape[-1]) - 1),
+            int(outputs.discrete_ids.shape[-1]),
         )
 
     def test_generate_e2e_supports_batched_inputs(self) -> None:

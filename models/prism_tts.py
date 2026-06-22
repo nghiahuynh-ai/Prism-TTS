@@ -443,18 +443,6 @@ class PrismTTS(nn.Module):
             do_sample=do_sample,
         )
 
-    def sample_continuous_latent(
-        self,
-        cond: torch.FloatTensor,
-        num_steps: Optional[int] = None,
-        temperature: float = 1.0,
-    ) -> torch.FloatTensor:
-        """Return backbone-predicted continuous latents for compatibility."""
-        del num_steps, temperature
-        if cond.dim() not in (2, 3):
-            raise ValueError("cond must have shape [batch, channels] or [batch, seq, channels].")
-        return cond
-
     def _encode(
         self,
         flat: MU.FlatBatch,
