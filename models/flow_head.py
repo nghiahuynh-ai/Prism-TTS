@@ -260,6 +260,67 @@ class DiTBlock(nn.Module):
         return x
 
 
+class FlowMatchingMLP(nn.Module):
+    """MAR-style per-position MLP head for flow matching on continuous latents.
+
+    Takes a noisy latent x_t, a prior condition from the backbone, and a
+    scalar timestep t, and predicts the flow velocity (noise - data).
+    """
+
+    def __init__(
+        self,
+        latent_size: int,
+        hidden_size: int,
+        depth: int = 6,
+    ):
+        super().__init__()
+        if latent_size < 1 or hidden_size < 1:
+            raise ValueError("latent_size and hidden_size must be >= 1.")
+        if depth < 1:
+            raise ValueError("depth must be >= 1.")
+
+        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.input_proj = nn.Linear(latent_size * 2, hidden_size, bias=True)
+        self.layers = nn.ModuleList(
+            [nn.Linear(hidden_size, hidden_size, bias=True) for _ in range(depth)]
+        )
+        self.act = nn.SiLU()
+        self.output_proj = nn.Linear(hidden_size, latent_size, bias=True)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.zeros_(self.input_proj.bias)
+        for layer in self.layers:
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        prior: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x_t:   [N, latent_size] – noisy latent at time t
+            prior:  [N, latent_size] – condition from backbone projection
+            t:      [N] – timestep in [0, 1]
+        Returns:
+            velocity [N, latent_size]
+        """
+        h = self.input_proj(torch.cat([x_t, prior], dim=-1))
+        t_emb = self.t_embedder(t).to(dtype=h.dtype, device=h.device)
+        h = h + t_emb
+        for layer in self.layers:
+            h = self.act(layer(h))
+        return self.output_proj(h)
+
+
 class FlowHead(nn.Module):
     """DiT-style flow head for continuous latent velocity prediction."""
 

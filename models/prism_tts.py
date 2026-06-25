@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaConfig
 
+from models.flow_head import FlowMatchingMLP
 from models.llama_backbone import LlamaBackbone
 from utils import model_utils as MU
 
@@ -37,10 +38,12 @@ class PrismTTS(nn.Module):
         discrete_vocab_size: int,
         continuous_latent_size: int,
         continuous_loss_weight: float = 1.0,
-        continuous_magnitude_loss_weight: float = 0.1,
         discrete_regular_token_loss_weight: float = 1.0,
         discrete_special_token_loss_weight: float = 1.0,
         parallel_sample_steps: int = 64,
+        flow_matching_hidden_size: int = 512,
+        flow_matching_depth: int = 6,
+        flow_matching_num_steps: int = 10,
     ):
         """Initialize model modules, embeddings, loss weights, and special-token ids."""
         super().__init__()
@@ -52,8 +55,6 @@ class PrismTTS(nn.Module):
             raise ValueError("continuous_latent_size must be at least 1.")
         if continuous_loss_weight < 0.0:
             raise ValueError("continuous_loss_weight must be >= 0.")
-        if continuous_magnitude_loss_weight < 0.0:
-            raise ValueError("continuous_magnitude_loss_weight must be >= 0.")
         if discrete_regular_token_loss_weight < 0.0:
             raise ValueError("discrete_regular_token_loss_weight must be >= 0.")
         if discrete_special_token_loss_weight < 0.0:
@@ -76,10 +77,10 @@ class PrismTTS(nn.Module):
         self.speech_block_size = self.num_discrete_tokens + 1
 
         self.continuous_loss_weight = float(continuous_loss_weight)
-        self.continuous_magnitude_loss_weight = float(continuous_magnitude_loss_weight)
         self.discrete_regular_token_loss_weight = float(discrete_regular_token_loss_weight)
         self.discrete_special_token_loss_weight = float(discrete_special_token_loss_weight)
         self.parallel_sample_steps = int(parallel_sample_steps)
+        self.flow_matching_num_steps = int(flow_matching_num_steps)
 
         self.backbone = LlamaBackbone(llama_config)
         self.discrete_embeddings = nn.ModuleList(
@@ -91,10 +92,15 @@ class PrismTTS(nn.Module):
             for _ in range(self.num_discrete_tokens)
         )
         self.continuous_proj = nn.Linear(self.continuous_latent_size, self.hidden_size)
-        self.continuous_prior_head = nn.Sequential(
+        self.continuous_prior_proj = nn.Sequential(
             nn.Linear(self.hidden_size, self.hidden_size),
             nn.SiLU(),
             nn.Linear(self.hidden_size, self.continuous_latent_size),
+        )
+        self.continuous_flow_head = FlowMatchingMLP(
+            latent_size=self.continuous_latent_size,
+            hidden_size=int(flow_matching_hidden_size),
+            depth=int(flow_matching_depth),
         )
 
         self.token_type_embeddings = nn.Parameter(torch.empty(3, self.hidden_size))
@@ -144,11 +150,12 @@ class PrismTTS(nn.Module):
         for lm_head in self.discrete_lm_heads:
             nn.init.normal_(lm_head.weight, mean=0.0, std=std)
         nn.init.normal_(self.continuous_proj.weight, mean=0.0, std=std)
-        for layer in self.continuous_prior_head:
+        for layer in self.continuous_prior_proj:
             if isinstance(layer, nn.Linear):
                 nn.init.normal_(layer.weight, mean=0.0, std=std)
                 if layer.bias is not None:
                     nn.init.zeros_(layer.bias)
+        self.continuous_flow_head._init_weights()
         nn.init.normal_(self.token_type_embeddings, mean=0.0, std=std)
         nn.init.normal_(self.speech_stream_embeddings, mean=0.0, std=std)
         nn.init.zeros_(self.active_stream_count_embedding.weight)
@@ -416,15 +423,47 @@ class PrismTTS(nn.Module):
         continuous_values: torch.FloatTensor,
         masked_continuous_positions: torch.BoolTensor,
     ) -> torch.Tensor:
-        """Compute masked continuous latent reconstruction loss from backbone hidden states."""
+        """Flow matching loss on masked continuous positions using MAR-style MLP."""
         if not masked_continuous_positions.any():
             return hidden_states.new_zeros(())
 
-        predicted = self.continuous_prior_head(hidden_states[masked_continuous_positions])
+        prior = self.continuous_prior_proj(hidden_states[masked_continuous_positions])
         targets = continuous_values[masked_continuous_positions]
-        cosine_loss = (1.0 - F.cosine_similarity(predicted, targets, dim=-1)).mean()
-        magnitude_loss = F.mse_loss(predicted.norm(dim=-1), targets.norm(dim=-1))
-        return cosine_loss + self.continuous_magnitude_loss_weight * magnitude_loss
+
+        t = torch.rand(prior.shape[0], device=prior.device, dtype=prior.dtype)
+        noise = torch.randn_like(targets)
+        t_view = t.unsqueeze(-1)
+        x_t = (1.0 - t_view) * targets + t_view * noise
+        v_target = noise - targets
+
+        v_pred = self.continuous_flow_head(x_t, prior, t)
+        return F.mse_loss(v_pred, v_target)
+
+    def _predict_continuous(
+        self,
+        hidden_states: torch.FloatTensor,
+        num_steps: Optional[int] = None,
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        """ODE-solve continuous latents from noise, conditioned on backbone prior.
+
+        Returns (prior, prediction) where prior is the raw backbone projection
+        and prediction is the Euler-integrated flow matching output.
+        """
+        n_steps = int(num_steps) if num_steps is not None else self.flow_matching_num_steps
+        prior = self.continuous_prior_proj(hidden_states)
+        x = torch.randn_like(prior)
+        dt = -1.0 / n_steps
+        for i in range(n_steps):
+            t_val = 1.0 - float(i) / n_steps
+            t = torch.full(
+                (prior.shape[0],),
+                t_val,
+                device=prior.device,
+                dtype=prior.dtype,
+            )
+            v = self.continuous_flow_head(x, prior, t)
+            x = x + dt * v
+        return prior, x
 
     def _sample_discrete_ids(
         self,

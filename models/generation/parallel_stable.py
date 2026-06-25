@@ -183,12 +183,12 @@ def generate_parallel_stable(
 
         if masked_continuous_positions.any():
             continuous_hidden = hidden_states[masked_continuous_positions]
-            prior_prediction = model.continuous_prior_head(continuous_hidden)
+            prior_prediction, continuous_prediction = model._predict_continuous(continuous_hidden)
             continuous_batch_idx = batch_indices[masked_continuous_positions]
             continuous_block_idx = flat.target_block_ids[masked_continuous_positions]
             candidate_prior[continuous_batch_idx, continuous_block_idx, :] = prior_prediction
             candidate_continuous[continuous_batch_idx, continuous_block_idx, :] = (
-                prior_prediction
+                continuous_prediction
             )
 
             if len(special_discrete_token_ids) > 0:
