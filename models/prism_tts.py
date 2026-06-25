@@ -40,10 +40,10 @@ class PrismTTS(nn.Module):
         continuous_loss_weight: float = 1.0,
         discrete_regular_token_loss_weight: float = 1.0,
         discrete_special_token_loss_weight: float = 1.0,
-        parallel_sample_steps: int = 64,
+        parallel_sample_steps: int = 128,
         flow_matching_hidden_size: int = 512,
         flow_matching_depth: int = 6,
-        flow_matching_num_steps: int = 10,
+        flow_matching_num_steps: int = 32,
     ):
         """Initialize model modules, embeddings, loss weights, and special-token ids."""
         super().__init__()

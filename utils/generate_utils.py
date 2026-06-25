@@ -102,7 +102,10 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
         discrete_special_token_loss_weight=float(
             prism_cfg.get("discrete_special_token_loss_weight", 1.0)
         ),
-        parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 64)),
+        parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 128)),
+        flow_matching_hidden_size=int(prism_cfg.get("flow_matching_hidden_size", 512)),
+        flow_matching_depth=int(prism_cfg.get("flow_matching_depth", 6)),
+        flow_matching_num_steps=int(prism_cfg.get("flow_matching_num_steps", 32)),
     )
 
 

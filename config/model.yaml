@@ -18,6 +18,10 @@ model:
     discrete_regular_token_loss_weight: 1.0
     discrete_special_token_loss_weight: 0.1
     parallel_sample_steps: 128
+    # Flow matching head for continuous latent prediction.
+    flow_matching_hidden_size: 512
+    flow_matching_depth: 6
+    flow_matching_num_steps: 32
 
   llama_config:
     # Must be >= text_token_offset + num_text_vocab_tokens.
