@@ -13,10 +13,10 @@ experiment:
   # experiment-specific values here.
   trainer:
     logger:
-      name: v2.1
+      name: v2.2
 
     checkpoint:
-      dirpath: checkpoints/v2.1
+      dirpath: checkpoints/v2.2
 
     # distributed:
     #   enabled: true

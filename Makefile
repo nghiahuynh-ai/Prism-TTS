@@ -29,7 +29,7 @@ PRETRAINED_STRICT ?= false
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
-WANDB_NAME ?= v2.1
+WANDB_NAME ?= v2.2
 WANDB_SAVE_DIR ?= logs
 WANDB_OFFLINE ?= false
 WANDB_LOG_MODEL ?= false
