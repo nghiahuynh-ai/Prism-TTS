@@ -16,7 +16,7 @@ experiment:
       name: ar
 
     checkpoint:
-      dirpath: checkpoints/ar
+      dirpath: checkpoints/ar-wo-vq
 
     distributed:
       enabled: true
