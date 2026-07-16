@@ -25,26 +25,56 @@ def _to_additive_mask(mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return (1.0 - mask).masked_fill((1.0 - mask).to(torch.bool), min_dtype)
 
 
-def _expand_padding_mask_to_4d(
-    attention_mask: torch.Tensor,
+def _build_causal_4d_mask(
+    padding_mask: Optional[torch.Tensor],
+    batch_size: int,
     query_length: int,
     target_length: int,
     dtype: torch.dtype,
     device: torch.device,
+    cache_position: Optional[torch.LongTensor],
+    window: Optional[int] = None,
 ) -> torch.Tensor:
-    if attention_mask.dim() != 2:
-        raise ValueError("Padding attention_mask must be 2D [batch, key_len].")
+    """Build a 4D additive causal mask, optionally combined with a key-padding mask.
 
-    batch_size, key_len = attention_mask.shape
-    if key_len < target_length:
-        raise ValueError(
-            f"attention_mask key length ({key_len}) is shorter than target_length ({target_length})."
-        )
+    PrismTTS is a purely autoregressive model, so attention must be causal. Right
+    padding plus causality guarantees every query attends to at least position 0,
+    avoiding all-`-inf` rows. When `window` is set, attention is additionally limited
+    to the most recent `window` positions (sliding-window causal, used by the
+    short-context conditioner).
+    """
+    min_value = torch.finfo(dtype).min
 
-    # Keep only keys; query masking is handled by downstream losses.
-    key_mask = attention_mask[:, :target_length].to(device=device, dtype=dtype)
-    additive = _to_additive_mask(key_mask, dtype=dtype)
-    return additive[:, None, None, :].expand(batch_size, 1, query_length, target_length)
+    if cache_position is not None:
+        query_positions = cache_position.to(device=device).view(query_length, 1)
+    else:
+        # No KV cache: queries occupy the last `query_length` positions.
+        offset = target_length - query_length
+        query_positions = (
+            torch.arange(query_length, device=device) + offset
+        ).view(query_length, 1)
+    key_positions = torch.arange(target_length, device=device).view(1, target_length)
+
+    # True where a key is in the future of the query (must be masked).
+    causal_bool = key_positions > query_positions  # [q, kv]
+    if window is not None and window > 0:
+        causal_bool = causal_bool | ((query_positions - key_positions) >= window)
+    causal = torch.zeros(query_length, target_length, dtype=dtype, device=device)
+    causal = causal.masked_fill(causal_bool, min_value)
+    mask = causal[None, None].expand(batch_size, 1, query_length, target_length).clone()
+
+    if padding_mask is not None:
+        if padding_mask.dim() != 2:
+            raise ValueError("Padding attention_mask must be 2D [batch, key_len].")
+        if padding_mask.shape[1] < target_length:
+            raise ValueError(
+                f"attention_mask key length ({padding_mask.shape[1]}) is shorter than "
+                f"target_length ({target_length})."
+            )
+        key_pad = ~padding_mask[:, :target_length].to(device=device, dtype=torch.bool)
+        mask = mask.masked_fill(key_pad[:, None, None, :], min_value)
+
+    return mask
 
 
 class FullAttentionLlamaDecoderLayer(nn.Module):
@@ -157,27 +187,31 @@ class LlamaBackbone(LlamaPreTrainedModel):
         attention_mask: Optional[torch.Tensor],
         inputs_embeds: torch.Tensor,
         past_key_values: Optional[Cache],
+        cache_position: Optional[torch.LongTensor],
     ) -> Optional[torch.Tensor]:
         past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
         sequence_length = int(inputs_embeds.shape[1])
         target_length = past_seen_tokens + sequence_length
+        batch_size = int(inputs_embeds.shape[0])
 
-        if attention_mask is None:
-            return None
-        if attention_mask.dim() == 2:
-            return _expand_padding_mask_to_4d(
-                attention_mask=attention_mask,
-                query_length=sequence_length,
-                target_length=target_length,
-                dtype=inputs_embeds.dtype,
-                device=inputs_embeds.device,
-            )
-        if attention_mask.dim() == 4:
+        # A 4D mask is treated as a fully specified additive mask (already causal).
+        if attention_mask is not None and attention_mask.dim() == 4:
             return _to_additive_mask(
                 attention_mask.to(device=inputs_embeds.device),
                 inputs_embeds.dtype,
             )
-        raise ValueError("attention_mask must be either 2D padding mask or 4D additive mask.")
+        if attention_mask is not None and attention_mask.dim() != 2:
+            raise ValueError("attention_mask must be either 2D padding mask or 4D additive mask.")
+
+        return _build_causal_4d_mask(
+            padding_mask=attention_mask,
+            batch_size=batch_size,
+            query_length=sequence_length,
+            target_length=target_length,
+            dtype=inputs_embeds.dtype,
+            device=inputs_embeds.device,
+            cache_position=cache_position,
+        )
 
     def forward(
         self,
@@ -215,6 +249,7 @@ class LlamaBackbone(LlamaPreTrainedModel):
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
+            cache_position=cache_position,
         )
 
         hidden_states = inputs_embeds
@@ -265,3 +300,58 @@ class LlamaBackbone(LlamaPreTrainedModel):
             hidden_states=all_hidden_states,
             attentions=all_attentions,
         )
+
+
+class WindowedCausalEncoder(nn.Module):
+    """Lightweight sliding-window causal transformer for local (short-context) conditioning.
+
+    Each position attends only to the most recent `window` positions (including
+    itself). Used by PrismTTS as the CALM-style short-context branch whose output is
+    added to the long-context backbone hidden state before the per-frame head.
+    """
+
+    def __init__(self, config: LlamaConfig, num_layers: int, window: int):
+        super().__init__()
+        if num_layers < 1:
+            raise ValueError("WindowedCausalEncoder num_layers must be >= 1.")
+        if window < 1:
+            raise ValueError("WindowedCausalEncoder window must be >= 1.")
+        self.window = int(window)
+        self.layers = nn.ModuleList(
+            [FullAttentionLlamaDecoderLayer(config, layer_idx) for layer_idx in range(num_layers)]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+
+    def forward(
+        self,
+        inputs_embeds: torch.FloatTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.FloatTensor:
+        batch_size, seq_len, _ = inputs_embeds.shape
+        device = inputs_embeds.device
+        cache_position = torch.arange(seq_len, device=device)
+        position_ids = cache_position.unsqueeze(0)
+
+        resolved_mask = _build_causal_4d_mask(
+            padding_mask=attention_mask if (attention_mask is not None and attention_mask.dim() == 2) else None,
+            batch_size=batch_size,
+            query_length=seq_len,
+            target_length=seq_len,
+            dtype=inputs_embeds.dtype,
+            device=device,
+            cache_position=cache_position,
+            window=self.window,
+        )
+        position_embeddings = self.rotary_emb(inputs_embeds, position_ids=position_ids)
+
+        hidden_states = inputs_embeds
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states=hidden_states,
+                attention_mask=resolved_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+            )
+        return self.norm(hidden_states)

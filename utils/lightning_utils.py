@@ -17,20 +17,15 @@ class PrismBatch:
     text_target_lengths: Optional[torch.LongTensor] = None
     speech_target_lengths: Optional[torch.LongTensor] = None
     text_target: Optional[torch.LongTensor] = None
-    discrete_target: Optional[torch.LongTensor] = None
     continuous_target: Optional[torch.FloatTensor] = None
     text_prompt: Optional[torch.LongTensor] = None
-    discrete_prompt: Optional[torch.LongTensor] = None
     continuous_prompt: Optional[torch.FloatTensor] = None
     attention_mask: Optional[torch.Tensor] = None
     flat_token_ids: Optional[torch.LongTensor] = None
     flat_continuous_values: Optional[torch.FloatTensor] = None
     flat_token_type_ids: Optional[torch.LongTensor] = None
-    flat_speech_stream_ids: Optional[torch.LongTensor] = None
     flat_target_block_ids: Optional[torch.LongTensor] = None
     flat_target_block_counts: Optional[torch.LongTensor] = None
-    flow_timesteps: Optional[torch.FloatTensor] = None
-    noise: Optional[torch.FloatTensor] = None
 
 
 @dataclass
@@ -65,9 +60,9 @@ def max_target_length_from_prism_batch(batch_inputs: Any) -> int:
     if flat_target_block_counts is not None:
         return int(torch.as_tensor(flat_target_block_counts).max().item())
 
-    discrete_target = getattr(batch_inputs, "discrete_target", None)
-    if discrete_target is not None:
-        normalized = torch.as_tensor(discrete_target)
+    continuous_target = getattr(batch_inputs, "continuous_target", None)
+    if continuous_target is not None:
+        normalized = torch.as_tensor(continuous_target)
         if normalized.dim() >= 2:
             return int(normalized.shape[-2])
 

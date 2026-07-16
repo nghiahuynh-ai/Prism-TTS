@@ -15,7 +15,6 @@ from utils.model_utils import (
     PrismTTSGenerationOutput,
     PrismTTSOutput,
     normalize_continuous_latents,
-    normalize_discrete_tokens,
 )
 
 try:
@@ -178,8 +177,8 @@ class PrismTTSLightning(pl.LightningModule):
             sync_dist=self.sync_dist_logging,
         )
         self.log(
-            "train/discrete_loss",
-            outputs.discrete_loss,
+            "train/consistency_loss",
+            outputs.consistency_loss,
             prog_bar=False,
             on_step=True,
             on_epoch=True,
@@ -187,31 +186,11 @@ class PrismTTSLightning(pl.LightningModule):
             sync_dist=self.sync_dist_logging,
         )
         self.log(
-            "train/continuous_loss",
-            outputs.continuous_loss,
+            "train/eos_loss",
+            outputs.eos_loss,
             prog_bar=False,
             on_step=True,
             on_epoch=True,
-            batch_size=batch_size,
-            sync_dist=self.sync_dist_logging,
-        )
-        self.log(
-            "train/flow_loss",
-            outputs.flow_loss,
-            prog_bar=False,
-            on_step=True,
-            on_epoch=True,
-            batch_size=batch_size,
-            sync_dist=self.sync_dist_logging,
-        )
-
-        discrete_ppl = torch.exp(outputs.discrete_loss.detach().clamp(max=20.0))
-        self.log(
-            "train/discrete_ppl",
-            discrete_ppl,
-            prog_bar=False,
-            on_step=True,
-            on_epoch=False,
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
@@ -246,8 +225,8 @@ class PrismTTSLightning(pl.LightningModule):
             sync_dist=self.sync_dist_logging,
         )
         self.log(
-            "val/discrete_loss",
-            outputs.discrete_loss,
+            "val/consistency_loss",
+            outputs.consistency_loss,
             prog_bar=False,
             on_step=False,
             on_epoch=True,
@@ -255,17 +234,8 @@ class PrismTTSLightning(pl.LightningModule):
             sync_dist=self.sync_dist_logging,
         )
         self.log(
-            "val/continuous_loss",
-            outputs.continuous_loss,
-            prog_bar=False,
-            on_step=False,
-            on_epoch=True,
-            batch_size=batch_size,
-            sync_dist=self.sync_dist_logging,
-        )
-        self.log(
-            "val/flow_loss",
-            outputs.flow_loss,
+            "val/eos_loss",
+            outputs.eos_loss,
             prog_bar=False,
             on_step=False,
             on_epoch=True,
@@ -340,25 +310,21 @@ class PrismTTSLightning(pl.LightningModule):
             batch_inputs.flat_token_ids is None
             or batch_inputs.flat_continuous_values is None
             or batch_inputs.flat_token_type_ids is None
-            or batch_inputs.flat_speech_stream_ids is None
             or batch_inputs.flat_target_block_ids is None
         ):
             raise ValueError(
                 "Batch is missing required pre-flattened tensors: "
                 "flat_token_ids, flat_continuous_values, flat_token_type_ids, "
-                "flat_speech_stream_ids, flat_target_block_ids."
+                "flat_target_block_ids."
             )
 
         return self.model(
             flat_token_ids=batch_inputs.flat_token_ids,
             flat_continuous_values=batch_inputs.flat_continuous_values,
             flat_token_type_ids=batch_inputs.flat_token_type_ids,
-            flat_speech_stream_ids=batch_inputs.flat_speech_stream_ids,
             flat_target_block_ids=batch_inputs.flat_target_block_ids,
             flat_target_block_counts=batch_inputs.flat_target_block_counts,
             attention_mask=batch_inputs.attention_mask,
-            flow_timesteps=batch_inputs.flow_timesteps,
-            noise=batch_inputs.noise,
             return_dict=True,
         )
 
@@ -376,24 +342,19 @@ class PrismTTSLightning(pl.LightningModule):
             "flat_token_ids",
             "flat_continuous_values",
             "flat_token_type_ids",
-            "flat_speech_stream_ids",
             "flat_target_block_ids",
         )
         required = (
             "text_target",
-            "discrete_target",
             "continuous_target",
             "text_prompt",
-            "discrete_prompt",
             "continuous_prompt",
         )
         if all(key in batch for key in required):
             return PrismBatch(
                 text_target=batch["text_target"],
-                discrete_target=batch["discrete_target"],
                 continuous_target=batch["continuous_target"],
                 text_prompt=batch["text_prompt"],
-                discrete_prompt=batch["discrete_prompt"],
                 continuous_prompt=batch["continuous_prompt"],
                 text_prompt_lengths=batch.get("text_prompt_lengths"),
                 speech_prompt_lengths=batch.get("speech_prompt_lengths"),
@@ -403,11 +364,8 @@ class PrismTTSLightning(pl.LightningModule):
                 flat_token_ids=batch.get("flat_token_ids"),
                 flat_continuous_values=batch.get("flat_continuous_values"),
                 flat_token_type_ids=batch.get("flat_token_type_ids"),
-                flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
-                flow_timesteps=batch.get("flow_timesteps"),
-                noise=batch.get("noise"),
             )
 
         if all(key in batch for key in required_flat):
@@ -416,11 +374,8 @@ class PrismTTSLightning(pl.LightningModule):
                 flat_token_ids=batch.get("flat_token_ids"),
                 flat_continuous_values=batch.get("flat_continuous_values"),
                 flat_token_type_ids=batch.get("flat_token_type_ids"),
-                flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
-                flow_timesteps=batch.get("flow_timesteps"),
-                noise=batch.get("noise"),
             )
 
         if "prompt" in batch and "target" in batch:
@@ -431,50 +386,38 @@ class PrismTTSLightning(pl.LightningModule):
 
             return PrismBatch(
                 text_target=target["text"],
-                discrete_target=target["discrete"],
                 continuous_target=target["continuous"],
                 text_prompt=prompt["text"],
-                discrete_prompt=prompt["discrete"],
                 continuous_prompt=prompt["continuous"],
                 text_prompt_lengths=batch.get("text_prompt_lengths"),
                 speech_prompt_lengths=batch.get("speech_prompt_lengths"),
                 text_target_lengths=batch.get("text_target_lengths"),
                 speech_target_lengths=batch.get("speech_target_lengths"),
                 attention_mask=batch.get("attention_mask"),
-                flow_timesteps=batch.get("flow_timesteps"),
-                noise=batch.get("noise"),
             )
 
         raise KeyError(
             "Mapping batch is missing PrismTTS keys. Required keys: "
-            "(text_target, discrete_target, continuous_target, text_prompt, "
-            "discrete_prompt, continuous_prompt) or "
+            "(text_target, continuous_target, text_prompt, continuous_prompt) or "
             "(flat_token_ids, flat_continuous_values, flat_token_type_ids, "
-            "flat_speech_stream_ids, flat_target_block_ids)."
+            "flat_target_block_ids)."
         )
 
     def _parse_sequence_batch(self, batch: list[Any] | tuple[Any, ...]) -> PrismBatch:
-        if len(batch) < 6:
+        if len(batch) < 4:
             raise ValueError(
-                "Sequence batch must provide at least 6 tensors in order: "
-                "text_target, discrete_target, continuous_target, text_prompt, "
-                "discrete_prompt, continuous_prompt."
+                "Sequence batch must provide at least 4 tensors in order: "
+                "text_target, continuous_target, text_prompt, continuous_prompt."
             )
 
-        attention_mask = batch[6] if len(batch) > 6 else None
-        flow_timesteps = batch[7] if len(batch) > 7 else None
-        noise = batch[8] if len(batch) > 8 else None
+        attention_mask = batch[4] if len(batch) > 4 else None
 
         return PrismBatch(
             text_target=batch[0],
-            discrete_target=batch[1],
-            continuous_target=batch[2],
-            text_prompt=batch[3],
-            discrete_prompt=batch[4],
-            continuous_prompt=batch[5],
+            continuous_target=batch[1],
+            text_prompt=batch[2],
+            continuous_prompt=batch[3],
             attention_mask=attention_mask,
-            flow_timesteps=flow_timesteps,
-            noise=noise,
         )
 
     def _current_lr(self) -> Optional[float]:
@@ -531,10 +474,8 @@ class PrismTTSLightning(pl.LightningModule):
         batch_inputs = self._parse_batch(batch)
         if (
             batch_inputs.text_prompt is None
-            or batch_inputs.discrete_prompt is None
             or batch_inputs.continuous_prompt is None
             or batch_inputs.text_target is None
-            or batch_inputs.discrete_target is None
             or batch_inputs.continuous_target is None
         ):
             return None
@@ -542,7 +483,7 @@ class PrismTTSLightning(pl.LightningModule):
         prompt_speech_len = (
             int(torch.as_tensor(batch_inputs.speech_prompt_lengths)[0].item())
             if batch_inputs.speech_prompt_lengths is not None
-            else int(batch_inputs.discrete_prompt.shape[-2])
+            else int(batch_inputs.continuous_prompt.shape[-2])
         )
         prompt_text_len = (
             int(torch.as_tensor(batch_inputs.text_prompt_lengths)[0].item())
@@ -552,7 +493,7 @@ class PrismTTSLightning(pl.LightningModule):
         target_speech_len = (
             int(torch.as_tensor(batch_inputs.speech_target_lengths)[0].item())
             if batch_inputs.speech_target_lengths is not None
-            else int(batch_inputs.discrete_target.shape[-2])
+            else int(batch_inputs.continuous_target.shape[-2])
         )
         target_text_len = (
             int(torch.as_tensor(batch_inputs.text_target_lengths)[0].item())
@@ -563,36 +504,28 @@ class PrismTTSLightning(pl.LightningModule):
             return None
 
         text_prompt = batch_inputs.text_prompt[:, :prompt_text_len]
-        discrete_prompt = normalize_discrete_tokens(
-            batch_inputs.discrete_prompt,
-            "discrete_prompt",
-            num_discrete_tokens=self.model.num_discrete_tokens,
-        )[:, :prompt_speech_len, :]
         continuous_prompt = normalize_continuous_latents(
             batch_inputs.continuous_prompt,
-            expected_len=int(batch_inputs.discrete_prompt.shape[-2]),
+            expected_len=int(batch_inputs.continuous_prompt.shape[-2]),
             name="continuous_prompt",
             continuous_latent_size=self.model.continuous_latent_size,
         )[:, :prompt_speech_len, :]
         text_target = batch_inputs.text_target[:, :target_text_len]
 
-        generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
-        for generation_method in ("causal", "parallel", "parallel_stable"):
-            generation_outputs[generation_method] = self.model.generate(
+        # Cap generation length at the teacher target length so the predicted and
+        # ground-truth audio align for logging/comparison.
+        generation_outputs: dict[str, PrismTTSGenerationOutput] = {
+            "ar": self.model.generate(
                 text_prompt=text_prompt,
-                discrete_prompt=discrete_prompt,
                 continuous_prompt=continuous_prompt,
                 text_target=text_target,
                 text_prompt_lengths=torch.tensor([prompt_text_len], device=self.device),
                 speech_prompt_lengths=torch.tensor([prompt_speech_len], device=self.device),
                 text_target_lengths=torch.tensor([target_text_len], device=self.device),
-                speech_target_lengths=torch.tensor([target_speech_len], device=self.device),
-                max_new_blocks=target_speech_len,
-                do_sample=False,
-                force_silent_special_tokens=True,
-                generation_method=generation_method,
+                max_new_frames=target_speech_len,
                 return_dict=True,
             )
+        }
 
         text_prompt_str = self._decode_text_tokens(text_prompt[0], length=prompt_text_len)
         text_target_str = self._decode_text_tokens(text_target[0], length=target_text_len)
@@ -1052,7 +985,7 @@ class PrismTTSLightning(pl.LightningModule):
             ] = []
             for method_name, generation in generations.items():
                 continuous = generation.continuous_latents
-                if continuous is None:
+                if continuous is None or int(continuous.shape[1]) < 1:
                     continue
                 normalized = normalize_continuous_latents(
                     continuous,
@@ -1060,15 +993,7 @@ class PrismTTSLightning(pl.LightningModule):
                     name=f"generation[{method_name}].continuous_latents",
                     continuous_latent_size=self.model.continuous_latent_size,
                 )
-                normalized_prior: Optional[torch.FloatTensor] = None
-                if generation.prior_latents is not None:
-                    normalized_prior = normalize_continuous_latents(
-                        generation.prior_latents,
-                        expected_len=generation.prior_latents.shape[1],
-                        name=f"generation[{method_name}].prior_latents",
-                        continuous_latent_size=self.model.continuous_latent_size,
-                    )
-                normalized_generations.append((str(method_name), normalized, normalized_prior))
+                normalized_generations.append((str(method_name), normalized, None))
             if not normalized_generations:
                 continue
 

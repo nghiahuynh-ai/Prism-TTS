@@ -91,21 +91,22 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
     llama_config = LlamaConfig(**llama_cfg)
     return PrismTTS(
         llama_config=llama_config,
-        num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
-        discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
         continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
         flow_model_channels=prism_cfg.get("flow_model_channels"),
-        flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
-        continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
-        discrete_regular_token_loss_weight=float(
-            prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
-        ),
-        discrete_special_token_loss_weight=float(
-            prism_cfg.get("discrete_special_token_loss_weight", 1.0)
-        ),
-        flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
-        parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 64)),
+        eos_loss_weight=float(prism_cfg.get("eos_loss_weight", 1.0)),
+        sigma_data=float(prism_cfg.get("sigma_data", 1.0)),
+        p_mean=float(prism_cfg.get("p_mean", -1.0)),
+        p_std=float(prism_cfg.get("p_std", 1.6)),
+        tangent_warmup_steps=int(prism_cfg.get("tangent_warmup_steps", 1000)),
+        tangent_norm_const=float(prism_cfg.get("tangent_norm_const", 0.1)),
+        sample_steps=int(prism_cfg.get("sample_steps", 1)),
+        eos_threshold=float(prism_cfg.get("eos_threshold", 0.5)),
+        latent_stats_decay=float(prism_cfg.get("latent_stats_decay", 0.999)),
+        inject_backbone_noise=bool(prism_cfg.get("inject_backbone_noise", True)),
+        use_short_context=bool(prism_cfg.get("use_short_context", True)),
+        short_context_layers=int(prism_cfg.get("short_context_layers", 2)),
+        short_context_window=int(prism_cfg.get("short_context_window", 10)),
     )
 
 
@@ -114,19 +115,25 @@ def _extract_model_state_dict(
     *,
     use_ema: bool,
 ) -> dict[str, torch.Tensor]:
-    if use_ema:
-        ema_state = checkpoint_payload.get("ema_state")
-        if isinstance(ema_state, dict) and ema_state:
-            return dict(ema_state)
-
+    stripped: dict[str, torch.Tensor] = {}
     state_dict = checkpoint_payload.get("state_dict")
     if isinstance(state_dict, dict) and state_dict:
-        stripped: dict[str, torch.Tensor] = {}
         for key, value in state_dict.items():
             if key.startswith("model."):
                 stripped[key[len("model.") :]] = value
             else:
                 stripped[key] = value
+
+    if use_ema:
+        ema_state = checkpoint_payload.get("ema_state")
+        if isinstance(ema_state, dict) and ema_state:
+            # EMA tracks only trainable float params. Overlay it on top of the
+            # regular weights so non-EMA entries (e.g. latent-stat buffers) survive.
+            merged = dict(stripped)
+            merged.update(dict(ema_state))
+            return merged
+
+    if stripped:
         return stripped
 
     if checkpoint_payload and all(isinstance(key, str) for key in checkpoint_payload):

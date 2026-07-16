@@ -21,8 +21,8 @@ from utils.dataset_utils import (
 
 DEFAULT_DISCRETE_TOKEN_COUNT = 2048
 TEXT_TOKEN_TYPE = 0
-SPEECH_DISCRETE_TOKEN_TYPE = 1
-SPEECH_CONTINUOUS_TOKEN_TYPE = 2
+# Speech is modeled as a single continuous latent per frame (no vector quantization).
+SPEECH_TOKEN_TYPE = 1
 
 
 def build_shared_token_layout(discrete_token_count: int) -> tuple[int, int, int, int]:
@@ -448,14 +448,13 @@ class BatchCollate:
         if not batch:
             raise ValueError("BatchCollate received an empty batch.")
 
-        normalized_samples = [self._validate_collate_sample(item) for item in batch]
-        samples = [self._append_target_eos_block(sample) for sample in normalized_samples]
+        samples = [self._validate_collate_sample(item) for item in batch]
         text_prompt_lengths = torch.tensor(
             [int(sample["text_prompt"].shape[0]) for sample in samples],
             dtype=torch.long,
         )
         speech_prompt_lengths = torch.tensor(
-            [int(sample["discrete_prompt"].shape[0]) for sample in samples],
+            [int(sample["continuous_prompt"].shape[0]) for sample in samples],
             dtype=torch.long,
         )
         text_target_lengths = torch.tensor(
@@ -463,25 +462,17 @@ class BatchCollate:
             dtype=torch.long,
         )
         speech_target_lengths = torch.tensor(
-            [int(sample["discrete_target"].shape[0]) for sample in samples],
+            [int(sample["continuous_target"].shape[0]) for sample in samples],
             dtype=torch.long,
         )
 
         collated: dict[str, torch.Tensor] = {
             "text_prompt": _pad_1d([sample["text_prompt"] for sample in samples], self.text_pad_value),
-            "discrete_prompt": _pad_2d(
-                [sample["discrete_prompt"] for sample in samples],
-                self.discrete_pad_value,
-            ),
             "continuous_prompt": _pad_2d(
                 [sample["continuous_prompt"] for sample in samples],
                 self.continuous_pad_value,
             ),
             "text_target": _pad_1d([sample["text_target"] for sample in samples], self.text_pad_value),
-            "discrete_target": _pad_2d(
-                [sample["discrete_target"] for sample in samples],
-                self.discrete_pad_value,
-            ),
             "continuous_target": _pad_2d(
                 [sample["continuous_target"] for sample in samples],
                 self.continuous_pad_value,
@@ -501,10 +492,6 @@ class BatchCollate:
             [item["token_type_ids"] for item in flat_per_sample],
             TEXT_TOKEN_TYPE,
         )
-        collated["flat_speech_stream_ids"] = _pad_1d(
-            [item["speech_stream_ids"] for item in flat_per_sample],
-            -1,
-        )
         collated["flat_target_block_ids"] = _pad_1d(
             [item["target_block_ids"] for item in flat_per_sample],
             -1,
@@ -514,10 +501,6 @@ class BatchCollate:
             0.0,
         )
         collated["flat_target_block_counts"] = speech_target_lengths
-        collated["flat_summary"] = torch.stack(
-            [item["summary"] for item in flat_per_sample],
-            dim=0,
-        )
 
         if self.include_attention_mask:
             collated["attention_mask"] = _pad_1d(
@@ -525,8 +508,6 @@ class BatchCollate:
                 False,
             ).to(dtype=torch.bool)
 
-        self._collate_optional_1d(samples, collated, key="flow_timesteps", pad_value=0.0)
-        self._collate_optional_2d(samples, collated, key="noise", pad_value=0.0)
         return collated
 
     def _validate_collate_sample(self, sample: Mapping[str, Any]) -> dict[str, torch.Tensor]:
@@ -604,224 +585,62 @@ class BatchCollate:
 
         return normalized
 
-    def _has_terminal_target_eos_block(self, sample: Mapping[str, torch.Tensor]) -> bool:
-        discrete_target = sample["discrete_target"]
-        continuous_target = sample["continuous_target"]
-        if int(discrete_target.shape[0]) < 1:
-            return False
-        if not bool(torch.eq(discrete_target[-1], self.eos_token_id).all().item()):
-            return False
-        last_continuous = continuous_target[-1]
-        return bool(torch.le(last_continuous.abs().max(), 1e-8).item())
-
-    def _append_target_eos_block(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """
-        Ensure each target speech sequence ends with one explicit EOS block:
-        - discrete: all streams = eos_token_id
-        - continuous: all-zero latent vector
-        """
-        if self._has_terminal_target_eos_block(sample):
-            return sample
-
-        discrete_target = sample["discrete_target"]
-        continuous_target = sample["continuous_target"]
-
-        eos_discrete = torch.full(
-            (1, int(discrete_target.shape[1])),
-            fill_value=self.eos_token_id,
-            dtype=discrete_target.dtype,
-            device=discrete_target.device,
-        )
-        eos_continuous = torch.zeros(
-            (1, int(continuous_target.shape[1])),
-            dtype=continuous_target.dtype,
-            device=continuous_target.device,
-        )
-
-        extended = dict(sample)
-        extended["discrete_target"] = torch.cat([discrete_target, eos_discrete], dim=0)
-        extended["continuous_target"] = torch.cat([continuous_target, eos_continuous], dim=0)
-
-        flow_timesteps = sample.get("flow_timesteps")
-        if flow_timesteps is not None:
-            extended["flow_timesteps"] = torch.cat(
-                [flow_timesteps, flow_timesteps.new_zeros((1,))],
-                dim=0,
-            )
-
-        noise = sample.get("noise")
-        if noise is not None:
-            eos_noise = noise.new_zeros((1, int(noise.shape[1])))
-            extended["noise"] = torch.cat([noise, eos_noise], dim=0)
-
-        return extended
-
-    def _build_flat_attention_mask(self, sample: dict[str, torch.Tensor]) -> torch.BoolTensor:
-        prompt_text = int(sample["text_prompt"].shape[0])
-        prompt_speech = int(sample["discrete_prompt"].shape[0])
-        target_text = int(sample["text_target"].shape[0])
-        target_speech = int(sample["discrete_target"].shape[0])
-        num_streams = int(sample["discrete_target"].shape[1]) + 1
-        total = (
-            prompt_text
-            + 1
-            + prompt_speech * num_streams
-            + 1
-            + target_text
-            + 1
-            + target_speech * num_streams
-            + 1
-        )
-        return torch.ones(total, dtype=torch.bool)
-
     def _build_flat_sample(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """
-        Flatten one split Prism sample into:
-        text_prompt -> EOT -> speech_prompt -> EOS -> text_target -> EOT -> speech_target -> EOS.
-        `speech_target` is expected to already include the terminal EOS speech block.
+        Flatten one split Prism sample into a causal continuous-only sequence:
+        text_prompt -> EOT -> [prompt frames] -> EOS -> text_target -> EOT -> [target frames].
 
-        Returns core flat tensors plus a compact summary tensor:
-        [text_prompt_start, text_prompt_end, speech_prompt_start, speech_prompt_end,
-         text_target_start, text_target_end, speech_target_start, speech_target_end,
-         sequence_length, num_discrete_streams,
-         text_stream_idx, speech_discrete_stream_start_idx, speech_discrete_stream_end_idx,
-         speech_continuous_stream_idx]
-        where each *_start/*_end boundary is [start, end) in flattened token indices.
+        Each speech frame is a single position carrying a continuous latent. There
+        is no trailing EOS after the target frames (end-of-sequence is learned by
+        the model's EOS head). `target_block_ids` holds the target frame index at
+        target speech positions and -1 elsewhere.
         """
         prompt_text = sample["text_prompt"].to(dtype=torch.long)
-        prompt_discrete = sample["discrete_prompt"].to(dtype=torch.long)
         prompt_continuous = sample["continuous_prompt"].to(dtype=torch.float32)
         target_text = sample["text_target"].to(dtype=torch.long)
-        target_discrete = sample["discrete_target"].to(dtype=torch.long)
         target_continuous = sample["continuous_target"].to(dtype=torch.float32)
 
-        num_discrete_streams = int(prompt_discrete.shape[1])
         continuous_dim = int(prompt_continuous.shape[1])
 
         token_ids: list[int] = []
         token_type_ids: list[int] = []
-        speech_stream_ids: list[int] = []
         target_block_ids: list[int] = []
         continuous_values: list[torch.Tensor] = []
-
-        text_stream_idx = 0
-        speech_discrete_stream_start_idx = 0
-        speech_discrete_stream_end_idx = num_discrete_streams - 1
-        speech_continuous_stream_idx = num_discrete_streams
 
         zero_cont = torch.zeros(continuous_dim, dtype=torch.float32)
 
         def append_text(token_id: int) -> None:
             token_ids.append(int(token_id))
             token_type_ids.append(TEXT_TOKEN_TYPE)
-            speech_stream_ids.append(text_stream_idx)
             target_block_ids.append(-1)
             continuous_values.append(zero_cont)
 
-        def append_discrete(token_id: int, stream_id: int, block_id: int) -> None:
-            token_ids.append(int(token_id))
-            token_type_ids.append(SPEECH_DISCRETE_TOKEN_TYPE)
-            speech_stream_ids.append(int(stream_id))
-            target_block_ids.append(int(block_id))
-            continuous_values.append(zero_cont)
-
-        def append_continuous(value: torch.Tensor, block_id: int) -> None:
+        def append_speech(value: torch.Tensor, block_id: int) -> None:
             token_ids.append(self.pad_token_id)
-            token_type_ids.append(SPEECH_CONTINUOUS_TOKEN_TYPE)
-            speech_stream_ids.append(speech_continuous_stream_idx)
+            token_type_ids.append(SPEECH_TOKEN_TYPE)
             target_block_ids.append(int(block_id))
             continuous_values.append(value)
 
-        text_prompt_start = len(token_ids)
         for token in prompt_text.tolist():
             append_text(token)
-        text_prompt_end = len(token_ids)
         append_text(self.eot_token_id)
 
-        speech_prompt_start = len(token_ids)
-        for block_idx in range(int(prompt_discrete.shape[0])):
-            for stream_idx in range(num_discrete_streams):
-                append_discrete(
-                    int(prompt_discrete[block_idx, stream_idx].item()),
-                    stream_idx,
-                    -1,
-                )
-            append_continuous(prompt_continuous[block_idx], -1)
-        speech_prompt_end = len(token_ids)
+        for block_idx in range(int(prompt_continuous.shape[0])):
+            append_speech(prompt_continuous[block_idx], -1)
         append_text(self.eos_token_id)
 
-        text_target_start = len(token_ids)
         for token in target_text.tolist():
             append_text(token)
-        text_target_end = len(token_ids)
         append_text(self.eot_token_id)
 
-        speech_target_start = len(token_ids)
-        for block_idx in range(int(target_discrete.shape[0])):
-            for stream_idx in range(num_discrete_streams):
-                append_discrete(
-                    int(target_discrete[block_idx, stream_idx].item()),
-                    stream_idx,
-                    block_idx,
-                )
-            append_continuous(target_continuous[block_idx], block_idx)
-        speech_target_end = len(token_ids)
-        append_text(self.eos_token_id)
+        for block_idx in range(int(target_continuous.shape[0])):
+            append_speech(target_continuous[block_idx], block_idx)
 
         seq_len = len(token_ids)
-        summary = torch.tensor(
-            [
-                text_prompt_start,
-                text_prompt_end,
-                speech_prompt_start,
-                speech_prompt_end,
-                text_target_start,
-                text_target_end,
-                speech_target_start,
-                speech_target_end,
-                seq_len,
-                num_discrete_streams,
-                text_stream_idx,
-                speech_discrete_stream_start_idx,
-                speech_discrete_stream_end_idx,
-                speech_continuous_stream_idx,
-            ],
-            dtype=torch.long,
-        )
         return {
             "token_ids": torch.tensor(token_ids, dtype=torch.long),
             "continuous_values": torch.stack(continuous_values, dim=0).to(dtype=torch.float32),
             "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
-            "speech_stream_ids": torch.tensor(speech_stream_ids, dtype=torch.long),
             "target_block_ids": torch.tensor(target_block_ids, dtype=torch.long),
             "attention_mask": torch.ones(seq_len, dtype=torch.bool),
-            "summary": summary,
         }
-
-    @staticmethod
-    def _collate_optional_1d(
-        samples: Sequence[dict[str, torch.Tensor]],
-        output: dict[str, torch.Tensor],
-        key: str,
-        pad_value: float,
-    ) -> None:
-        presence = [key in sample for sample in samples]
-        if not any(presence):
-            return
-        if not all(presence):
-            raise ValueError(f"{key} must be provided for all samples or for none.")
-        output[key] = _pad_1d([sample[key] for sample in samples], pad_value)
-
-    @staticmethod
-    def _collate_optional_2d(
-        samples: Sequence[dict[str, torch.Tensor]],
-        output: dict[str, torch.Tensor],
-        key: str,
-        pad_value: float,
-    ) -> None:
-        presence = [key in sample for sample in samples]
-        if not any(presence):
-            return
-        if not all(presence):
-            raise ValueError(f"{key} must be provided for all samples or for none.")
-        output[key] = _pad_2d([sample[key] for sample in samples], pad_value)

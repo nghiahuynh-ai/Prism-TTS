@@ -29,24 +29,23 @@ def _estimate_concat_sequence_length(
     speech_prompt_length: int,
     text_target_length: int,
     speech_target_length: int,
-    num_discrete_streams: int,
+    num_discrete_streams: int = 1,
 ) -> int:
+    # Continuous-only autoregressive layout: one position per speech frame.
+    # text_prompt -> EOT -> [prompt frames] -> EOS -> text_target -> EOT -> [target frames]
+    del num_discrete_streams
     text_prompt_length = max(1, int(text_prompt_length))
     speech_prompt_length = max(1, int(speech_prompt_length))
     text_target_length = max(1, int(text_target_length))
-    # Training collate appends one explicit terminal EOS speech block.
-    speech_target_length = max(1, int(speech_target_length)) + 1
-    num_discrete_streams = max(1, int(num_discrete_streams))
-    speech_block_size = num_discrete_streams + 1
+    speech_target_length = max(1, int(speech_target_length))
     return (
         text_prompt_length
         + 1  # EOT after text prompt
-        + speech_prompt_length * speech_block_size
+        + speech_prompt_length
         + 1  # EOS after speech prompt
         + text_target_length
         + 1  # EOT after text target
-        + speech_target_length * speech_block_size
-        + 1  # EOS after speech target
+        + speech_target_length
     )
 
 

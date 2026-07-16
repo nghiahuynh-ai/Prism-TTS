@@ -381,16 +381,6 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
     llama_cfg = _require_mapping(model_cfg, "llama_config")
     dataset_cfg = _require_mapping(data_cfg, "dataset")
 
-    num_discrete_tokens = int(prism_cfg["num_discrete_tokens"])
-    dataset_stream_count_raw = dataset_cfg.get("discrete_stream_count")
-    if dataset_stream_count_raw is not None:
-        dataset_stream_count = int(dataset_stream_count_raw)
-        if num_discrete_tokens != dataset_stream_count:
-            raise ValueError(
-                "model.prism_tts.num_discrete_tokens must match "
-                f"data.dataset.discrete_stream_count ({dataset_stream_count})."
-            )
-
     continuous_latent_size = int(prism_cfg["continuous_latent_size"])
     dataset_continuous_dim_raw = dataset_cfg.get("continuous_feature_dim")
     if dataset_continuous_dim_raw is not None:
@@ -400,39 +390,17 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
                 "model.prism_tts.continuous_latent_size must match "
                 f"data.dataset.continuous_feature_dim ({dataset_continuous_dim})."
             )
-    continuous_loss_weight = float(prism_cfg.get("continuous_loss_weight", 1.0))
-    if continuous_loss_weight < 0.0:
-        raise ValueError("model.prism_tts.continuous_loss_weight must be >= 0.")
-    discrete_regular_token_loss_weight = float(
-        prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
-    )
-    if discrete_regular_token_loss_weight < 0.0:
-        raise ValueError("model.prism_tts.discrete_regular_token_loss_weight must be >= 0.")
-    discrete_special_token_loss_weight = float(
-        prism_cfg.get("discrete_special_token_loss_weight", 1.0)
-    )
-    if discrete_special_token_loss_weight < 0.0:
-        raise ValueError("model.prism_tts.discrete_special_token_loss_weight must be >= 0.")
-    if (
-        discrete_regular_token_loss_weight == 0.0
-        and discrete_special_token_loss_weight == 0.0
-    ):
-        raise ValueError(
-            "At least one of model.prism_tts.discrete_regular_token_loss_weight or "
-            "model.prism_tts.discrete_special_token_loss_weight must be > 0."
-        )
 
-    discrete_vocab_size = int(prism_cfg["discrete_vocab_size"])
-    if discrete_vocab_size < text_offset:
-        raise ValueError(
-            "model.prism_tts.discrete_vocab_size is too small for shared token layout. "
-            f"Need at least {text_offset}, got {discrete_vocab_size}."
-        )
+    eos_loss_weight = float(prism_cfg.get("eos_loss_weight", 1.0))
+    if eos_loss_weight < 0.0:
+        raise ValueError("model.prism_tts.eos_loss_weight must be >= 0.")
+
+    # The unified embedding table must cover text tokens (which begin at text_offset).
     llama_vocab_size = int(llama_cfg["vocab_size"])
-    if discrete_vocab_size > llama_vocab_size:
+    if llama_vocab_size < text_offset:
         raise ValueError(
-            "model.prism_tts.discrete_vocab_size must be <= model.llama_config.vocab_size "
-            "because text and discrete embeddings are unified."
+            "model.llama_config.vocab_size is too small for the shared token layout. "
+            f"Need at least {text_offset} to cover special + text tokens, got {llama_vocab_size}."
         )
 
     if "pad_token_id" in llama_cfg and int(llama_cfg["pad_token_id"]) != pad_id:
@@ -471,21 +439,22 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
 
     return PrismTTS(
         llama_config=llama_config,
-        num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
-        discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
         continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
         flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
         flow_model_channels=prism_cfg.get("flow_model_channels"),
-        flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
-        continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
-        discrete_regular_token_loss_weight=float(
-            prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
-        ),
-        discrete_special_token_loss_weight=float(
-            prism_cfg.get("discrete_special_token_loss_weight", 1.0)
-        ),
-        flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
-        parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 64)),
+        eos_loss_weight=float(prism_cfg.get("eos_loss_weight", 1.0)),
+        sigma_data=float(prism_cfg.get("sigma_data", 1.0)),
+        p_mean=float(prism_cfg.get("p_mean", -1.0)),
+        p_std=float(prism_cfg.get("p_std", 1.6)),
+        tangent_warmup_steps=int(prism_cfg.get("tangent_warmup_steps", 1000)),
+        tangent_norm_const=float(prism_cfg.get("tangent_norm_const", 0.1)),
+        sample_steps=int(prism_cfg.get("sample_steps", 1)),
+        eos_threshold=float(prism_cfg.get("eos_threshold", 0.5)),
+        latent_stats_decay=float(prism_cfg.get("latent_stats_decay", 0.999)),
+        inject_backbone_noise=bool(prism_cfg.get("inject_backbone_noise", True)),
+        use_short_context=bool(prism_cfg.get("use_short_context", True)),
+        short_context_layers=int(prism_cfg.get("short_context_layers", 2)),
+        short_context_window=int(prism_cfg.get("short_context_window", 10)),
     )
 
 

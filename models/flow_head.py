@@ -141,6 +141,10 @@ class FlowHead(nn.Module):
         self.res_blocks = nn.ModuleList(res_blocks)
         self.final_layer = FinalLayer(model_channels, out_channels)
 
+        # Adaptive-weighting head (sCM uncertainty weighting): logvar(t) shares the
+        # head's timestep embedding, folding the weighting network into the head.
+        self.logvar_linear = nn.Linear(model_channels, 1)
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -166,6 +170,10 @@ class FlowHead(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
+        # Start logvar at 0 so exp(logvar) = 1 (neutral loss weighting).
+        nn.init.constant_(self.logvar_linear.weight, 0)
+        nn.init.constant_(self.logvar_linear.bias, 0)
+
     def forward(self, x, t, c):
         """
         Apply the model to an input batch.
@@ -188,6 +196,14 @@ class FlowHead(nn.Module):
                 x = block(x, y)
 
         return self.final_layer(x, y)
+
+    def logvar(self, t):
+        """Adaptive-weighting logvar for the sCM loss, from the shared timestep embed.
+
+        :param t: a 1-D batch of timesteps.
+        :return: an [N, 1] Tensor of log-variances.
+        """
+        return self.logvar_linear(self.time_embed(t))
 
     def forward_with_cfg(self, x, t, c, cfg_scale):
         half = x[: len(x) // 2]

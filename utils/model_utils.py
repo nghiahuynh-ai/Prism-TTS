@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import wave
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -13,17 +12,29 @@ import torch.nn.functional as F
 from transformers.utils import ModelOutput
 
 
+# Token-type ids for the flattened autoregressive sequence.
+# Speech is now modeled as a single continuous latent per frame (no vector
+# quantization), so there is no separate discrete stream type.
 TEXT_TOKEN_TYPE = 0
-SPEECH_DISCRETE_TOKEN_TYPE = 1
-SPEECH_CONTINUOUS_TOKEN_TYPE = 2
+SPEECH_TOKEN_TYPE = 1
 
 
 @dataclass
 class FlatBatch:
+    """Packed, causal, continuous-only sequence consumed by the AR backbone.
+
+    Layout per sample:
+    text_prompt -> EOT -> [prompt speech frames] -> EOS -> text_target -> EOT
+      -> [target speech frames]
+
+    Each speech frame occupies a single position carrying a continuous latent in
+    `continuous_values` (raw, un-normalized). `target_block_ids` holds the target
+    frame index (0-based) at target speech positions and -1 elsewhere.
+    """
+
     token_ids: torch.LongTensor
     continuous_values: torch.FloatTensor
     token_type_ids: torch.LongTensor
-    speech_stream_ids: torch.LongTensor
     target_block_ids: torch.LongTensor
     attention_mask: torch.BoolTensor
     target_block_counts: torch.LongTensor
@@ -32,18 +43,15 @@ class FlatBatch:
 @dataclass
 class PrismTTSOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
-    discrete_loss: Optional[torch.Tensor] = None
-    continuous_loss: Optional[torch.Tensor] = None
-    flow_loss: Optional[torch.Tensor] = None
+    consistency_loss: Optional[torch.Tensor] = None
+    eos_loss: Optional[torch.Tensor] = None
 
 
 @dataclass
 class PrismTTSGenerationOutput(ModelOutput):
     text_ids: Optional[torch.LongTensor] = None
-    discrete_ids: Optional[torch.LongTensor] = None
     continuous_latents: Optional[torch.FloatTensor] = None
-    prior_latents: Optional[torch.FloatTensor] = None
-    discrete_logits: Optional[tuple[torch.Tensor, ...]] = None
+    eos_scores: Optional[torch.FloatTensor] = None
 
 
 def normalize_text_tokens(
@@ -54,28 +62,6 @@ def normalize_text_tokens(
     if text_tokens.dim() != 2:
         raise ValueError(f"{name} must have shape [batch, length].")
     return text_tokens
-
-
-def normalize_discrete_tokens(
-    discrete_tokens: torch.LongTensor,
-    name: str,
-    *,
-    num_discrete_tokens: int,
-) -> torch.LongTensor:
-    """Normalize discrete tokens to shape [batch, length, num_discrete_tokens]."""
-    if discrete_tokens.dim() != 3:
-        raise ValueError(
-            f"{name} must have shape [batch, num_discrete_tokens, length] "
-            f"or [batch, length, num_discrete_tokens]."
-        )
-    if discrete_tokens.shape[1] == num_discrete_tokens:
-        return discrete_tokens.transpose(1, 2).contiguous()
-    if discrete_tokens.shape[-1] == num_discrete_tokens:
-        return discrete_tokens
-    raise ValueError(
-        f"{name} must contain one axis with size num_discrete_tokens="
-        f"{num_discrete_tokens}, got shape={tuple(discrete_tokens.shape)}."
-    )
 
 
 def normalize_continuous_latents(
@@ -169,6 +155,26 @@ def normalize_raw_text_batch(
     if not all(isinstance(item, str) for item in out):
         raise ValueError(f"{name} sequence must contain only strings.")
     return out
+
+
+def inject_continuous_backbone_noise(
+    clean_latents: torch.FloatTensor,
+) -> torch.FloatTensor:
+    """Inject random VP-schedule noise into continuous latents fed to the AR backbone.
+
+    Per frame, interpolate between the clean latent and Gaussian noise at a random
+    SNR (k ~ U(0, 1)): sqrt(k)*eps + sqrt(1-k)*clean. Applied only to the backbone
+    *input context* during training; the per-frame head target stays clean. This
+    regularizes the causal backbone against exposure bias, since at inference it
+    consumes imperfect generated frames rather than ground-truth latents.
+    """
+    k = torch.rand(
+        (*clean_latents.shape[:-1], 1),
+        device=clean_latents.device,
+        dtype=clean_latents.dtype,
+    )
+    e = torch.randn_like(clean_latents)
+    return torch.sqrt(k) * e + torch.sqrt(1.0 - k) * clean_latents
 
 
 def read_wav_mono(path_like: str | Path) -> tuple[np.ndarray, int]:
@@ -284,7 +290,7 @@ def resample_audio_if_needed(
 
 def build_default_mimi_speech_encoder(
     *,
-    num_discrete_tokens: int,
+    num_quantizers: int,
     device: torch.device,
     continuous_dtype: torch.dtype,
     mimi_model_name_or_path: str,
@@ -292,8 +298,14 @@ def build_default_mimi_speech_encoder(
     mimi_token: str | bool | None,
     mimi_local_files_only: bool,
     raw_prompt_name: str = "raw_speech_prompt",
-) -> Callable[[Any], tuple[torch.Tensor, torch.Tensor]]:
-    """Build a Mimi-backed speech encoder returning (discrete_codes, pre-upsample_latents)."""
+) -> Callable[[Any], torch.Tensor]:
+    """Build a Mimi-backed encoder returning continuous pre-upsample latents [L, D].
+
+    Vector quantization is bypassed for modeling: the encoder still runs Mimi's
+    RVQ to obtain codes, then reconstructs the continuous pre-upsample latent via
+    `quantizer.decode`. `num_quantizers` controls the fidelity of that continuous
+    reconstruction and should match how the training features were prepared.
+    """
     try:
         from transformers import AutoFeatureExtractor, MimiModel
     except ModuleNotFoundError as exc:
@@ -317,7 +329,7 @@ def build_default_mimi_speech_encoder(
     mimi_model.to(device=device)
     mimi_model.eval()
 
-    def _default_speech_encoder(raw_prompt: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    def _default_speech_encoder(raw_prompt: Any) -> torch.Tensor:
         prompt_audio, prompt_sample_rate = extract_audio_with_sample_rate(
             raw_prompt,
             name=raw_prompt_name,
@@ -354,7 +366,7 @@ def build_default_mimi_speech_encoder(
         encoded = mimi_model.encode(
             input_values=input_values,
             padding_mask=padding_mask,
-            num_quantizers=int(num_discrete_tokens),
+            num_quantizers=int(num_quantizers),
             return_dict=True,
         )
         prompt_codes = encoded.audio_codes
@@ -362,9 +374,8 @@ def build_default_mimi_speech_encoder(
             raise RuntimeError("Mimi encode did not return audio_codes.")
         prompt_latents = mimi_model.quantizer.decode(prompt_codes)
 
-        discrete = prompt_codes[0].transpose(0, 1).to(dtype=torch.long)
         continuous = prompt_latents[0].transpose(0, 1).to(dtype=continuous_dtype)
-        return discrete, continuous
+        return continuous
 
     return _default_speech_encoder
 
@@ -403,23 +414,25 @@ def build_lazy_mimi_speech_decoder(
 def assemble_flat_batch(
     *,
     text_prompt: torch.LongTensor,
-    discrete_prompt: torch.LongTensor,
     continuous_prompt: torch.FloatTensor,
     text_target: torch.LongTensor,
-    discrete_target: torch.LongTensor,
     continuous_target: torch.FloatTensor,
     text_prompt_lengths: torch.LongTensor,
     speech_prompt_lengths: torch.LongTensor,
     text_target_lengths: torch.LongTensor,
     speech_target_lengths: torch.LongTensor,
-    attention_mask: Optional[torch.Tensor],
     pad_token_id: int,
     eos_token_id: int,
     eot_token_id: int,
     continuous_latent_size: int,
-    num_discrete_tokens: int,
 ) -> FlatBatch:
-    """Assemble split prompt/target tensors into one flattened sequence representation."""
+    """Assemble split prompt/target tensors into one causal continuous-only sequence.
+
+    Layout: text_prompt -> EOT -> [prompt frames] -> EOS -> text_target -> EOT
+      -> [target frames]. Target frames carry frame ids 0..L-1 in
+    `target_block_ids`; everything else is -1. There is no trailing EOS after the
+    target frames (end-of-sequence is predicted by the model's EOS head).
+    """
     batch_size = int(text_prompt.shape[0])
     device = text_prompt.device
     cont_dtype = continuous_prompt.dtype
@@ -427,7 +440,6 @@ def assemble_flat_batch(
     token_ids_per_sample: list[torch.LongTensor] = []
     continuous_per_sample: list[torch.FloatTensor] = []
     token_types_per_sample: list[torch.LongTensor] = []
-    stream_ids_per_sample: list[torch.LongTensor] = []
     target_block_ids_per_sample: list[torch.LongTensor] = []
 
     for sample_idx in range(batch_size):
@@ -438,86 +450,37 @@ def assemble_flat_batch(
 
         sample_token_ids: list[int] = []
         sample_types: list[int] = []
-        sample_stream_ids: list[int] = []
         sample_target_block_ids: list[int] = []
         sample_continuous: list[torch.Tensor] = []
 
-        def append_text_token(token_id: int) -> None:
+        zero_cont = torch.zeros(continuous_latent_size, dtype=cont_dtype, device=device)
+
+        def append_text(token_id: int) -> None:
             sample_token_ids.append(int(token_id))
             sample_types.append(TEXT_TOKEN_TYPE)
-            sample_stream_ids.append(-1)
             sample_target_block_ids.append(-1)
-            sample_continuous.append(
-                torch.zeros(
-                    continuous_latent_size,
-                    dtype=cont_dtype,
-                    device=device,
-                )
-            )
+            sample_continuous.append(zero_cont)
 
-        def append_speech_discrete(token_id: int, stream_id: int, target_block_id: int) -> None:
-            sample_token_ids.append(int(token_id))
-            sample_types.append(SPEECH_DISCRETE_TOKEN_TYPE)
-            sample_stream_ids.append(int(stream_id))
-            sample_target_block_ids.append(int(target_block_id))
-            sample_continuous.append(
-                torch.zeros(
-                    continuous_latent_size,
-                    dtype=cont_dtype,
-                    device=device,
-                )
-            )
-
-        def append_speech_continuous(
-            value: torch.Tensor,
-            target_block_id: int,
-        ) -> None:
+        def append_speech(value: torch.Tensor, target_block_id: int) -> None:
             sample_token_ids.append(pad_token_id)
-            sample_types.append(SPEECH_CONTINUOUS_TOKEN_TYPE)
-            sample_stream_ids.append(num_discrete_tokens)
+            sample_types.append(SPEECH_TOKEN_TYPE)
             sample_target_block_ids.append(int(target_block_id))
             sample_continuous.append(value)
 
-        prompt_text = text_prompt[sample_idx, :l1]
-        prompt_discrete = discrete_prompt[sample_idx, :l2, :]
-        prompt_continuous = continuous_prompt[sample_idx, :l2, :]
-        target_text = text_target[sample_idx, :l3]
-        target_discrete = discrete_target[sample_idx, :l4, :]
-        target_continuous = continuous_target[sample_idx, :l4, :]
-
-        for token in prompt_text.tolist():
-            append_text_token(token)
-        append_text_token(eot_token_id)
+        for token in text_prompt[sample_idx, :l1].tolist():
+            append_text(token)
+        append_text(eot_token_id)
 
         for block_idx in range(l2):
-            for stream_idx in range(num_discrete_tokens):
-                append_speech_discrete(
-                    token_id=int(prompt_discrete[block_idx, stream_idx].item()),
-                    stream_id=stream_idx,
-                    target_block_id=-1,
-                )
-            append_speech_continuous(
-                value=prompt_continuous[block_idx],
-                target_block_id=-1,
-            )
-        append_text_token(eos_token_id)
+            append_speech(continuous_prompt[sample_idx, block_idx], -1)
+        append_text(eos_token_id)
 
-        for token in target_text.tolist():
-            append_text_token(token)
-        append_text_token(eot_token_id)
+        for token in text_target[sample_idx, :l3].tolist():
+            append_text(token)
+        append_text(eot_token_id)
 
         for block_idx in range(l4):
-            for stream_idx in range(num_discrete_tokens):
-                append_speech_discrete(
-                    token_id=int(target_discrete[block_idx, stream_idx].item()),
-                    stream_id=stream_idx,
-                    target_block_id=block_idx,
-                )
-            append_speech_continuous(
-                value=target_continuous[block_idx],
-                target_block_id=block_idx,
-            )
-        append_text_token(eos_token_id)
+            append_speech(continuous_target[sample_idx, block_idx], block_idx)
 
         token_ids_per_sample.append(
             torch.tensor(sample_token_ids, dtype=torch.long, device=device)
@@ -525,125 +488,38 @@ def assemble_flat_batch(
         token_types_per_sample.append(
             torch.tensor(sample_types, dtype=torch.long, device=device)
         )
-        stream_ids_per_sample.append(
-            torch.tensor(sample_stream_ids, dtype=torch.long, device=device)
-        )
         target_block_ids_per_sample.append(
             torch.tensor(sample_target_block_ids, dtype=torch.long, device=device)
         )
         continuous_per_sample.append(torch.stack(sample_continuous, dim=0))
 
     max_seq_len = max(int(x.shape[0]) for x in token_ids_per_sample)
-    token_ids = torch.full(
-        (batch_size, max_seq_len),
-        pad_token_id,
-        dtype=torch.long,
-        device=device,
-    )
+    token_ids = torch.full((batch_size, max_seq_len), pad_token_id, dtype=torch.long, device=device)
     token_type_ids = torch.full(
-        (batch_size, max_seq_len),
-        TEXT_TOKEN_TYPE,
-        dtype=torch.long,
-        device=device,
+        (batch_size, max_seq_len), TEXT_TOKEN_TYPE, dtype=torch.long, device=device
     )
-    speech_stream_ids = torch.full(
-        (batch_size, max_seq_len),
-        -1,
-        dtype=torch.long,
-        device=device,
-    )
-    target_block_ids = torch.full(
-        (batch_size, max_seq_len),
-        -1,
-        dtype=torch.long,
-        device=device,
-    )
+    target_block_ids = torch.full((batch_size, max_seq_len), -1, dtype=torch.long, device=device)
     continuous_values = torch.zeros(
-        batch_size,
-        max_seq_len,
-        continuous_latent_size,
-        dtype=cont_dtype,
-        device=device,
+        batch_size, max_seq_len, continuous_latent_size, dtype=cont_dtype, device=device
     )
-    derived_attention_mask = torch.zeros(
-        batch_size,
-        max_seq_len,
-        dtype=torch.bool,
-        device=device,
-    )
+    attention_mask = torch.zeros(batch_size, max_seq_len, dtype=torch.bool, device=device)
 
     for sample_idx in range(batch_size):
         seq_len = int(token_ids_per_sample[sample_idx].shape[0])
         token_ids[sample_idx, :seq_len] = token_ids_per_sample[sample_idx]
         token_type_ids[sample_idx, :seq_len] = token_types_per_sample[sample_idx]
-        speech_stream_ids[sample_idx, :seq_len] = stream_ids_per_sample[sample_idx]
         target_block_ids[sample_idx, :seq_len] = target_block_ids_per_sample[sample_idx]
         continuous_values[sample_idx, :seq_len, :] = continuous_per_sample[sample_idx]
-        derived_attention_mask[sample_idx, :seq_len] = True
-
-    if attention_mask is not None:
-        if attention_mask.dim() != 2 or attention_mask.shape[0] != batch_size:
-            raise ValueError("attention_mask must have shape [batch, sequence].")
-        if attention_mask.shape[1] < max_seq_len:
-            raise ValueError(
-                "attention_mask length must be >= concatenated sequence length."
-            )
-        derived_attention_mask = derived_attention_mask & attention_mask[:, :max_seq_len].to(
-            device=device,
-            dtype=torch.bool,
-        )
+        attention_mask[sample_idx, :seq_len] = True
 
     return FlatBatch(
         token_ids=token_ids,
         continuous_values=continuous_values,
         token_type_ids=token_type_ids,
-        speech_stream_ids=speech_stream_ids,
         target_block_ids=target_block_ids,
-        attention_mask=derived_attention_mask,
+        attention_mask=attention_mask,
         target_block_counts=speech_target_lengths.to(device=device, dtype=torch.long),
     )
-
-
-def sample_masked_target_blocks(
-    target_block_counts: torch.LongTensor,
-    mask_ratio: float,
-    masked_target_blocks: Optional[torch.BoolTensor],
-) -> torch.BoolTensor:
-    """Sample (or validate provided) masked target-block indices for reconstruction."""
-    batch_size = int(target_block_counts.shape[0])
-    device = target_block_counts.device
-    max_target_blocks = int(target_block_counts.max().item()) if batch_size > 0 else 0
-    if max_target_blocks <= 0:
-        return torch.zeros((batch_size, 0), dtype=torch.bool, device=device)
-
-    if masked_target_blocks is not None:
-        if masked_target_blocks.dim() != 2 or masked_target_blocks.shape[0] != batch_size:
-            raise ValueError("masked_target_blocks must have shape [batch, target_blocks].")
-        if masked_target_blocks.shape[1] < max_target_blocks:
-            raise ValueError(
-                "masked_target_blocks must cover at least max(target_block_counts) columns."
-            )
-        out = masked_target_blocks[:, :max_target_blocks].to(device=device, dtype=torch.bool).clone()
-        for sample_idx in range(batch_size):
-            count = int(target_block_counts[sample_idx].item())
-            if count < max_target_blocks:
-                out[sample_idx, count:] = False
-        return out
-
-    out = torch.zeros((batch_size, max_target_blocks), dtype=torch.bool, device=device)
-    for sample_idx in range(batch_size):
-        count = int(target_block_counts[sample_idx].item())
-        if count <= 0:
-            continue
-        num_masked = int(round(mask_ratio * count))
-        if mask_ratio > 0.0:
-            num_masked = max(1, num_masked)
-        num_masked = min(count, max(0, num_masked))
-        if num_masked == 0:
-            continue
-        picked = torch.randperm(count, device=device)[:num_masked]
-        out[sample_idx, picked] = True
-    return out
 
 
 def build_flat_batch_from_collate(
@@ -651,7 +527,6 @@ def build_flat_batch_from_collate(
     flat_token_ids: torch.LongTensor,
     flat_continuous_values: torch.FloatTensor,
     flat_token_type_ids: torch.LongTensor,
-    flat_speech_stream_ids: torch.LongTensor,
     flat_target_block_ids: torch.LongTensor,
     flat_target_block_counts: Optional[torch.LongTensor],
     attention_mask: Optional[torch.Tensor],
@@ -684,7 +559,6 @@ def build_flat_batch_from_collate(
         expected_last=continuous_latent_size,
     )
     flat_token_type_ids = _require_shape("flat_token_type_ids", flat_token_type_ids)
-    flat_speech_stream_ids = _require_shape("flat_speech_stream_ids", flat_speech_stream_ids)
     flat_target_block_ids = _require_shape("flat_target_block_ids", flat_target_block_ids)
 
     if attention_mask is None:
@@ -720,294 +594,7 @@ def build_flat_batch_from_collate(
         token_ids=flat_token_ids.to(dtype=torch.long, device=device),
         continuous_values=flat_continuous_values.to(device=device),
         token_type_ids=flat_token_type_ids.to(dtype=torch.long, device=device),
-        speech_stream_ids=flat_speech_stream_ids.to(dtype=torch.long, device=device),
         target_block_ids=flat_target_block_ids.to(dtype=torch.long, device=device),
         attention_mask=resolved_attention,
         target_block_counts=flat_target_block_counts,
     )
-
-
-def build_two_level_rope_position_embeddings(
-    *,
-    inputs_embeds: torch.FloatTensor,
-    speech_stream_ids: torch.LongTensor,
-    rotary_emb: torch.nn.Module,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compose global 1D RoPE with within-block stream-index RoPE."""
-    batch_size, seq_len, _ = inputs_embeds.shape
-    device = inputs_embeds.device
-
-    global_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    secondary_position_ids = speech_stream_ids.clamp(min=0)
-
-    global_cos, global_sin = rotary_emb(inputs_embeds, position_ids=global_position_ids)
-    secondary_cos, secondary_sin = rotary_emb(
-        inputs_embeds,
-        position_ids=secondary_position_ids,
-    )
-
-    cos = global_cos * secondary_cos - global_sin * secondary_sin
-    sin = global_sin * secondary_cos + global_cos * secondary_sin
-    return cos, sin
-
-
-def top_k_top_p_filter(
-    logits: torch.Tensor,
-    top_k: int = 50,
-    top_p: float = 0.95,
-) -> torch.Tensor:
-    """Apply top-k and nucleus (top-p) filtering to sampling logits."""
-    if top_k > 0:
-        top_k = min(top_k, logits.shape[-1])
-        threshold = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
-        logits = logits.masked_fill(logits < threshold, float("-inf"))
-
-    if top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        sorted_mask = cumulative_probs > top_p
-        sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
-        sorted_mask[..., 0] = False
-        sorted_logits = sorted_logits.masked_fill(sorted_mask, float("-inf"))
-        logits = torch.full_like(logits, float("-inf")).scatter(
-            -1,
-            sorted_indices,
-            sorted_logits,
-        )
-    return logits
-
-
-def sample_discrete_ids(
-    logits: torch.Tensor,
-    temperature: float = 0.8,
-    top_k: int = 50,
-    top_p: float = 0.95,
-    do_sample: bool = True,
-) -> torch.LongTensor:
-    """Sample token ids from logits with optional temperature/top-k/top-p filtering."""
-    if not do_sample or temperature <= 0.0:
-        return torch.argmax(logits, dim=-1)
-
-    scaled_logits = logits / temperature
-    filtered_logits = top_k_top_p_filter(
-        scaled_logits,
-        top_k=top_k,
-        top_p=top_p,
-    )
-    probs = torch.softmax(filtered_logits, dim=-1)
-    sample_shape = probs.shape[:-1]
-    samples = torch.multinomial(probs.reshape(-1, probs.shape[-1]), num_samples=1)
-    return samples.reshape(*sample_shape)
-
-
-def inject_continuous_backbone_noise(
-    clean_latents: torch.FloatTensor,
-) -> torch.FloatTensor:
-    """Inject random noise into continuous latents before backbone conditioning."""
-    k = torch.rand(
-        (*clean_latents.shape[:-1], 1),
-        device=clean_latents.device,
-        dtype=clean_latents.dtype,
-    )
-    e = torch.randn_like(clean_latents)
-    return torch.sqrt(k) * e + torch.sqrt(1.0 - k) * clean_latents
-
-
-def sample_flow_training_inputs(
-    continuous_targets: torch.FloatTensor,
-    flow_timesteps: Optional[torch.FloatTensor] = None,
-    noise: Optional[torch.FloatTensor] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample flow-matching mixtures and denoising targets for continuous latents."""
-    if flow_timesteps is None:
-        flow_timesteps = torch.rand(
-            continuous_targets.shape[:-1],
-            device=continuous_targets.device,
-            dtype=continuous_targets.dtype,
-        )
-    if noise is None:
-        noise = torch.randn_like(continuous_targets)
-
-    t = flow_timesteps.unsqueeze(-1)
-    flow_inputs = (1.0 - t) * noise + t * continuous_targets
-    flow_target = continuous_targets - noise
-    return flow_inputs, flow_target, flow_timesteps
-
-
-def get_time_shifted_steps(
-    *,
-    num_steps: int,
-    t_shift: float,
-    device: torch.device,
-) -> torch.FloatTensor:
-    """Build [0, 1] timesteps with a time-shift transform."""
-    if num_steps < 1:
-        raise ValueError("num_steps must be >= 1.")
-    if t_shift <= 0.0:
-        raise ValueError("t_shift must be > 0.")
-    base = torch.linspace(0.0, 1.0, num_steps + 1, device=device, dtype=torch.float32)
-    return t_shift * base / (1.0 + (t_shift - 1.0) * base)
-
-
-def build_parallel_stable_unmask_schedule(
-    *,
-    maskable_lengths: torch.LongTensor,
-    num_steps: int,
-    t_shift: float,
-) -> torch.LongTensor:
-    """
-    Build per-sample unmask counts for stable parallel decoding.
-
-    The schedule mirrors iterative unmasking:
-    k_n = r_n - r_{n-1} with time-shifted cumulative ratio r_n.
-    """
-    if num_steps < 1:
-        raise ValueError("num_steps must be >= 1.")
-
-    batch_size = int(maskable_lengths.shape[0])
-    device = maskable_lengths.device
-    schedule = torch.zeros(batch_size, num_steps, dtype=torch.long, device=device)
-    if batch_size <= 0:
-        return schedule
-
-    time_steps = get_time_shifted_steps(
-        num_steps=num_steps,
-        t_shift=t_shift,
-        device=device,
-    )
-    time_deltas = time_steps[1:] - time_steps[:-1]
-
-    for sample_idx in range(batch_size):
-        total_maskable = max(0, int(maskable_lengths[sample_idx].item()))
-        if total_maskable <= 0:
-            continue
-
-        remaining = total_maskable
-        for step_idx in range(num_steps):
-            if remaining <= 0:
-                break
-            if step_idx >= num_steps - 1:
-                step_unmask = remaining
-            else:
-                delta = float(time_deltas[step_idx].item())
-                step_unmask = int(math.ceil(float(total_maskable) * delta))
-                step_unmask = min(remaining, max(0, step_unmask))
-            schedule[sample_idx, step_idx] = int(step_unmask)
-            remaining -= int(step_unmask)
-
-    return schedule
-
-
-def gumbel_sample_scores(
-    scores: torch.Tensor,
-    temperature: float,
-) -> torch.Tensor:
-    """Apply temperature-scaled Gumbel perturbation for position selection."""
-    if temperature <= 0.0:
-        return scores
-    scaled_scores = scores / temperature
-    uniform = torch.rand_like(scaled_scores)
-    uniform = uniform.clamp(min=1e-10, max=1.0 - 1e-10)
-    gumbel_noise = -torch.log(-torch.log(uniform))
-    return scaled_scores + gumbel_noise
-
-
-def resolve_generation_discrete_eos_token_id(
-    discrete_eos_token_id: Optional[int],
-    *,
-    backbone_eos_token_id: Optional[int],
-    discrete_vocab_size: int,
-) -> int:
-    """Resolve the discrete EOS id used during generation."""
-    if discrete_eos_token_id is not None:
-        return int(discrete_eos_token_id)
-    candidate = backbone_eos_token_id
-    if candidate is None or not (0 <= int(candidate) < discrete_vocab_size):
-        return 0
-    return int(candidate)
-
-
-def infer_special_discrete_token_ids(
-    discrete_eos_token_id: int,
-    *,
-    backbone_eos_token_id: Optional[int],
-    backbone_pad_token_id: Optional[int],
-    discrete_vocab_size: int,
-) -> tuple[int, ...]:
-    """Collect discrete token ids treated as special for loss/silence heuristics."""
-    ids: set[int] = set()
-    if 0 <= discrete_eos_token_id < discrete_vocab_size:
-        ids.add(int(discrete_eos_token_id))
-
-    cfg_eos = backbone_eos_token_id
-    cfg_pad = backbone_pad_token_id
-    if cfg_eos is not None and 0 <= int(cfg_eos) < discrete_vocab_size:
-        ids.add(int(cfg_eos))
-        if 0 <= int(cfg_eos) - 1 < discrete_vocab_size:
-            ids.add(int(cfg_eos) - 1)
-    if cfg_pad is not None and 0 <= int(cfg_pad) < discrete_vocab_size:
-        ids.add(int(cfg_pad))
-    return tuple(sorted(ids))
-
-
-def build_special_block_mask(
-    discrete_tokens: torch.LongTensor,
-    special_token_ids: tuple[int, ...],
-) -> torch.BoolTensor:
-    """Mark blocks where all discrete streams are special tokens."""
-    if len(special_token_ids) == 0:
-        return torch.zeros(
-            discrete_tokens.shape[0],
-            dtype=torch.bool,
-            device=discrete_tokens.device,
-        )
-    ids = torch.tensor(
-        special_token_ids,
-        dtype=discrete_tokens.dtype,
-        device=discrete_tokens.device,
-    )
-    return torch.isin(discrete_tokens, ids).all(dim=-1)
-
-
-def estimate_parallel_speech_target_lengths(
-    *,
-    text_prompt_lengths: torch.LongTensor,
-    speech_prompt_lengths: torch.LongTensor,
-    text_target_lengths: torch.LongTensor,
-    max_new_blocks: Optional[int],
-) -> torch.LongTensor:
-    """
-    Estimate target speech blocks for parallel generation from prompt length ratios.
-
-    The estimate mirrors the usual text-to-speech duration heuristic:
-    target_blocks ~= target_text_len * (prompt_speech_len / prompt_text_len),
-    with bounded ratio and per-sample safety floors.
-    """
-    batch_size = int(text_prompt_lengths.shape[0])
-    device = text_prompt_lengths.device
-    estimated = torch.zeros(batch_size, dtype=torch.long, device=device)
-    cap = None if max_new_blocks is None else max(0, int(max_new_blocks))
-
-    for sample_idx in range(batch_size):
-        prompt_text_len = int(text_prompt_lengths[sample_idx].item())
-        prompt_speech_len = int(speech_prompt_lengths[sample_idx].item())
-        target_text_len = int(text_target_lengths[sample_idx].item())
-
-        if target_text_len > 0:
-            ratio = 1.0
-            if prompt_text_len > 0:
-                ratio = float(prompt_speech_len) / float(prompt_text_len)
-            ratio = max(0.5, min(8.0, ratio))
-            est_blocks = int(math.ceil(float(target_text_len) * ratio))
-            est_blocks = max(target_text_len, est_blocks)
-        elif cap is not None:
-            est_blocks = cap
-        else:
-            est_blocks = max(1, prompt_speech_len)
-
-        if cap is not None:
-            est_blocks = min(est_blocks, cap)
-        estimated[sample_idx] = max(0, int(est_blocks))
-
-    return estimated
