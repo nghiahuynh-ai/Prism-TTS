@@ -642,13 +642,6 @@ def _build_lightning_module(
         audio_sample_rate=int(module_cfg.get("audio_sample_rate", 24_000)),
         max_audio_samples=int(module_cfg.get("max_audio_samples", 2)),
         log_media_on_validation_end=bool(module_cfg.get("log_media_on_validation_end", True)),
-        ema_decay=float(module_cfg.get("ema_decay", 0.999)),
-        ema_start_step=int(module_cfg.get("ema_start_step", 0)),
-        ema_update_every_n_steps=int(module_cfg.get("ema_update_every_n_steps", 1)),
-        ema_warmup_steps=int(module_cfg.get("ema_warmup_steps", 0)),
-        ema_device=str(module_cfg.get("ema_device", "cpu")),
-        use_ema_for_validation=bool(module_cfg.get("use_ema_for_validation", True)),
-        use_ema_for_periodic_eval=bool(module_cfg.get("use_ema_for_periodic_eval", True)),
         sync_dist_logging=bool(module_cfg.get("sync_dist_logging", False)),
     )
 

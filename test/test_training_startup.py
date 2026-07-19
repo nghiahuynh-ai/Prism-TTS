@@ -140,12 +140,11 @@ def test_train_model_builder_honors_meanflow_and_memory_options():
     assert model.short_encoder.chunk_size == 3
 
 
-def test_lightning_module_uses_low_peak_optimizer_and_cpu_ema():
+def test_lightning_module_uses_low_peak_optimizer_without_ema():
     config = {
         "trainer": {
             "lightning_module": {
                 "audio_decoder": None,
-                "ema_device": "cpu",
             },
             "optimizer": {
                 "name": "adamw",
@@ -182,12 +181,9 @@ def test_lightning_module_uses_low_peak_optimizer_and_cpu_ema():
     module = train._build_lightning_module(config, model)
 
     optimizer = module.configure_optimizers()
-    module._initialize_ema_if_needed()
 
     assert optimizer.defaults["foreach"] is False
-    assert module.ema_device == "cpu"
-    assert module._ema_state
-    assert all(tensor.device.type == "cpu" for tensor in module._ema_state.values())
+    assert not any("ema" in key.lower() for key in module.__dict__)
 
 
 def test_audio_decoder_is_lazy_by_default(tmp_path, monkeypatch):

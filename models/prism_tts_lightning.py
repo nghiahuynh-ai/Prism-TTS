@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
 from typing import Any, Optional
 
 import numpy as np
@@ -61,13 +60,6 @@ class PrismTTSLightning(pl.LightningModule):
         audio_sample_rate: int = 24_000,
         max_audio_samples: int = 2,
         log_media_on_validation_end: bool = True,
-        ema_decay: float = 0.999,
-        ema_start_step: int = 0,
-        ema_update_every_n_steps: int = 1,
-        ema_warmup_steps: int = 0,
-        ema_device: str = "cpu",
-        use_ema_for_validation: bool = True,
-        use_ema_for_periodic_eval: bool = True,
         sync_dist_logging: bool = False,
     ) -> None:
         super().__init__()
@@ -77,17 +69,6 @@ class PrismTTSLightning(pl.LightningModule):
             raise ValueError("audio_sample_rate must be >= 1.")
         if max_audio_samples < 1:
             raise ValueError("max_audio_samples must be >= 1.")
-        if not (0.0 < ema_decay < 1.0):
-            raise ValueError("ema_decay must be in (0, 1).")
-        if ema_start_step < 0:
-            raise ValueError("ema_start_step must be >= 0.")
-        if ema_update_every_n_steps < 1:
-            raise ValueError("ema_update_every_n_steps must be >= 1.")
-        if ema_warmup_steps < 0:
-            raise ValueError("ema_warmup_steps must be >= 0.")
-        ema_device = str(ema_device).strip().lower()
-        if ema_device not in {"cpu", "model"}:
-            raise ValueError("ema_device must be one of {'cpu', 'model'}.")
 
         self.model = model
         self.learning_rate = learning_rate
@@ -103,13 +84,6 @@ class PrismTTSLightning(pl.LightningModule):
         self.audio_sample_rate = audio_sample_rate
         self.max_audio_samples = max_audio_samples
         self.log_media_on_validation_end = log_media_on_validation_end
-        self.ema_decay = ema_decay
-        self.ema_start_step = ema_start_step
-        self.ema_update_every_n_steps = ema_update_every_n_steps
-        self.ema_warmup_steps = ema_warmup_steps
-        self.ema_device = ema_device
-        self.use_ema_for_validation = use_ema_for_validation
-        self.use_ema_for_periodic_eval = use_ema_for_periodic_eval
         self.sync_dist_logging = sync_dist_logging
 
         self._eval_loader_ref: Optional[Any] = None
@@ -118,10 +92,6 @@ class PrismTTSLightning(pl.LightningModule):
         self._train_loader_iter: Optional[Iterator[Any]] = None
         self._cached_text_id_to_char: Optional[dict[int, str]] = None
         self._periodic_eval_active = False
-        self._ema_state: dict[str, torch.Tensor] = {}
-        self._ema_updates = 0
-        self._last_ema_step = -1
-        self._ema_validation_backup: Optional[dict[str, torch.Tensor]] = None
 
         self.save_hyperparameters(
             {
@@ -133,13 +103,6 @@ class PrismTTSLightning(pl.LightningModule):
                 "audio_sample_rate": audio_sample_rate,
                 "max_audio_samples": max_audio_samples,
                 "log_media_on_validation_end": log_media_on_validation_end,
-                "ema_decay": ema_decay,
-                "ema_start_step": ema_start_step,
-                "ema_update_every_n_steps": ema_update_every_n_steps,
-                "ema_warmup_steps": ema_warmup_steps,
-                "ema_device": ema_device,
-                "use_ema_for_validation": use_ema_for_validation,
-                "use_ema_for_periodic_eval": use_ema_for_periodic_eval,
                 "sync_dist_logging": sync_dist_logging,
             }
         )
@@ -254,12 +217,8 @@ class PrismTTSLightning(pl.LightningModule):
         )
         return outputs.loss
 
-    def on_fit_start(self) -> None:
-        self._initialize_ema_if_needed()
-
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         del outputs, batch_idx
-        self._maybe_update_ema()
         if self._periodic_eval_active:
             return
         trainer = self.trainer
@@ -276,11 +235,7 @@ class PrismTTSLightning(pl.LightningModule):
         finally:
             self._periodic_eval_active = False
 
-    def on_validation_epoch_start(self) -> None:
-        self._maybe_apply_ema_for_validation()
-
     def on_validation_epoch_end(self) -> None:
-        self._maybe_restore_after_validation()
         if not self.log_media_on_validation_end:
             return
         if self._periodic_eval_active:
@@ -294,26 +249,6 @@ class PrismTTSLightning(pl.LightningModule):
             self._run_periodic_eval()
         finally:
             self._periodic_eval_active = False
-
-    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        if not self._ema_state:
-            return
-        checkpoint["ema_state"] = {
-            name: tensor.detach().cpu() for name, tensor in self._ema_state.items()
-        }
-        checkpoint["ema_updates"] = int(self._ema_updates)
-        checkpoint["ema_last_step"] = int(self._last_ema_step)
-
-    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        state = checkpoint.get("ema_state")
-        if isinstance(state, Mapping):
-            self._ema_state = {
-                str(name): tensor.detach().clone()
-                for name, tensor in state.items()
-                if torch.is_tensor(tensor)
-            }
-        self._ema_updates = int(checkpoint.get("ema_updates", 0))
-        self._last_ema_step = int(checkpoint.get("ema_last_step", -1))
 
     def _forward_batch(self, batch_inputs: PrismBatch) -> PrismTTSOutput:
         if (
@@ -444,22 +379,21 @@ class PrismTTSLightning(pl.LightningModule):
         periodic_samples: list[PeriodicEvalSample] = []
         was_training = self.model.training
         try:
-            with self._ema_scope(enabled=self.use_ema_for_periodic_eval):
-                self.model.eval()
-                with torch.no_grad():
-                    eval_sample = self._synthesize_periodic_eval_sample(
-                        eval_batch,
-                        sample_source="validation",
-                    )
-                    if eval_sample is not None:
-                        periodic_samples.append(eval_sample)
+            self.model.eval()
+            with torch.no_grad():
+                eval_sample = self._synthesize_periodic_eval_sample(
+                    eval_batch,
+                    sample_source="validation",
+                )
+                if eval_sample is not None:
+                    periodic_samples.append(eval_sample)
 
-                    train_sample = self._synthesize_periodic_eval_sample(
-                        train_batch,
-                        sample_source="train",
-                    )
-                    if train_sample is not None:
-                        periodic_samples.append(train_sample)
+                train_sample = self._synthesize_periodic_eval_sample(
+                    train_batch,
+                    sample_source="train",
+                )
+                if train_sample is not None:
+                    periodic_samples.append(train_sample)
         finally:
             if was_training:
                 self.model.train()
@@ -632,142 +566,6 @@ class PrismTTSLightning(pl.LightningModule):
         if isinstance(val_loaders, (list, tuple)):
             return val_loaders[0] if len(val_loaders) > 0 else None
         return val_loaders
-
-    def _initialize_ema_if_needed(self) -> None:
-        with torch.no_grad():
-            for name, param in self._ema_parameters():
-                device = self._ema_storage_device(param)
-                shadow = self._ema_state.get(name)
-                if shadow is None:
-                    self._ema_state[name] = param.detach().to(
-                        device=device,
-                        dtype=torch.float32,
-                        copy=True,
-                    )
-                elif shadow.device != device or shadow.dtype != torch.float32:
-                    self._ema_state[name] = shadow.to(
-                        device=device,
-                        dtype=torch.float32,
-                    )
-
-    def _maybe_update_ema(self) -> None:
-        trainer = self.trainer
-        if trainer is None or trainer.sanity_checking:
-            return
-
-        step = int(self.global_step)
-        effective_start = max(1, self.ema_start_step)
-        if step < effective_start:
-            return
-        if step % self.ema_update_every_n_steps != 0:
-            return
-        if step == self._last_ema_step:
-            return
-
-        self._initialize_ema_if_needed()
-        decay = self._ema_decay_for_step(step)
-        with torch.no_grad():
-            for name, param in self._ema_parameters():
-                shadow = self._ema_state.get(name)
-                if shadow is None:
-                    device = self._ema_storage_device(param)
-                    self._ema_state[name] = param.detach().to(
-                        device=device,
-                        dtype=torch.float32,
-                        copy=True,
-                    )
-                    continue
-                current = param.detach().to(device=shadow.device, dtype=shadow.dtype)
-                shadow.mul_(decay).add_(current, alpha=1.0 - decay)
-
-        self._ema_updates += 1
-        self._last_ema_step = step
-        self.log(
-            "train/ema_decay",
-            decay,
-            prog_bar=False,
-            on_step=True,
-            on_epoch=False,
-            batch_size=1,
-            sync_dist=False,
-        )
-
-    def _ema_decay_for_step(self, step: int) -> float:
-        if self.ema_warmup_steps <= 0:
-            return self.ema_decay
-        effective_start = max(1, self.ema_start_step)
-        progress = float(step - effective_start + 1) / float(self.ema_warmup_steps)
-        progress = min(1.0, max(0.0, progress))
-        return self.ema_decay * progress
-
-    def _maybe_apply_ema_for_validation(self) -> None:
-        if not self.use_ema_for_validation:
-            return
-        if self._ema_validation_backup is not None:
-            return
-        self._initialize_ema_if_needed()
-        if not self._ema_state:
-            return
-        self._ema_validation_backup = self._backup_current_parameters()
-        self._copy_ema_to_model()
-
-    def _maybe_restore_after_validation(self) -> None:
-        if self._ema_validation_backup is None:
-            return
-        self._restore_parameters(self._ema_validation_backup)
-        self._ema_validation_backup = None
-
-    @contextmanager
-    def _ema_scope(self, enabled: bool) -> Iterator[None]:
-        if not enabled or not self._ema_state:
-            yield
-            return
-        backup = self._backup_current_parameters()
-        self._copy_ema_to_model()
-        try:
-            yield
-        finally:
-            self._restore_parameters(backup)
-
-    def _backup_current_parameters(self) -> dict[str, torch.Tensor]:
-        with torch.no_grad():
-            backup_device = torch.device("cpu") if self.ema_device == "cpu" else None
-            return {
-                name: param.detach().to(
-                    device=param.device if backup_device is None else backup_device,
-                    copy=True,
-                )
-                for name, param in self._ema_parameters()
-            }
-
-    def _restore_parameters(self, backup: Mapping[str, torch.Tensor]) -> None:
-        with torch.no_grad():
-            for name, param in self._ema_parameters():
-                value = backup.get(name)
-                if value is None:
-                    continue
-                param.copy_(value.to(device=param.device, dtype=param.dtype))
-
-    def _copy_ema_to_model(self) -> None:
-        with torch.no_grad():
-            for name, param in self._ema_parameters():
-                shadow = self._ema_state.get(name)
-                if shadow is None:
-                    continue
-                param.copy_(shadow.to(device=param.device, dtype=param.dtype))
-
-    def _ema_storage_device(self, param: torch.nn.Parameter) -> torch.device:
-        if self.ema_device == "cpu":
-            return torch.device("cpu")
-        return param.device
-
-    def _ema_parameters(self) -> Iterator[tuple[str, torch.nn.Parameter]]:
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-            if not param.dtype.is_floating_point:
-                continue
-            yield name, param
 
     def _log_eval_media_to_wandb(
         self,
