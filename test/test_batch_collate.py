@@ -110,3 +110,28 @@ def test_batch_collate_builds_continuous_only_causal_layout():
 
     # The last target frame's continuous latent is preserved (not zeroed).
     assert out["flat_continuous_values"][0, len_a - 1].tolist() == [0.5, 0.5]
+
+
+def test_batch_collate_rounds_flat_sequence_to_fixed_bucket():
+    collate = BatchCollate(
+        discrete_token_count=100,
+        flat_sequence_length_multiple=8,
+    )
+    sample = _make_sample(
+        text_prompt=[200],
+        discrete_prompt=[[1]],
+        continuous_prompt=[[0.1, 0.1]],
+        text_target=[210, 211],
+        discrete_target=[[3], [4], [5]],
+        continuous_target=[[0.3, 0.3], [0.4, 0.4], [0.5, 0.5]],
+    )
+
+    out = collate([sample])
+
+    # Natural flat length is 2 text + EOT + 3 frames = 6; only model-facing
+    # tensors round to the 8-position allocation bucket.
+    assert out["flat_token_ids"].shape == (1, 8)
+    assert out["flat_continuous_values"].shape == (1, 8, 2)
+    assert out["attention_mask"].tolist() == [[True] * 6 + [False] * 2]
+    assert out["text_target"].shape == (1, 2)
+    assert out["continuous_target"].shape == (1, 3, 2)

@@ -721,6 +721,7 @@ class BatchCollate:
         continuous_pad_value: float = 0.0,
         include_attention_mask: bool = True,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
+        flat_sequence_length_multiple: int = 1,
     ) -> None:
         # `discrete_token_count` only fixes the shared token-id layout (EOT/EOS/PAD/
         # text offset); no discrete speech stream is emitted in this branch.
@@ -734,6 +735,9 @@ class BatchCollate:
         self.continuous_pad_value = continuous_pad_value
         self.include_attention_mask = include_attention_mask
         self.discrete_token_count = int(discrete_token_count)
+        self.flat_sequence_length_multiple = int(flat_sequence_length_multiple)
+        if self.flat_sequence_length_multiple < 1:
+            raise ValueError("flat_sequence_length_multiple must be >= 1.")
 
     def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         if not batch:
@@ -778,18 +782,22 @@ class BatchCollate:
         collated["flat_token_ids"] = _pad_1d(
             [item["token_ids"] for item in flat_per_sample],
             self.pad_token_id,
+            pad_to_multiple=self.flat_sequence_length_multiple,
         )
         collated["flat_token_type_ids"] = _pad_1d(
             [item["token_type_ids"] for item in flat_per_sample],
             TEXT_TOKEN_TYPE,
+            pad_to_multiple=self.flat_sequence_length_multiple,
         )
         collated["flat_target_block_ids"] = _pad_1d(
             [item["target_block_ids"] for item in flat_per_sample],
             -1,
+            pad_to_multiple=self.flat_sequence_length_multiple,
         )
         collated["flat_continuous_values"] = _pad_2d(
             [item["continuous_values"] for item in flat_per_sample],
             0.0,
+            pad_to_multiple=self.flat_sequence_length_multiple,
         )
         collated["flat_target_block_counts"] = speech_target_lengths
 
@@ -797,6 +805,7 @@ class BatchCollate:
             collated["attention_mask"] = _pad_1d(
                 [item["attention_mask"] for item in flat_per_sample],
                 False,
+                pad_to_multiple=self.flat_sequence_length_multiple,
             ).to(dtype=torch.bool)
 
         return collated

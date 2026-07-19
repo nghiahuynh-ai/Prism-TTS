@@ -301,6 +301,11 @@ class PrismTTS(nn.Module):
         outputs = self.backbone(
             inputs_embeds=inputs_embeds,
             attention_mask=backbone_mask,
+            # Every position is recomputed on each call (training and the
+            # full-recompute generate loop), so a KV cache is never reused;
+            # the config default (use_cache=True) would allocate per-layer
+            # K/V copies of the whole sequence on every forward.
+            use_cache=False,
             return_dict=True,
         )
         return outputs.last_hidden_state

@@ -186,6 +186,69 @@ def test_lightning_module_uses_low_peak_optimizer_without_ema():
     assert not any("ema" in key.lower() for key in module.__dict__)
 
 
+def test_cuda_cache_cleanup_runs_once_per_configured_step(monkeypatch):
+    config = {
+        "trainer": {
+            "lightning_module": {
+                "audio_decoder": None,
+                "cuda_cache_cleanup_every_n_steps": 10,
+            },
+            "optimizer": {"name": "adamw", "foreach": False},
+            "scheduler": {"enabled": False},
+            "lightning_trainer": {"max_steps": 1},
+        }
+    }
+    model_config = {
+        "model": {
+            "name": "prism_tts",
+            "prism_tts": {
+                "continuous_latent_size": 4,
+                "flow_num_res_blocks": 1,
+                "use_short_context": False,
+            },
+            "llama_config": {
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 32,
+                "pad_token_id": 0,
+                "eos_token_id": 2,
+                "use_cache": False,
+                "_attn_implementation": "eager",
+            },
+        }
+    }
+    module = train._build_lightning_module(
+        config,
+        train._build_model(model_config),
+    )
+    calls: list[str] = []
+    logged: dict[str, float] = {}
+    reserved_values = iter((8 * 1024**3, 6 * 1024**3))
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda: 4 * 1024**3)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: next(reserved_values))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(
+        module,
+        "log",
+        lambda name, value, **kwargs: logged.__setitem__(name, float(value)),
+    )
+
+    module._maybe_cleanup_cuda_cache(step=9)
+    module._maybe_cleanup_cuda_cache(step=10)
+    module._maybe_cleanup_cuda_cache(step=10)
+
+    assert calls == ["empty"]
+    assert logged["train/cuda_allocated_gib"] == 4.0
+    assert logged["train/cuda_reserved_gib"] == 6.0
+    assert logged["train/cuda_cache_released_gib"] == 2.0
+
+
 def test_audio_decoder_is_lazy_by_default(tmp_path, monkeypatch):
     module_path = tmp_path / "lazy_decoder_target.py"
     module_path.write_text(

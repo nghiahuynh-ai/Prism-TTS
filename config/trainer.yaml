@@ -12,6 +12,10 @@ trainer:
     audio_sample_rate: 24000
     max_audio_samples: 2
     log_media_on_validation_end: true
+    # Periodically run gc.collect() + empty_cache() to release cycle-held
+    # tensors and inactive allocator blocks. Every step would force a device
+    # sync per step for no extra benefit.
+    cuda_cache_cleanup_every_n_steps: 100
     # Keep startup fast: Mimi is only needed for media logging, not train loss.
     audio_decoder_lazy: true
     audio_decoder: models.mimi_latent_decoder.MimiPreUpsampleLatentDecoder
@@ -53,7 +57,7 @@ trainer:
     max_steps: 1000000
     min_steps: 0
     gradient_clip_val: 1.0
-    # Keep the effective batch at 8 while bounding per-step activation memory.
+    # Fixed microbatch 1; accumulate to preserve effective batch size 8.
     accumulate_grad_batches: 1
     log_every_n_steps: 10
     val_check_interval: 100000

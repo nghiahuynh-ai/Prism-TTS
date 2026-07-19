@@ -31,7 +31,9 @@ data:
     shuffle_val: false
     shuffle_test: false
     adaptive_batching:
-      # Set true to enable dynamic batch sizes based on estimated memory usage.
+      # Bounds batch_size * max_len^2 per batch. With a fixed batch size the
+      # per-step peak is unbounded (16 samples padded to the longest utterance),
+      # so the allocator footprint ratchets up over training until OOM.
       enabled: false
       # Target utilization against the configured/derived memory_budget.
       target_memory_utilization: 0.9
@@ -42,7 +44,7 @@ data:
       target_batch_cost: 40_000_000
       # Quantile used when deriving memory_budget automatically.
       reference_length_quantile: 0.95
-      # Upper bound for dynamic batch size (allows adding samples when memory is underused).
+      # Upper bound used only when adaptive batching is explicitly enabled.
       max_batch_size: 1024
       # Sampler RNG seed; null falls back to trainer.seed (or 0).
       seed: null
@@ -86,4 +88,7 @@ data:
     text_pad_value: null
     continuous_pad_value: 0.0
     include_attention_mask: true
+    # Round only the flattened model sequence to this multiple. Fixed shape
+    # buckets reduce allocator churn without changing fixed batch membership.
+    flat_sequence_length_multiple: 64
     codec_frame_rate_hz: 12.5

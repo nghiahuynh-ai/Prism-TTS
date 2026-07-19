@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, Optional
 
@@ -60,6 +61,7 @@ class PrismTTSLightning(pl.LightningModule):
         audio_sample_rate: int = 24_000,
         max_audio_samples: int = 2,
         log_media_on_validation_end: bool = True,
+        cuda_cache_cleanup_every_n_steps: int = 100,
         sync_dist_logging: bool = False,
     ) -> None:
         super().__init__()
@@ -69,6 +71,8 @@ class PrismTTSLightning(pl.LightningModule):
             raise ValueError("audio_sample_rate must be >= 1.")
         if max_audio_samples < 1:
             raise ValueError("max_audio_samples must be >= 1.")
+        if cuda_cache_cleanup_every_n_steps < 0:
+            raise ValueError("cuda_cache_cleanup_every_n_steps must be >= 0.")
 
         self.model = model
         self.learning_rate = learning_rate
@@ -84,6 +88,7 @@ class PrismTTSLightning(pl.LightningModule):
         self.audio_sample_rate = audio_sample_rate
         self.max_audio_samples = max_audio_samples
         self.log_media_on_validation_end = log_media_on_validation_end
+        self.cuda_cache_cleanup_every_n_steps = int(cuda_cache_cleanup_every_n_steps)
         self.sync_dist_logging = sync_dist_logging
 
         self._eval_loader_ref: Optional[Any] = None
@@ -92,6 +97,7 @@ class PrismTTSLightning(pl.LightningModule):
         self._train_loader_iter: Optional[Iterator[Any]] = None
         self._cached_text_id_to_char: Optional[dict[int, str]] = None
         self._periodic_eval_active = False
+        self._last_cuda_cache_cleanup_step = -1
 
         self.save_hyperparameters(
             {
@@ -103,6 +109,7 @@ class PrismTTSLightning(pl.LightningModule):
                 "audio_sample_rate": audio_sample_rate,
                 "max_audio_samples": max_audio_samples,
                 "log_media_on_validation_end": log_media_on_validation_end,
+                "cuda_cache_cleanup_every_n_steps": cuda_cache_cleanup_every_n_steps,
                 "sync_dist_logging": sync_dist_logging,
             }
         )
@@ -219,6 +226,7 @@ class PrismTTSLightning(pl.LightningModule):
 
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         del outputs, batch_idx
+        self._maybe_cleanup_cuda_cache(step=int(self.global_step))
         if self._periodic_eval_active:
             return
         trainer = self.trainer
@@ -370,6 +378,56 @@ class PrismTTSLightning(pl.LightningModule):
         if trainer is None or not trainer.optimizers:
             return None
         return float(trainer.optimizers[0].param_groups[0]["lr"])
+
+    def _maybe_cleanup_cuda_cache(self, *, step: int) -> None:
+        interval = self.cuda_cache_cleanup_every_n_steps
+        if (
+            interval < 1
+            or step < 1
+            or step % interval != 0
+            or step == self._last_cuda_cache_cleanup_step
+            or not torch.cuda.is_available()
+        ):
+            return
+
+        # The MeanFlow torch.func.jvp pass leaves reference cycles behind each
+        # step; CUDA tensors reachable only from those cycles are invisible to
+        # empty_cache until the Python GC breaks them.
+        gc.collect()
+        gib = float(1024**3)
+        allocated_gib = float(torch.cuda.memory_allocated()) / gib
+        reserved_before_gib = float(torch.cuda.memory_reserved()) / gib
+        torch.cuda.empty_cache()
+        reserved_after_gib = float(torch.cuda.memory_reserved()) / gib
+        self._last_cuda_cache_cleanup_step = step
+
+        self.log(
+            "train/cuda_allocated_gib",
+            allocated_gib,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+            sync_dist=False,
+        )
+        self.log(
+            "train/cuda_reserved_gib",
+            reserved_after_gib,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+            sync_dist=False,
+        )
+        self.log(
+            "train/cuda_cache_released_gib",
+            max(0.0, reserved_before_gib - reserved_after_gib),
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+            sync_dist=False,
+        )
 
     def _run_periodic_eval(self, train_batch: Optional[Any] = None) -> None:
         eval_batch = self._next_eval_batch()

@@ -34,7 +34,7 @@ WANDB_LOG_MODEL ?= false
 WANDB_ENTITY ?=
 WANDB_GROUP ?=
 WANDB_TAGS ?=
-PYTORCH_CUDA_ALLOC_CONF ?= backend:cudaMallocAsync
+PYTORCH_CUDA_ALLOC_CONF ?= expandable_segments:True,garbage_collection_threshold:0.8
 
 TRAIN_ARGS ?=
 VALIDATE_ARGS ?=
@@ -107,7 +107,7 @@ help:
 	@echo "  WANDB_ENTITY=...       Override WandB entity"
 	@echo "  WANDB_GROUP=...        Override WandB group"
 	@echo "  WANDB_TAGS=a,b,c       Override WandB tags"
-	@echo "  PYTORCH_CUDA_ALLOC_CONF=...  CUDA allocator config (default: backend:cudaMallocAsync)"
+	@echo "  PYTORCH_CUDA_ALLOC_CONF=...  CUDA allocator config (default: expandable segments)"
 	@echo ""
 	@echo "Extra args:"
 	@echo "  TRAIN_ARGS='...'"

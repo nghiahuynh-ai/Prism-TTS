@@ -15,7 +15,9 @@ from typing import Any
 
 _DEFAULTED_CUDA_ALLOC_CONF = False
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "expandable_segments:True,garbage_collection_threshold:0.8"
+    )
     _DEFAULTED_CUDA_ALLOC_CONF = True
 
 # Keep a process-level timestamp so the startup report includes expensive imports
@@ -642,6 +644,9 @@ def _build_lightning_module(
         audio_sample_rate=int(module_cfg.get("audio_sample_rate", 24_000)),
         max_audio_samples=int(module_cfg.get("max_audio_samples", 2)),
         log_media_on_validation_end=bool(module_cfg.get("log_media_on_validation_end", True)),
+        cuda_cache_cleanup_every_n_steps=int(
+            module_cfg.get("cuda_cache_cleanup_every_n_steps", 100)
+        ),
         sync_dist_logging=bool(module_cfg.get("sync_dist_logging", False)),
     )
 
@@ -1023,6 +1028,9 @@ def _build_data_objects(
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
+        flat_sequence_length_multiple=int(
+            collate_cfg.get("flat_sequence_length_multiple", 1)
+        ),
     )
 
     num_workers = int(loader_cfg.get("num_workers", 0))
@@ -1744,7 +1752,8 @@ def run(args: argparse.Namespace, *, process_start: float | None = None) -> None
     if _DEFAULTED_CUDA_ALLOC_CONF:
         print(
             "[train.py] PYTORCH_CUDA_ALLOC_CONF was unset; defaulting to "
-            "'backend:cudaMallocAsync' to avoid NVML-related allocator assertions."
+            "'expandable_segments:True,garbage_collection_threshold:0.8' "
+            "to reduce fragmentation from variable sequence lengths."
         )
     _apply_wandb_cli_overrides(config, args)
     tracking = _apply_experiment_tracking_defaults(config)
