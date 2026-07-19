@@ -292,6 +292,63 @@ def test_lazy_metadata_build_does_not_open_manifest_during_data_setup(tmp_path):
     assert test_loader is None
 
 
+def test_indexed_metadata_builds_sized_map_dataset_for_distributed_sampler(tmp_path):
+    manifest = tmp_path / "train.txt"
+    manifest.write_text(
+        "\n".join(
+            f"{index}.wav|1.0|a|{index}.npy|p.wav|1.0|a|p.npy"
+            for index in range(5)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = {
+        "data": {
+            "train_manifest": str(manifest),
+            "val_manifest": None,
+            "test_manifest": None,
+            "manifest_root": None,
+            "vocab_path": str(PROJECT_ROOT / "dataset" / "vocab.txt"),
+            "loader": {
+                "train_batch_size": 2,
+                "num_workers": 0,
+                "persistent_workers": False,
+                "pin_memory": False,
+                "shuffle_train": True,
+            },
+            "shared_layout": {"discrete_token_count": 16},
+            "dataset": {"metadata_mode": "indexed"},
+            "collate": {"continuous_pad_value": 0.0, "include_attention_mask": True},
+        },
+        "trainer": {"distributed": {"enabled": True}},
+    }
+
+    train_loader, _, _ = train._build_data_objects(
+        config,
+        warmup_train_workers=False,
+    )
+
+    assert isinstance(train_loader.dataset, train.PrismDataset)
+    assert not isinstance(train_loader.dataset, train.IterableDataset)
+    assert train_loader.dataset.index_manifest
+    assert len(train_loader.dataset) == 5
+
+    rank_zero = torch.utils.data.DistributedSampler(
+        train_loader.dataset,
+        num_replicas=2,
+        rank=0,
+        shuffle=False,
+    )
+    rank_one = torch.utils.data.DistributedSampler(
+        train_loader.dataset,
+        num_replicas=2,
+        rank=1,
+        shuffle=False,
+    )
+    assert len(rank_zero) == len(rank_one) == 3
+    assert set(rank_zero).union(rank_one) == set(range(5))
+
+
 @pytest.mark.filterwarnings("ignore:GPU available but not used.*")
 def test_lightning_consumes_startup_prefetch_without_resetting_workers(monkeypatch):
     class TinyModule(train.pl.LightningModule):

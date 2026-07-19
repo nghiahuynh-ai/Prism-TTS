@@ -59,10 +59,11 @@ data:
 
   dataset:
     # PrismDataset(...) arguments.
-    # "lazy" streams and parses metadata only in DataLoader workers. It avoids
-    # the multi-minute startup cost of reading a full NFS manifest; set "eager"
-    # only when using adaptive batching.
-    metadata_mode: lazy
+    # "indexed" follows the v2.2 random-access design: it stores compact byte
+    # offsets, exposes the exact sample count, and lets Lightning's distributed
+    # sampler split each epoch evenly across ranks. "lazy" has faster startup
+    # but cannot provide exact, count-balanced DDP epochs.
+    metadata_mode: indexed
     # Training-order randomization for lazy metadata; this many entries per
     # worker are retained while streaming, not the entire manifest.
     metadata_shuffle_buffer_size: 256

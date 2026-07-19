@@ -51,3 +51,27 @@ def test_lazy_manifest_defers_parsing_until_iteration(tmp_path):
     entries = list(dataset._iter_manifest_entries(shard_index=0, shard_count=1))
     assert [entry.file_name for entry in entries] == ["one.wav", "two.wav"]
     assert entries[0].target_npy_path == tmp_path / "one.npy"
+
+
+def test_indexed_manifest_exposes_exact_random_access_length(tmp_path):
+    manifest_path = tmp_path / "manifest.txt"
+    manifest_path.write_text(
+        "# ignored\n"
+        "one.wav|1.0|one|one.npy|prompt.wav|1.0|prompt|prompt.npy\n"
+        "\n"
+        "two.wav|1.0|two|two.npy|prompt.wav|1.0|prompt|prompt.npy\n",
+        encoding="utf-8",
+    )
+
+    dataset = PrismDataset(
+        manifest_path,
+        vocab_path=PROJECT_ROOT / "dataset" / "vocab.txt",
+        index_manifest=True,
+    )
+
+    assert len(dataset) == 2
+    assert dataset._entries == []
+    assert list(dataset._manifest_line_numbers) == [2, 4]
+    assert dataset._manifest_entry_at(0).file_name == "one.wav"
+    assert dataset._manifest_entry_at(1).file_name == "two.wav"
+    assert dataset._manifest_entry_at(-1).file_name == "two.wav"

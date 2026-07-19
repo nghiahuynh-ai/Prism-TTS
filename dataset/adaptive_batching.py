@@ -106,6 +106,29 @@ def estimate_prism_sample_lengths(
             )
         return lengths
 
+    iter_manifest_entries = getattr(dataset, "iter_manifest_entries", None)
+    if callable(iter_manifest_entries) and tokenizer is not None and hasattr(
+        tokenizer, "char_to_id"
+    ):
+        char_to_id = getattr(tokenizer, "char_to_id")
+        append_eos = bool(getattr(tokenizer, "append_eos", False))
+        if not isinstance(char_to_id, Mapping):
+            raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
+        return [
+            _estimate_concat_sequence_length(
+                text_target_length=_estimate_text_token_count(
+                    str(entry.transcript),
+                    char_to_id=char_to_id,
+                    append_eos=append_eos,
+                ),
+                speech_target_length=_estimate_discrete_length(
+                    float(entry.duration),
+                    codec_frame_rate_hz,
+                ),
+            )
+            for entry in iter_manifest_entries()
+        ]
+
     samples = getattr(dataset, "_samples", None)
     if isinstance(samples, Sequence) and len(samples) > 0:
         lengths = []

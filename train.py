@@ -944,8 +944,10 @@ def _build_data_objects(
     }
 
     metadata_mode = str(dataset_cfg.get("metadata_mode", "eager")).strip().lower()
-    if metadata_mode not in {"eager", "lazy"}:
-        raise ValueError("data.dataset.metadata_mode must be either 'eager' or 'lazy'.")
+    if metadata_mode not in {"eager", "indexed", "lazy"}:
+        raise ValueError(
+            "data.dataset.metadata_mode must be 'eager', 'indexed', or 'lazy'."
+        )
     shuffle_train = bool(loader_cfg.get("shuffle_train", True))
     metadata_shuffle_buffer_size = int(
         dataset_cfg.get("metadata_shuffle_buffer_size", 256)
@@ -960,8 +962,12 @@ def _build_data_objects(
         *,
         split: str,
     ) -> PrismDataset | LazyPrismDataset:
-        if metadata_mode == "eager":
-            return PrismDataset(source=manifest, **dataset_kwargs)
+        if metadata_mode != "lazy":
+            return PrismDataset(
+                source=manifest,
+                index_manifest=metadata_mode == "indexed",
+                **dataset_kwargs,
+            )
         return LazyPrismDataset(
             source=manifest,
             shuffle_manifest=split == "train" and shuffle_train,
@@ -1101,8 +1107,8 @@ def _build_data_objects(
     if adaptive_enabled:
         if isinstance(train_dataset, IterableDataset):
             raise ValueError(
-                "Adaptive batching requires data.dataset.metadata_mode='eager' because "
-                "it needs every manifest sample length before training starts."
+                "Adaptive batching requires data.dataset.metadata_mode='eager' or "
+                "'indexed' because it needs random-access samples."
             )
         target_memory_utilization = float(adaptive_cfg.get("target_memory_utilization", 0.8))
         if target_memory_utilization <= 0.0 or target_memory_utilization > 1.0:
