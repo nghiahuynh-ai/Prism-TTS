@@ -128,6 +128,11 @@ class FlowHead(nn.Module):
         self.grad_checkpointing = grad_checkpointing
 
         self.time_embed = TimestepEmbedder(model_channels)
+        # MeanFlow uses two timesteps: the head is conditioned on (t, t - r).
+        # `gap_embed` embeds the interval (t - r); it is only added when an interval
+        # timestep `r` is supplied (MeanFlow), leaving single-timestep flow matching
+        # behavior unchanged when `r` is None.
+        self.gap_embed = TimestepEmbedder(model_channels)
         self.cond_embed = nn.Linear(z_channels, model_channels)
 
         self.input_proj = nn.Linear(in_channels, model_channels)
@@ -155,9 +160,11 @@ class FlowHead(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize timestep embedding MLP
+        # Initialize timestep embedding MLPs
         nn.init.normal_(self.time_embed.mlp[0].weight, std=0.02)
         nn.init.normal_(self.time_embed.mlp[2].weight, std=0.02)
+        nn.init.normal_(self.gap_embed.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.gap_embed.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers
         for block in self.res_blocks:
@@ -174,19 +181,22 @@ class FlowHead(nn.Module):
         nn.init.constant_(self.logvar_linear.weight, 0)
         nn.init.constant_(self.logvar_linear.bias, 0)
 
-    def forward(self, x, t, c):
+    def forward(self, x, t, c, r=None):
         """
         Apply the model to an input batch.
         :param x: an [N x C] Tensor of inputs.
         :param t: a 1-D batch of timesteps.
         :param c: conditioning from AR transformer.
+        :param r: optional 1-D batch of MeanFlow interval start timesteps. When
+            provided, the head is additionally conditioned on the interval (t - r)
+            (MeanFlow average-velocity field); when None it is a single-timestep
+            flow-matching / consistency head.
         :return: an [N x C] Tensor of outputs.
         """
         x = self.input_proj(x)
-        t = self.time_embed(t)
-        c = self.cond_embed(c)
-
-        y = t + c
+        y = self.time_embed(t) + self.cond_embed(c)
+        if r is not None:
+            y = y + self.gap_embed(t - r)
 
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for block in self.res_blocks:

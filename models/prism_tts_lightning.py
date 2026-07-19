@@ -177,8 +177,8 @@ class PrismTTSLightning(pl.LightningModule):
             sync_dist=self.sync_dist_logging,
         )
         self.log(
-            "train/consistency_loss",
-            outputs.consistency_loss,
+            "train/flow_loss",
+            outputs.flow_loss,
             prog_bar=False,
             on_step=True,
             on_epoch=True,
@@ -225,8 +225,8 @@ class PrismTTSLightning(pl.LightningModule):
             sync_dist=self.sync_dist_logging,
         )
         self.log(
-            "val/consistency_loss",
-            outputs.consistency_loss,
+            "val/flow_loss",
+            outputs.flow_loss,
             prog_bar=False,
             on_step=False,
             on_epoch=True,
@@ -472,24 +472,9 @@ class PrismTTSLightning(pl.LightningModule):
         batch = LU.slice_batch_to_sample(batch, sample_idx=0)
         batch = LU.move_to_device(batch, self.device)
         batch_inputs = self._parse_batch(batch)
-        if (
-            batch_inputs.text_prompt is None
-            or batch_inputs.continuous_prompt is None
-            or batch_inputs.text_target is None
-            or batch_inputs.continuous_target is None
-        ):
+        if batch_inputs.text_target is None or batch_inputs.continuous_target is None:
             return None
 
-        prompt_speech_len = (
-            int(torch.as_tensor(batch_inputs.speech_prompt_lengths)[0].item())
-            if batch_inputs.speech_prompt_lengths is not None
-            else int(batch_inputs.continuous_prompt.shape[-2])
-        )
-        prompt_text_len = (
-            int(torch.as_tensor(batch_inputs.text_prompt_lengths)[0].item())
-            if batch_inputs.text_prompt_lengths is not None
-            else int(batch_inputs.text_prompt.shape[1])
-        )
         target_speech_len = (
             int(torch.as_tensor(batch_inputs.speech_target_lengths)[0].item())
             if batch_inputs.speech_target_lengths is not None
@@ -503,50 +488,62 @@ class PrismTTSLightning(pl.LightningModule):
         if target_speech_len < 1:
             return None
 
-        text_prompt = batch_inputs.text_prompt[:, :prompt_text_len]
-        continuous_prompt = normalize_continuous_latents(
-            batch_inputs.continuous_prompt,
-            expected_len=int(batch_inputs.continuous_prompt.shape[-2]),
-            name="continuous_prompt",
-            continuous_latent_size=self.model.continuous_latent_size,
-        )[:, :prompt_speech_len, :]
         text_target = batch_inputs.text_target[:, :target_text_len]
+        continuous_target = normalize_continuous_latents(
+            batch_inputs.continuous_target,
+            expected_len=int(batch_inputs.continuous_target.shape[-2]),
+            name="continuous_target",
+            continuous_latent_size=self.model.continuous_latent_size,
+        )[:, :target_speech_len, :]
 
-        # Cap generation length at the teacher target length so the predicted and
-        # ground-truth audio align for logging/comparison.
-        generation_outputs: dict[str, PrismTTSGenerationOutput] = {
-            "ar": self.model.generate(
-                text_prompt=text_prompt,
-                continuous_prompt=continuous_prompt,
+        # Condition on the first protected-prefix fraction of the utterance's own
+        # frames and regenerate the rest, then compare to the ground-truth tail.
+        condition_len = int(target_speech_len * float(self.model.protected_prefix_ratio))
+        condition_len = max(0, min(target_speech_len - 1, condition_len))
+        gen_len = target_speech_len - condition_len
+        if gen_len < 1:
+            return None
+        continuous_condition = (
+            continuous_target[:, :condition_len, :] if condition_len > 0 else None
+        )
+        condition_lengths = (
+            torch.tensor([condition_len], device=self.device) if condition_len > 0 else None
+        )
+
+        default_block = max(1, int(self.model.default_block_size))
+        block_specs: dict[str, int] = {"latent": 1}
+        if default_block > 1:
+            block_specs["block"] = default_block
+
+        # eos_threshold=2.0 disables early stopping so the generated length matches
+        # gen_len for aligned logging/comparison against the ground-truth tail.
+        generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
+        for method_name, block_size in block_specs.items():
+            generation_outputs[method_name] = self.model.generate(
                 text_target=text_target,
-                text_prompt_lengths=torch.tensor([prompt_text_len], device=self.device),
-                speech_prompt_lengths=torch.tensor([prompt_speech_len], device=self.device),
+                continuous_condition=continuous_condition,
                 text_target_lengths=torch.tensor([target_text_len], device=self.device),
-                max_new_frames=target_speech_len,
+                condition_lengths=condition_lengths,
+                max_new_frames=gen_len,
+                block_size=block_size,
+                eos_threshold=2.0,
                 return_dict=True,
             )
+
+        text_target_str = self._decode_text_tokens(text_target[0], length=target_text_len)
+        synthesized_text_by_method = {
+            method_name: text_target_str for method_name in generation_outputs
         }
 
-        text_prompt_str = self._decode_text_tokens(text_prompt[0], length=prompt_text_len)
-        text_target_str = self._decode_text_tokens(text_target[0], length=target_text_len)
-        synthesized_text_by_method: dict[str, str] = {}
-        for generation_method, generation in generation_outputs.items():
-            generated_text = ""
-            if generation.text_ids is not None and int(generation.text_ids.shape[0]) > 0:
-                generated_text = self._decode_text_tokens(
-                    generation.text_ids[0],
-                    length=int(generation.text_ids.shape[1]),
-                )
-            synthesized_text_by_method[generation_method] = generated_text or text_target_str
-
+        gt_tail = continuous_target[:, condition_len:target_speech_len, :]
         return PeriodicEvalSample(
             sample_source=str(sample_source),
             batch_inputs=PrismBatch(
-                continuous_target=batch_inputs.continuous_target,
-                speech_target_lengths=torch.tensor([target_speech_len], device=self.device),
+                continuous_target=gt_tail,
+                speech_target_lengths=torch.tensor([gen_len], device=self.device),
             ),
             generations=generation_outputs,
-            text_prompt=text_prompt_str,
+            text_prompt="",
             text_target=text_target_str,
             synthesized_text_by_method=synthesized_text_by_method,
         )

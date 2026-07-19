@@ -48,6 +48,7 @@ def test_estimate_prism_sample_lengths_from_manifest_metadata():
         dataset,
         codec_frame_rate_hz=12.5,
     )
-    # Continuous-only layout: text_prompt + EOT + prompt_frames + EOS + text_target + EOT + target_frames.
-    # sample 0: 2 + 1 + 2 + 1 + 3 + 1 + 2 = 12 ; sample 1: 4 + 1 + 1 + 1 + 2 + 1 + 3 = 13
-    assert lengths == [12, 13]
+    # Single-utterance continuous-only layout: text_target + EOT + target_frames.
+    # sample 0: transcript "abc" (3) + 1 + round(0.16*12.5)=2 -> 6
+    # sample 1: transcript "bb" (2) + 1 + round(0.24*12.5)=3 -> 6
+    assert lengths == [6, 6]

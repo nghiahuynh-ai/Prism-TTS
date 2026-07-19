@@ -186,16 +186,16 @@ def main() -> None:
     if args.sample_steps is not None:
         generate_kwargs["num_sample_steps"] = int(args.sample_steps)
 
+    # Single-utterance layout: the reference audio seeds the in-context condition
+    # frames (zeroshot voice), and `text` is the utterance to synthesize.
     with torch.no_grad():
         generation = model.generate(
-            text_prompt=text_prompt,
-            continuous_prompt=continuous_prompt,
             text_target=text_target,
-            text_prompt_lengths=torch.tensor([text_prompt.shape[1]], device=device, dtype=torch.long),
-            speech_prompt_lengths=torch.tensor(
+            continuous_condition=continuous_prompt,
+            text_target_lengths=torch.tensor([text_target.shape[1]], device=device, dtype=torch.long),
+            condition_lengths=torch.tensor(
                 [raw_prompt_continuous.shape[0]], device=device, dtype=torch.long
             ),
-            text_target_lengths=torch.tensor([text_target.shape[1]], device=device, dtype=torch.long),
             return_dict=True,
             **generate_kwargs,
         )
@@ -256,7 +256,7 @@ def main() -> None:
         print(f"[generate.py] wrote mel spectrogram: {mel_path}")
     print(
         "[generate.py] summary: "
-        f"prompt_text_tokens={text_prompt.shape[1]}, "
+        f"condition_frames={int(raw_prompt_continuous.shape[0])}, "
         f"generated_frames={int(sample_latents.shape[0])}, sample_rate={output_sample_rate}"
     )
 

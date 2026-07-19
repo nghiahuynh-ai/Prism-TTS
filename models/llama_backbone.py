@@ -77,6 +77,34 @@ def _build_causal_4d_mask(
     return mask
 
 
+def build_bidirectional_4d_mask(
+    padding_mask: Optional[torch.Tensor],
+    batch_size: int,
+    seq_len: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build a 4D additive *bidirectional* mask (only padded keys are masked).
+
+    Used by the masked-generative (MAR) variant: every query may attend to every
+    non-padded key (no causal triangle). Returned as a fully-specified additive
+    mask so the backbone's 4D-mask branch consumes it verbatim.
+    """
+    min_value = torch.finfo(dtype).min
+    mask = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=dtype, device=device)
+    if padding_mask is not None:
+        if padding_mask.dim() != 2:
+            raise ValueError("Padding attention_mask must be 2D [batch, key_len].")
+        if padding_mask.shape[1] < seq_len:
+            raise ValueError(
+                f"attention_mask key length ({padding_mask.shape[1]}) is shorter than "
+                f"seq_len ({seq_len})."
+            )
+        key_pad = ~padding_mask[:, :seq_len].to(device=device, dtype=torch.bool)
+        mask = mask.masked_fill(key_pad[:, None, None, :], min_value)
+    return mask
+
+
 class FullAttentionLlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()

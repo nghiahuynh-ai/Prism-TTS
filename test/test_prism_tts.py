@@ -23,7 +23,12 @@ VOCAB_SIZE = TEXT_OFFSET + 20
 MODEL_CONFIG_PATH = PROJECT_ROOT / "config" / "model.yaml"
 
 
-def build_tiny_model(sample_steps: int = 1, tangent_warmup_steps: int = 0) -> PrismTTS:
+def build_tiny_model(
+    sample_steps: int = 1,
+    head_mode: str = "flowmatch",
+    noise_mode: str = "ramp",
+    default_block_size: int = 2,
+) -> PrismTTS:
     torch.manual_seed(0)
     cfg = LlamaConfig(
         vocab_size=VOCAB_SIZE,
@@ -45,9 +50,11 @@ def build_tiny_model(sample_steps: int = 1, tangent_warmup_steps: int = 0) -> Pr
         continuous_latent_size=CONTINUOUS_DIM,
         flow_num_res_blocks=2,
         sample_steps=sample_steps,
-        tangent_warmup_steps=tangent_warmup_steps,
         short_context_layers=1,
         short_context_window=4,
+        head_mode=head_mode,
+        noise_mode=noise_mode,
+        default_block_size=default_block_size,
     )
 
 
@@ -57,6 +64,8 @@ def build_config_model() -> PrismTTS:
 
 
 def make_sample(lt_p, lp, lt_t, lg):
+    # Prompt fields are still required by the collate validator but are ignored by
+    # the single-utterance flat layout (only text_target + continuous_target used).
     return {
         "text_prompt": torch.randint(TEXT_OFFSET, VOCAB_SIZE, (lt_p,)),
         "discrete_prompt": torch.randint(0, DISCRETE_TOKEN_COUNT, (lp, 1)),
@@ -69,21 +78,7 @@ def make_sample(lt_p, lp, lt_t, lg):
 
 def make_batch():
     collate = BatchCollate(discrete_token_count=DISCRETE_TOKEN_COUNT)
-    return collate([make_sample(3, 4, 5, 6), make_sample(2, 3, 4, 5)])
-
-
-def _print_model(model: PrismTTS) -> int:
-    def emit(value: object = "") -> None:
-        print(value, flush=True)
-
-    total_params = sum(param.numel() for param in model.parameters())
-    emit("=" * 100)
-    emit("Model:")
-    emit(model)
-    emit("-" * 100)
-    emit(f"Total parameters: {total_params:,}")
-    emit("=" * 100)
-    return total_params
+    return collate([make_sample(3, 4, 5, 6), make_sample(2, 3, 4, 8)])
 
 
 def _forward(model, batch):
@@ -101,22 +96,29 @@ def _forward(model, batch):
 def test_print_config_model(pytestconfig):
     torch.manual_seed(0)
     model = build_config_model().eval()
-    capture_manager = pytestconfig.pluginmanager.getplugin("capturemanager")
-    if capture_manager is None:
-        total_params = _print_model(model)
-    else:
-        with capture_manager.global_and_fixture_disabled():
-            total_params = _print_model(model)
-    assert total_params == sum(p.numel() for p in model.parameters())
+    total_params = sum(p.numel() for p in model.parameters())
     assert total_params > 0
 
 
-def test_forward_returns_finite_losses_and_backward_flows():
+def test_single_utterance_flat_layout():
+    batch = make_batch()
+    token_ids = batch["flat_token_ids"]
+    attention = batch["attention_mask"]
+    # sample 0: text_target(5) + EOT(1) + frames(6) = 12; sample 1: 4 + 1 + 8 = 13.
+    assert int(attention[0].sum()) == 5 + 1 + 6
+    assert int(attention[1].sum()) == 4 + 1 + 8
+    # No literal EOS token anywhere; exactly one EOT per sample.
+    assert int((token_ids == EOS).sum()) == 0
+    assert int((token_ids[0, : int(attention[0].sum())] == EOT).sum()) == 1
+
+
+@pytest.mark.parametrize("head_mode", ["flowmatch", "meanflow"])
+def test_forward_returns_finite_losses_and_backward_flows(head_mode):
     torch.manual_seed(0)
-    model = build_tiny_model().train()
+    model = build_tiny_model(head_mode=head_mode).train()
     out = _forward(model, make_batch())
     assert torch.isfinite(out.loss)
-    assert torch.isfinite(out.consistency_loss)
+    assert torch.isfinite(out.flow_loss)
     assert torch.isfinite(out.eos_loss)
 
     out.loss.backward()
@@ -125,8 +127,8 @@ def test_forward_returns_finite_losses_and_backward_flows():
         grads = [p.grad for p in module.parameters() if p.grad is not None]
         assert grads, f"no gradient reached {name}"
         assert any(g.abs().sum() > 0 for g in grads), f"zero gradient in {name}"
-    # The adaptive-weighting logvar head lives inside FlowHead and must receive gradient.
-    assert model.flow_head.logvar_linear.weight.grad is not None
+    assert model.masked_speech_embedding.grad is not None
+    assert model.masked_speech_embedding.grad.abs().sum() > 0
     backbone_grads = [p.grad for p in model.backbone.parameters() if p.grad is not None]
     assert backbone_grads and any(g.abs().sum() > 0 for g in backbone_grads)
 
@@ -149,17 +151,55 @@ def test_eval_forward_does_not_update_stats():
     assert int(model.train_step.item()) == 0
 
 
-def test_generate_shapes_and_finite():
+def test_backbone_is_bidirectional():
+    model = build_tiny_model().eval()
+    embeds = torch.randn(1, 5, model.hidden_size)
+    mask = model._backbone_attention_mask(torch.ones(1, 5, dtype=torch.bool), embeds)
+    assert mask.shape == (1, 1, 5, 5)
+    # A query may attend to a future key (no causal triangle).
+    assert mask[0, 0, 0, 4].item() == 0.0
+
+
+def test_masked_positions_do_not_leak_targets():
+    torch.manual_seed(0)
+    model = build_tiny_model().eval()
+    batch = make_batch()
+    flat = MU.build_flat_batch_from_collate(
+        flat_token_ids=batch["flat_token_ids"],
+        flat_continuous_values=batch["flat_continuous_values"],
+        flat_token_type_ids=batch["flat_token_type_ids"],
+        flat_target_block_ids=batch["flat_target_block_ids"],
+        flat_target_block_counts=batch["flat_target_block_counts"],
+        attention_mask=batch["attention_mask"],
+        continuous_latent_size=CONTINUOUS_DIM,
+    )
+    masked = torch.zeros_like(batch["flat_token_type_ids"], dtype=torch.bool)
+    masked[0] = (flat.target_block_ids[0] >= 3) & (flat.target_block_ids[0] >= 0)
+    norm = model._normalize(flat.continuous_values)
+    with torch.no_grad():
+        z1 = model._encode_conditioning(
+            flat.token_ids, flat.token_type_ids, norm, norm, flat.attention_mask, masked
+        )
+        perturbed = norm.clone()
+        pos = int(torch.nonzero(masked[0], as_tuple=False)[0].item())
+        perturbed[0, pos, :] += 1000.0
+        z2 = model._encode_conditioning(
+            flat.token_ids, flat.token_type_ids, perturbed, perturbed, flat.attention_mask, masked
+        )
+    assert (z1 - z2).abs().max().item() < 1e-4
+
+
+@pytest.mark.parametrize("block_size", [1, 3])
+def test_generate_shapes_and_finite(block_size):
     torch.manual_seed(0)
     model = build_tiny_model().eval()
     gen = model.generate(
-        text_prompt=torch.randint(TEXT_OFFSET, VOCAB_SIZE, (2, 3)),
-        continuous_prompt=torch.randn(2, 4, CONTINUOUS_DIM),
         text_target=torch.randint(TEXT_OFFSET, VOCAB_SIZE, (2, 5)),
-        text_prompt_lengths=torch.tensor([3, 3]),
-        speech_prompt_lengths=torch.tensor([4, 4]),
+        continuous_condition=torch.randn(2, 3, CONTINUOUS_DIM),
         text_target_lengths=torch.tensor([5, 5]),
+        condition_lengths=torch.tensor([3, 3]),
         max_new_frames=8,
+        block_size=block_size,
         eos_threshold=2.0,  # never stop -> full length
         return_dict=True,
     )
@@ -169,85 +209,34 @@ def test_generate_shapes_and_finite():
     assert gen.text_ids.shape == (2, 5)
 
 
+def test_generate_without_condition_is_plain_tts():
+    torch.manual_seed(0)
+    model = build_tiny_model().eval()
+    gen = model.generate(
+        text_target=torch.randint(TEXT_OFFSET, VOCAB_SIZE, (2, 4)),
+        text_target_lengths=torch.tensor([4, 4]),
+        max_new_frames=5,
+        block_size=2,
+        eos_threshold=2.0,
+        return_dict=True,
+    )
+    assert gen.continuous_latents.shape == (2, 5, CONTINUOUS_DIM)
+
+
 def test_generate_stops_on_eos_threshold():
     torch.manual_seed(0)
     model = build_tiny_model().eval()
     gen = model.generate(
-        text_prompt=torch.randint(TEXT_OFFSET, VOCAB_SIZE, (2, 3)),
-        continuous_prompt=torch.randn(2, 4, CONTINUOUS_DIM),
         text_target=torch.randint(TEXT_OFFSET, VOCAB_SIZE, (2, 4)),
-        text_prompt_lengths=torch.tensor([3, 3]),
-        speech_prompt_lengths=torch.tensor([4, 4]),
+        continuous_condition=torch.randn(2, 3, CONTINUOUS_DIM),
         text_target_lengths=torch.tensor([4, 4]),
+        condition_lengths=torch.tensor([3, 3]),
         max_new_frames=8,
+        block_size=1,
         eos_threshold=-1.0,  # any probability exceeds -1 -> stop after one frame
         return_dict=True,
     )
     assert gen.continuous_latents.shape == (2, 1, CONTINUOUS_DIM)
-
-
-def test_generation_first_frame_conditioning_matches_teacher_forcing():
-    """Causal parity: the conditioning for target frame 0 is the EOT-after-text-target
-    hidden state and is independent of the (future) target frames."""
-    torch.manual_seed(0)
-    model = build_tiny_model().eval()
-
-    text_prompt = torch.randint(TEXT_OFFSET, VOCAB_SIZE, (1, 3))
-    continuous_prompt = torch.randn(1, 4, CONTINUOUS_DIM)
-    text_target = torch.randint(TEXT_OFFSET, VOCAB_SIZE, (1, 5))
-    continuous_target = torch.randn(1, 6, CONTINUOUS_DIM)
-    lengths = dict(
-        text_prompt_lengths=torch.tensor([3]),
-        speech_prompt_lengths=torch.tensor([4]),
-        text_target_lengths=torch.tensor([5]),
-    )
-
-    flat_full = MU.assemble_flat_batch(
-        text_prompt=text_prompt,
-        continuous_prompt=continuous_prompt,
-        text_target=text_target,
-        continuous_target=continuous_target,
-        speech_target_lengths=torch.tensor([6]),
-        pad_token_id=model.pad_token_id,
-        eos_token_id=model.eos_token_id,
-        eot_token_id=model.eot_token_id,
-        continuous_latent_size=CONTINUOUS_DIM,
-        **lengths,
-    )
-    with torch.no_grad():
-        h_full = model._encode_conditioning(
-            flat_full.token_ids,
-            flat_full.token_type_ids,
-            model._normalize(flat_full.continuous_values),
-            model._normalize(flat_full.continuous_values),
-            flat_full.attention_mask,
-        )
-    flat_prefix = MU.assemble_flat_batch(
-        text_prompt=text_prompt,
-        continuous_prompt=continuous_prompt,
-        text_target=text_target,
-        continuous_target=continuous_target[:, :0, :],
-        speech_target_lengths=torch.tensor([0]),
-        pad_token_id=model.pad_token_id,
-        eos_token_id=model.eos_token_id,
-        eot_token_id=model.eot_token_id,
-        continuous_latent_size=CONTINUOUS_DIM,
-        **lengths,
-    )
-    with torch.no_grad():
-        h_prefix = model._encode_conditioning(
-            flat_prefix.token_ids,
-            flat_prefix.token_type_ids,
-            model._normalize(flat_prefix.continuous_values),
-            model._normalize(flat_prefix.continuous_values),
-            flat_prefix.attention_mask,
-        )
-
-    prefix_len = flat_prefix.token_ids.shape[1]
-    first_frame_pos = int((flat_full.target_block_ids[0] == 0).nonzero()[0].item())
-    cond_full = h_full[0, first_frame_pos - 1]
-    cond_prefix = h_prefix[0, prefix_len - 1]
-    assert torch.allclose(cond_full, cond_prefix, atol=1e-5)
 
 
 def test_backbone_noise_injection_helper():
@@ -256,27 +245,37 @@ def test_backbone_noise_injection_helper():
     noised = MU.inject_continuous_backbone_noise(clean)
     assert noised.shape == clean.shape
     assert torch.isfinite(noised).all()
-    # With k ~ U(0, 1) noise is injected, so the output differs from the clean input.
     assert not torch.allclose(noised, clean)
 
 
-def test_backbone_noise_flag_is_train_only_and_finite():
+def test_context_noise_ramp_keeps_prefix_and_mask_clean():
+    torch.manual_seed(0)
+    batch_size, seq_len = 1, 10
+    latents = torch.randn(batch_size, seq_len, CONTINUOUS_DIM)
+    # frames 0..9 are all speech targets; protect first 30% (=3), mask suffix 8..9.
+    target_block_ids = torch.arange(seq_len).view(1, seq_len)
+    counts = torch.tensor([seq_len])
+    masked = torch.zeros(batch_size, seq_len, dtype=torch.bool)
+    masked[0, 8:] = True
+    speech = torch.ones(batch_size, seq_len, dtype=torch.bool)
+    out = MU.apply_context_noise_ramp(
+        latents, target_block_ids, counts, masked, speech,
+        protected_prefix_ratio=0.3, k_max=1.0, random_intensity=False,
+    )
+    # Protected prefix (0..2) and masked suffix (8..9) stay exactly clean.
+    assert torch.allclose(out[0, :3], latents[0, :3])
+    assert torch.allclose(out[0, 8:], latents[0, 8:])
+    # Eligible visible region (3..7) is perturbed somewhere.
+    assert not torch.allclose(out[0, 3:8], latents[0, 3:8])
+
+
+def test_backbone_noise_modes_train_only_and_finite():
     torch.manual_seed(0)
     batch = make_batch()
-
-    # Enabled: training forward stays finite; disabled path also runs.
-    for flag in (True, False):
-        model = build_tiny_model()
-        model.inject_backbone_noise = flag
-        model.train()
+    for noise_mode in ("ramp", "iid", "none"):
+        model = build_tiny_model(noise_mode=noise_mode).train()
         out = _forward(model, batch)
         assert torch.isfinite(out.loss)
-
-    # The flag only affects training; eval never injects backbone noise.
-    model = build_tiny_model().eval()
-    assert model.inject_backbone_noise is True
-    out = _forward(model, batch)
-    assert torch.isfinite(out.loss)
 
 
 def test_generate_e2e_tensor_with_injected_components():
@@ -287,12 +286,11 @@ def test_generate_e2e_tensor_with_injected_components():
         return [TEXT_OFFSET + (ord(c) % 20) for c in text][:6] or [TEXT_OFFSET]
 
     def fake_encoder(_prompt):
-        return torch.randn(5, CONTINUOUS_DIM)
+        return torch.randn(3, CONTINUOUS_DIM)
 
     gen = model.generate_e2e(
-        raw_text_prompt="hello",
-        raw_speech_prompt=object(),
         raw_text_target="world",
+        raw_speech_condition=object(),
         text_tokenizer=fake_tokenizer,
         speech_encoder=fake_encoder,
         output_type="tensor",
@@ -306,4 +304,4 @@ def test_generate_e2e_tensor_with_injected_components():
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    _print_model(build_config_model().eval())
+    build_config_model().eval()

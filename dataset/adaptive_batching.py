@@ -25,25 +25,15 @@ def _estimate_discrete_length(duration_seconds: float, codec_frame_rate_hz: floa
 
 
 def _estimate_concat_sequence_length(
-    text_prompt_length: int,
-    speech_prompt_length: int,
     text_target_length: int,
     speech_target_length: int,
-    num_discrete_streams: int = 1,
 ) -> int:
-    # Continuous-only autoregressive layout: one position per speech frame.
-    # text_prompt -> EOT -> [prompt frames] -> EOS -> text_target -> EOT -> [target frames]
-    del num_discrete_streams
-    text_prompt_length = max(1, int(text_prompt_length))
-    speech_prompt_length = max(1, int(speech_prompt_length))
+    # Single-utterance continuous-only layout: text_target -> EOT -> [target frames].
+    # One position per speech frame; no prompt prefix, no discrete streams.
     text_target_length = max(1, int(text_target_length))
     speech_target_length = max(1, int(speech_target_length))
     return (
-        text_prompt_length
-        + 1  # EOT after text prompt
-        + speech_prompt_length
-        + 1  # EOS after speech prompt
-        + text_target_length
+        text_target_length
         + 1  # EOT after text target
         + speech_target_length
     )
@@ -96,35 +86,22 @@ def estimate_prism_sample_lengths(
         append_eos = bool(getattr(tokenizer, "append_eos", False))
         if not isinstance(char_to_id, Mapping):
             raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
-        num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
 
         lengths: list[int] = []
         for entry in entries:
-            text_prompt_len = _estimate_text_token_count(
-                str(getattr(entry, "prompt_transcript")),
-                char_to_id=char_to_id,
-                append_eos=append_eos,
-            )
             text_target_len = _estimate_text_token_count(
                 str(getattr(entry, "transcript")),
                 char_to_id=char_to_id,
                 append_eos=append_eos,
             )
-            prompt_discrete_len = _estimate_discrete_length(
-                float(getattr(entry, "prompt_duration")),
-                codec_frame_rate_hz,
-            )
-            target_discrete_len = _estimate_discrete_length(
+            target_frame_len = _estimate_discrete_length(
                 float(getattr(entry, "duration")),
                 codec_frame_rate_hz,
             )
             lengths.append(
                 _estimate_concat_sequence_length(
-                    text_prompt_length=text_prompt_len,
-                    speech_prompt_length=prompt_discrete_len,
                     text_target_length=text_target_len,
-                    speech_target_length=target_discrete_len,
-                    num_discrete_streams=num_discrete_streams,
+                    speech_target_length=target_frame_len,
                 )
             )
         return lengths
@@ -138,25 +115,15 @@ def estimate_prism_sample_lengths(
                     "Expected each in-memory dataset sample to be a mapping for adaptive batching."
                 )
 
-            text_prompt_len = _safe_1d_length(sample.get("text_prompt"), field_name="text_prompt")
             text_target_len = _safe_1d_length(sample.get("text_target"), field_name="text_target")
-            prompt_discrete_len = _safe_2d_length(
-                sample.get("discrete_prompt"),
-                field_name="discrete_prompt",
+            target_frame_len = _safe_2d_length(
+                sample.get("continuous_target"),
+                field_name="continuous_target",
             )
-            target_discrete_len = _safe_2d_length(
-                sample.get("discrete_target"),
-                field_name="discrete_target",
-            )
-            discrete_prompt = sample.get("discrete_prompt")
-            num_discrete_streams = int(getattr(discrete_prompt, "shape", [1, 1])[1])
             lengths.append(
                 _estimate_concat_sequence_length(
-                    text_prompt_length=text_prompt_len,
-                    speech_prompt_length=prompt_discrete_len,
                     text_target_length=text_target_len,
-                    speech_target_length=target_discrete_len,
-                    num_discrete_streams=num_discrete_streams,
+                    speech_target_length=target_frame_len,
                 )
             )
         return lengths

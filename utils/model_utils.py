@@ -21,15 +21,17 @@ SPEECH_TOKEN_TYPE = 1
 
 @dataclass
 class FlatBatch:
-    """Packed, causal, continuous-only sequence consumed by the AR backbone.
+    """Packed, continuous-only sequence consumed by the (bidirectional MAR) backbone.
 
-    Layout per sample:
-    text_prompt -> EOT -> [prompt speech frames] -> EOS -> text_target -> EOT
-      -> [target speech frames]
+    Single-utterance layout per sample:
+    text_target -> EOT -> [target speech frames]
 
     Each speech frame occupies a single position carrying a continuous latent in
-    `continuous_values` (raw, un-normalized). `target_block_ids` holds the target
-    frame index (0-based) at target speech positions and -1 elsewhere.
+    `continuous_values` (raw, un-normalized). Every speech frame is a target:
+    `target_block_ids` holds the frame index (0-based) at speech positions and -1
+    at text/EOT positions. The first `protected_prefix_ratio` fraction of frames is
+    kept clean as an in-context condition (never masked); end-of-sequence is
+    predicted by the model's binary EOS head (there is no literal EOS token).
     """
 
     token_ids: torch.LongTensor
@@ -43,7 +45,7 @@ class FlatBatch:
 @dataclass
 class PrismTTSOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
-    consistency_loss: Optional[torch.Tensor] = None
+    flow_loss: Optional[torch.Tensor] = None
     eos_loss: Optional[torch.Tensor] = None
 
 
@@ -175,6 +177,67 @@ def inject_continuous_backbone_noise(
     )
     e = torch.randn_like(clean_latents)
     return torch.sqrt(k) * e + torch.sqrt(1.0 - k) * clean_latents
+
+
+def apply_context_noise_ramp(
+    continuous_norm: torch.FloatTensor,
+    target_block_ids: torch.LongTensor,
+    target_block_counts: torch.LongTensor,
+    masked_positions: torch.BoolTensor,
+    speech_mask: torch.BoolTensor,
+    *,
+    protected_prefix_ratio: float,
+    k_max: float = 1.0,
+    random_intensity: bool = True,
+) -> torch.FloatTensor:
+    """Inject a monotonic per-position noise ramp into the visible context frames.
+
+    Only the *visible eligible* target frames (after the protected prefix, before
+    the masked suffix) are noised; the protected prefix, the masked positions, and
+    all non-speech positions stay clean. Within the eligible region the noise level
+    ramps DOWN from `k_max` at the leftmost frame to ~0 at the frame adjacent to the
+    masked suffix (VP interpolation ``sqrt(k)*eps + sqrt(1-k)*x``). When
+    `random_intensity` a per-sample multiplier ``alpha ~ U(0,1)`` scales the whole
+    ramp, so a large fraction of samples stay near-clean (keeps clean-context
+    generation in-distribution). Applied to the long-context backbone only, at
+    training time; the head targets and short-context stay clean.
+    """
+    batch_size, seq_len, _ = continuous_norm.shape
+    device = continuous_norm.device
+    dtype = continuous_norm.dtype
+
+    counts = target_block_counts.to(device=device).clamp(min=1).float()  # [B]
+    protected = torch.ceil(counts * float(protected_prefix_ratio))  # [B]
+
+    bid = target_block_ids.to(device=device).float()  # [B, S]
+    # First masked frame id per sample (contiguous suffix); counts if none masked.
+    masked_bid = torch.where(
+        masked_positions, bid, torch.full_like(bid, float("inf"))
+    )
+    mask_start = masked_bid.min(dim=1).values  # [B]
+    mask_start = torch.minimum(mask_start, counts)  # [B]
+
+    prot = protected[:, None]  # [B, 1]
+    ms = mask_start[:, None]  # [B, 1]
+    denom = (ms - prot).clamp(min=1.0)
+    pos_norm = ((bid - prot) / denom).clamp(0.0, 1.0)  # 0 leftmost -> 1 near mask
+    k = float(k_max) * (1.0 - pos_norm)  # leftmost highest
+    if random_intensity:
+        alpha = torch.rand(batch_size, 1, device=device)
+        k = k * alpha
+
+    eligible = (
+        speech_mask
+        & (~masked_positions)
+        & (target_block_ids >= 0)
+        & (bid >= prot)
+        & (bid < ms)
+    )
+    k = torch.where(eligible, k, torch.zeros_like(k)).clamp(0.0, 1.0)
+    k = k.unsqueeze(-1).to(dtype)
+    e = torch.randn_like(continuous_norm)
+    noised = torch.sqrt(k) * e + torch.sqrt(1.0 - k) * continuous_norm
+    return torch.where(eligible.unsqueeze(-1), noised, continuous_norm)
 
 
 def read_wav_mono(path_like: str | Path) -> tuple[np.ndarray, int]:
@@ -413,29 +476,25 @@ def build_lazy_mimi_speech_decoder(
 
 def assemble_flat_batch(
     *,
-    text_prompt: torch.LongTensor,
-    continuous_prompt: torch.FloatTensor,
     text_target: torch.LongTensor,
     continuous_target: torch.FloatTensor,
-    text_prompt_lengths: torch.LongTensor,
-    speech_prompt_lengths: torch.LongTensor,
     text_target_lengths: torch.LongTensor,
     speech_target_lengths: torch.LongTensor,
     pad_token_id: int,
-    eos_token_id: int,
     eot_token_id: int,
     continuous_latent_size: int,
 ) -> FlatBatch:
-    """Assemble split prompt/target tensors into one causal continuous-only sequence.
+    """Assemble split target tensors into one single-utterance continuous sequence.
 
-    Layout: text_prompt -> EOT -> [prompt frames] -> EOS -> text_target -> EOT
-      -> [target frames]. Target frames carry frame ids 0..L-1 in
-    `target_block_ids`; everything else is -1. There is no trailing EOS after the
-    target frames (end-of-sequence is predicted by the model's EOS head).
+    Layout: text_target -> EOT -> [target frames]. Target frames carry frame ids
+    0..L-1 in `target_block_ids`; text/EOT positions are -1. There is no prompt
+    prefix and no literal EOS token (end-of-sequence is predicted by the model's
+    EOS head); the first fraction of frames is used as an in-context condition via
+    masking at training/generation time.
     """
-    batch_size = int(text_prompt.shape[0])
-    device = text_prompt.device
-    cont_dtype = continuous_prompt.dtype
+    batch_size = int(text_target.shape[0])
+    device = text_target.device
+    cont_dtype = continuous_target.dtype
 
     token_ids_per_sample: list[torch.LongTensor] = []
     continuous_per_sample: list[torch.FloatTensor] = []
@@ -443,8 +502,6 @@ def assemble_flat_batch(
     target_block_ids_per_sample: list[torch.LongTensor] = []
 
     for sample_idx in range(batch_size):
-        l1 = int(text_prompt_lengths[sample_idx].item())
-        l2 = int(speech_prompt_lengths[sample_idx].item())
         l3 = int(text_target_lengths[sample_idx].item())
         l4 = int(speech_target_lengths[sample_idx].item())
 
@@ -466,14 +523,6 @@ def assemble_flat_batch(
             sample_types.append(SPEECH_TOKEN_TYPE)
             sample_target_block_ids.append(int(target_block_id))
             sample_continuous.append(value)
-
-        for token in text_prompt[sample_idx, :l1].tolist():
-            append_text(token)
-        append_text(eot_token_id)
-
-        for block_idx in range(l2):
-            append_speech(continuous_prompt[sample_idx, block_idx], -1)
-        append_text(eos_token_id)
 
         for token in text_target[sample_idx, :l3].tolist():
             append_text(token)

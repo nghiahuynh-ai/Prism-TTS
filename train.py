@@ -711,7 +711,6 @@ def _build_data_objects(
         "vocab_path": _optional_path(data_cfg.get("vocab_path")),
         "manifest_root": _optional_path(data_cfg.get("manifest_root")),
         "discrete_token_count": discrete_token_count,
-        "discrete_stream_count": dataset_cfg.get("discrete_stream_count"),
         "continuous_feature_dim": dataset_cfg.get("continuous_feature_dim"),
         "append_eos_to_text": bool(dataset_cfg.get("append_eos_to_text", False)),
         "cache_npy": bool(dataset_cfg.get("cache_npy", False)),
@@ -730,7 +729,6 @@ def _build_data_objects(
 
     collate = BatchCollate(
         text_pad_value=collate_cfg.get("text_pad_value"),
-        discrete_pad_value=collate_cfg.get("discrete_pad_value"),
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,

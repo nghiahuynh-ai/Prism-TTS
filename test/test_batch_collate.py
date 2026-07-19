@@ -35,9 +35,9 @@ def _make_sample(
     }
 
 
-def _expected_flat_len(text_prompt, speech_prompt, text_target, speech_target) -> int:
-    # text_prompt + EOT + prompt frames + EOS + text_target + EOT + target frames
-    return text_prompt + 1 + speech_prompt + 1 + text_target + 1 + speech_target
+def _expected_flat_len(text_target, speech_target) -> int:
+    # Single-utterance layout: text_target + EOT + target frames.
+    return text_target + 1 + speech_target
 
 
 def test_batch_collate_builds_continuous_only_causal_layout():
@@ -63,7 +63,7 @@ def test_batch_collate_builds_continuous_only_causal_layout():
 
     out = collate([sample_a, sample_b])
 
-    # No terminal EOS speech block is appended: lengths are the raw frame counts.
+    # Split lengths are still emitted (prompt fields are ignored by the flat layout).
     assert out["text_prompt_lengths"].tolist() == [3, 1]
     assert out["speech_prompt_lengths"].tolist() == [2, 1]
     assert out["text_target_lengths"].tolist() == [2, 1]
@@ -75,8 +75,10 @@ def test_batch_collate_builds_continuous_only_causal_layout():
     assert "discrete_prompt" not in out
     assert "discrete_target" not in out
 
-    len_a = _expected_flat_len(3, 2, 2, 3)
-    len_b = _expected_flat_len(1, 1, 1, 2)
+    # Single-utterance flat layout: text_target -> EOT -> target frames (no prompt,
+    # no mid-sequence EOS, no trailing EOS token).
+    len_a = _expected_flat_len(2, 3)  # = 6
+    len_b = _expected_flat_len(1, 2)  # = 4
     assert tuple(out["flat_token_ids"].shape) == (2, len_a)
     assert tuple(out["flat_token_type_ids"].shape) == (2, len_a)
     assert tuple(out["flat_target_block_ids"].shape) == (2, len_a)
@@ -86,8 +88,11 @@ def test_batch_collate_builds_continuous_only_causal_layout():
     assert out["attention_mask"][0].tolist() == [True] * len_a
     assert out["attention_mask"][1].tolist() == [True] * len_b + [False] * (len_a - len_b)
 
-    # Sample A: text prompt (3) then EOT.
-    assert out["flat_token_ids"][0, :4].tolist() == [200, 201, 202, eot_token_id]
+    # No literal EOS token appears in the flattened sequence.
+    assert int((out["flat_token_ids"] == eos_token_id).sum().item()) == 0
+
+    # Sample A: text target (2) then EOT.
+    assert out["flat_token_ids"][0, :3].tolist() == [210, 211, eot_token_id]
 
     # Target frames carry frame ids 0..L-1; everything else is -1.
     tgt = out["flat_target_block_ids"][0]
@@ -99,9 +104,9 @@ def test_batch_collate_builds_continuous_only_causal_layout():
 
     # Every speech position is token_type SPEECH with pad token id; text is TEXT.
     speech_mask = out["flat_token_type_ids"][0] == SPEECH_TOKEN_TYPE
-    assert int(speech_mask.sum().item()) == 2 + 3  # prompt + target frames
+    assert int(speech_mask.sum().item()) == 3  # target frames only
     assert torch.all(out["flat_token_ids"][0][speech_mask] == pad_token_id)
-    assert int((out["flat_token_type_ids"][0] == TEXT_TOKEN_TYPE)[valid].sum().item()) == 3 + 1 + 2 + 1 + 1
+    assert int((out["flat_token_type_ids"][0] == TEXT_TOKEN_TYPE)[valid].sum().item()) == 2 + 1
 
     # The last target frame's continuous latent is preserved (not zeroed).
     assert out["flat_continuous_values"][0, len_a - 1].tolist() == [0.5, 0.5]

@@ -16,7 +16,6 @@ from utils.dataset_utils import (
     _pad_2d,
     _to_float_2d,
     _to_long_1d,
-    _to_long_2d,
 )
 
 DEFAULT_DISCRETE_TOKEN_COUNT = 2048
@@ -149,7 +148,6 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         vocab_path: str | Path | None = None,
         manifest_root: str | Path | None = None,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
-        discrete_stream_count: int | None = None,
         continuous_feature_dim: int | None = None,
         append_eos_to_text: bool = False,
         cache_npy: bool = False,
@@ -179,15 +177,10 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         if cache_npz is not None:
             cache_npy = bool(cache_npz)
         self.cache_npy = bool(cache_npy)
-        self._npy_cache: dict[str, tuple[torch.LongTensor, torch.FloatTensor]] = {}
-        self.discrete_stream_count = (
-            None if discrete_stream_count is None else int(discrete_stream_count)
-        )
+        self._npy_cache: dict[str, torch.FloatTensor] = {}
         self.continuous_feature_dim = (
             None if continuous_feature_dim is None else int(continuous_feature_dim)
         )
-        if self.discrete_stream_count is not None and self.discrete_stream_count < 1:
-            raise ValueError("discrete_stream_count must be >= 1 when provided.")
         if self.continuous_feature_dim is not None and self.continuous_feature_dim < 1:
             raise ValueError("continuous_feature_dim must be >= 1 when provided.")
 
@@ -290,48 +283,45 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         return path
 
     @staticmethod
-    def _extract_modal_arrays_from_npy(
-        payload: Any,
-        npy_path: Path,
-    ) -> tuple[Any, Any]:
+    def _extract_continuous_from_npy(payload: Any, npy_path: Path) -> Any:
+        """Return the continuous latent array from a feature .npy (discrete ignored).
+
+        Supported formats: a plain float array [L, D]; a structured array with a
+        'continuous' field; or a pickled dict/tuple payload (legacy tuples are
+        (discrete, continuous)). Any discrete stream present is not used.
+        """
         if isinstance(payload, np.ndarray) and payload.dtype.names is not None:
-            field_names = set(payload.dtype.names)
-            if "discrete" in field_names and "continuous" in field_names:
-                discrete = payload["discrete"]
+            if "continuous" in set(payload.dtype.names):
                 continuous = payload["continuous"]
-                if (
-                    isinstance(discrete, np.ndarray)
-                    and discrete.dtype == object
-                    and discrete.shape == ()
-                ):
-                    discrete = discrete.item()
                 if (
                     isinstance(continuous, np.ndarray)
                     and continuous.dtype == object
                     and continuous.shape == ()
                 ):
                     continuous = continuous.item()
-                return discrete, continuous
+                return continuous
 
         if isinstance(payload, np.ndarray) and payload.dtype == object and payload.shape == ():
             value = payload.item()
-            if isinstance(value, Mapping):
-                if "discrete" in value and "continuous" in value:
-                    return value["discrete"], value["continuous"]
+            if isinstance(value, Mapping) and "continuous" in value:
+                return value["continuous"]
             if isinstance(value, tuple) and len(value) == 2:
-                return value[0], value[1]
+                return value[1]  # legacy (discrete, continuous)
+            return value
+
+        if isinstance(payload, np.ndarray) and payload.dtype != object:
+            return payload
 
         raise ValueError(
-            f"{npy_path} must contain 'discrete' and 'continuous' arrays. "
-            "Supported .npy formats: structured arrays with named fields or "
-            "pickled dict/tuple payloads."
+            f"{npy_path} must contain a 'continuous' array. Supported .npy formats: "
+            "a plain float array [L, D], a structured array with a 'continuous' field, "
+            "or a pickled dict/tuple payload."
         )
 
-    def _load_npy_features(self, npy_path: Path) -> tuple[torch.LongTensor, torch.FloatTensor]:
+    def _load_continuous_features(self, npy_path: Path) -> torch.FloatTensor:
         cache_key = str(npy_path)
         if self.cache_npy and cache_key in self._npy_cache:
-            discrete, continuous = self._npy_cache[cache_key]
-            return discrete.clone(), continuous.clone()
+            return self._npy_cache[cache_key].clone()
 
         try:
             try:
@@ -341,57 +331,24 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                     raise
                 payload = np.load(npy_path, allow_pickle=True)
 
-            discrete_raw, continuous_raw = self._extract_modal_arrays_from_npy(
-                payload,
-                npy_path,
-            )
-            discrete = _to_long_2d(discrete_raw, f"{npy_path}:discrete")
+            continuous_raw = self._extract_continuous_from_npy(payload, npy_path)
             continuous = _to_float_2d(continuous_raw, f"{npy_path}:continuous")
         except Exception as exc:
             raise RuntimeError(f"Failed to load npy file {npy_path}: {exc}") from exc
 
-        if self.discrete_stream_count is not None and discrete.shape[1] > self.discrete_stream_count:
-            discrete = discrete[:, : self.discrete_stream_count]
-
-        self._validate_feature_shapes(discrete, continuous, npy_path)
-
-        if discrete.numel() > 0:
-            discrete_min = int(discrete.min().item())
-            discrete_max = int(discrete.max().item())
-            if discrete_min < 0 or discrete_max >= self.text_token_offset:
-                raise ValueError(
-                    "Discrete ids must be within shared discrete/special range "
-                    f"[0, {self.text_token_offset - 1}], got min={discrete_min}, "
-                    f"max={discrete_max} in {npy_path}. "
-                    "Text ids start from text_token_offset."
-                )
-
-        if self.cache_npy:
-            self._npy_cache[cache_key] = (discrete, continuous)
-            return discrete.clone(), continuous.clone()
-        return discrete, continuous
-
-    def _validate_feature_shapes(
-        self,
-        discrete: torch.LongTensor,
-        continuous: torch.FloatTensor,
-        npy_path: Path,
-    ) -> None:
-        if discrete.shape[0] != continuous.shape[0]:
-            raise ValueError(
-                f"{npy_path} length mismatch between modalities: "
-                f"discrete L={discrete.shape[0]}, continuous L={continuous.shape[0]}."
-            )
-        if self.discrete_stream_count is not None and discrete.shape[1] != self.discrete_stream_count:
-            raise ValueError(
-                f"{npy_path} discrete shape mismatch: expected [L, {self.discrete_stream_count}], "
-                f"got {tuple(discrete.shape)}."
-            )
-        if self.continuous_feature_dim is not None and continuous.shape[1] != self.continuous_feature_dim:
+        if (
+            self.continuous_feature_dim is not None
+            and continuous.shape[1] != self.continuous_feature_dim
+        ):
             raise ValueError(
                 f"{npy_path} continuous shape mismatch: expected [L, {self.continuous_feature_dim}], "
                 f"got {tuple(continuous.shape)}."
             )
+
+        if self.cache_npy:
+            self._npy_cache[cache_key] = continuous
+            return continuous.clone()
+        return continuous
 
     def _encode_text(self, text: str, field_name: str) -> torch.LongTensor:
         try:
@@ -401,8 +358,8 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         return _to_long_1d(encoded, field_name)
 
     def _build_manifest_sample(self, entry: ManifestEntry) -> dict[str, torch.Tensor]:
-        discrete_target, continuous_target = self._load_npy_features(entry.target_npy_path)
-        discrete_prompt, continuous_prompt = self._load_npy_features(entry.prompt_npy_path)
+        continuous_target = self._load_continuous_features(entry.target_npy_path)
+        continuous_prompt = self._load_continuous_features(entry.prompt_npy_path)
 
         text_target = self._encode_text(entry.transcript, "transcript")
         text_prompt = self._encode_text(entry.prompt_transcript, "prompt_transcript")
@@ -410,26 +367,25 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         return _normalize_split_sample(
             {
                 "text_target": text_target,
-                "discrete_target": discrete_target,
                 "continuous_target": continuous_target,
                 "text_prompt": text_prompt,
-                "discrete_prompt": discrete_prompt,
                 "continuous_prompt": continuous_prompt,
             }
         )
 
 
 class BatchCollate:
-    """Pad Prism-TTS samples without delay alignment and append target EOS speech blocks."""
+    """Pad Prism-TTS samples and flatten each into a single-utterance continuous sequence."""
 
     def __init__(
         self,
         text_pad_value: int | None = None,
-        discrete_pad_value: int | None = None,
         continuous_pad_value: float = 0.0,
         include_attention_mask: bool = True,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
     ) -> None:
+        # `discrete_token_count` only fixes the shared token-id layout (EOT/EOS/PAD/
+        # text offset); no discrete speech stream is emitted in this branch.
         (
             self.eot_token_id,
             self.eos_token_id,
@@ -437,9 +393,6 @@ class BatchCollate:
             _,
         ) = build_shared_token_layout(int(discrete_token_count))
         self.text_pad_value = self.pad_token_id if text_pad_value is None else int(text_pad_value)
-        self.discrete_pad_value = (
-            self.pad_token_id if discrete_pad_value is None else int(discrete_pad_value)
-        )
         self.continuous_pad_value = continuous_pad_value
         self.include_attention_mask = include_attention_mask
         self.discrete_token_count = int(discrete_token_count)
@@ -513,10 +466,8 @@ class BatchCollate:
     def _validate_collate_sample(self, sample: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         required_keys = (
             "text_target",
-            "discrete_target",
             "continuous_target",
             "text_prompt",
-            "discrete_prompt",
             "continuous_prompt",
         )
         missing = [key for key in required_keys if key not in sample]
@@ -535,31 +486,19 @@ class BatchCollate:
             return value
 
         text_target = require_tensor("text_target", 1)
-        discrete_target = require_tensor("discrete_target", 2)
         continuous_target = require_tensor("continuous_target", 2)
         text_prompt = require_tensor("text_prompt", 1)
-        discrete_prompt = require_tensor("discrete_prompt", 2)
         continuous_prompt = require_tensor("continuous_prompt", 2)
 
-        if discrete_target.shape[1] != discrete_prompt.shape[1]:
-            raise ValueError(
-                "discrete_target and discrete_prompt must have the same number of discrete streams."
-            )
         if continuous_target.shape[1] != continuous_prompt.shape[1]:
             raise ValueError(
                 "continuous_target and continuous_prompt must have the same channel size."
             )
-        if discrete_target.shape[0] != continuous_target.shape[0]:
-            raise ValueError("discrete_target and continuous_target must share the same length.")
-        if discrete_prompt.shape[0] != continuous_prompt.shape[0]:
-            raise ValueError("discrete_prompt and continuous_prompt must share the same length.")
 
         normalized: dict[str, torch.Tensor] = {
             "text_target": text_target,
-            "discrete_target": discrete_target,
             "continuous_target": continuous_target,
             "text_prompt": text_prompt,
-            "discrete_prompt": discrete_prompt,
             "continuous_prompt": continuous_prompt,
         }
 
@@ -587,20 +526,19 @@ class BatchCollate:
 
     def _build_flat_sample(self, sample: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """
-        Flatten one split Prism sample into a causal continuous-only sequence:
-        text_prompt -> EOT -> [prompt frames] -> EOS -> text_target -> EOT -> [target frames].
+        Flatten one split Prism sample into a single-utterance continuous sequence:
+        text_target -> EOT -> [target frames].
 
-        Each speech frame is a single position carrying a continuous latent. There
-        is no trailing EOS after the target frames (end-of-sequence is learned by
-        the model's EOS head). `target_block_ids` holds the target frame index at
-        target speech positions and -1 elsewhere.
+        Each speech frame is a single position carrying a continuous latent. Every
+        frame is a target (`target_block_ids` = 0..L-1 at speech positions, -1 at
+        text/EOT); the first fraction of frames is used as an in-context condition
+        via masking in the model. There is no prompt prefix and no literal EOS
+        token (end-of-sequence is learned by the model's EOS head).
         """
-        prompt_text = sample["text_prompt"].to(dtype=torch.long)
-        prompt_continuous = sample["continuous_prompt"].to(dtype=torch.float32)
         target_text = sample["text_target"].to(dtype=torch.long)
         target_continuous = sample["continuous_target"].to(dtype=torch.float32)
 
-        continuous_dim = int(prompt_continuous.shape[1])
+        continuous_dim = int(target_continuous.shape[1])
 
         token_ids: list[int] = []
         token_type_ids: list[int] = []
@@ -620,14 +558,6 @@ class BatchCollate:
             token_type_ids.append(SPEECH_TOKEN_TYPE)
             target_block_ids.append(int(block_id))
             continuous_values.append(value)
-
-        for token in prompt_text.tolist():
-            append_text(token)
-        append_text(self.eot_token_id)
-
-        for block_idx in range(int(prompt_continuous.shape[0])):
-            append_speech(prompt_continuous[block_idx], -1)
-        append_text(self.eos_token_id)
 
         for token in target_text.tolist():
             append_text(token)

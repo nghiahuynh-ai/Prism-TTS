@@ -6,12 +6,13 @@ from typing import Any
 import torch
 
 
+# Continuous-only pipeline: discrete streams are excluded from this branch, so only
+# text + continuous fields are required. Discrete fields, if present in a sample, are
+# ignored (kept optional for backward compatibility with older feature files).
 _REQUIRED_KEYS = (
     "text_target",
-    "discrete_target",
     "continuous_target",
     "text_prompt",
-    "discrete_prompt",
     "continuous_prompt",
 )
 
@@ -63,15 +64,9 @@ def _normalize_split_sample(sample: Mapping[str, Any]) -> dict[str, torch.Tensor
     text_target = _to_long_1d(sample["text_target"], "text_target")
     text_prompt = _to_long_1d(sample["text_prompt"], "text_prompt")
 
-    discrete_target = _to_long_2d(sample["discrete_target"], "discrete_target")
-    discrete_prompt = _to_long_2d(sample["discrete_prompt"], "discrete_prompt")
     continuous_target = _to_float_2d(sample["continuous_target"], "continuous_target")
     continuous_prompt = _to_float_2d(sample["continuous_prompt"], "continuous_prompt")
 
-    if discrete_target.shape[1] != discrete_prompt.shape[1]:
-        raise ValueError(
-            "discrete_target and discrete_prompt must have the same number of discrete streams."
-        )
     if continuous_target.shape[1] != continuous_prompt.shape[1]:
         raise ValueError(
             "continuous_target and continuous_prompt must have the same channel size."
@@ -79,10 +74,8 @@ def _normalize_split_sample(sample: Mapping[str, Any]) -> dict[str, torch.Tensor
 
     normalized: dict[str, torch.Tensor] = {
         "text_target": text_target,
-        "discrete_target": discrete_target,
         "continuous_target": continuous_target,
         "text_prompt": text_prompt,
-        "discrete_prompt": discrete_prompt,
         "continuous_prompt": continuous_prompt,
     }
 

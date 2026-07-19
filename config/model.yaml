@@ -7,34 +7,49 @@ model:
   prism_tts:
     # Continuous latent dimension per speech frame (Mimi pre-upsample latent).
     continuous_latent_size: 512
-    # Per-frame consistency head (AdaLN MLP).
+    # Per-frame flow head (AdaLN MLP).
     flow_num_res_blocks: 4
     flow_model_channels: null
     # Binary end-of-sequence head loss weight.
     eos_loss_weight: 1.0
-    # Consistency modeling (sCM / TrigFlow). sigma_data should match the std of
-    # the normalized latents (~1.0 after running mean/std normalization).
-    sigma_data: 1.0
-    # Logit-normal proposal over noise level: t = arctan(exp(N(p_mean, p_std)) / sigma_data).
-    p_mean: -1.0
-    p_std: 1.6
-    # Tangent warmup (ramps the JVP tangent term 0->1 over these steps) + normalization.
-    tangent_warmup_steps: 1000
-    tangent_norm_const: 0.1
+    # Backbone attention: "bidirectional" (masked-generative / MAR) or "causal".
+    attn_mode: bidirectional
+    # Per-frame head objective: "flowmatch" (rectified-flow control, de-risking) or
+    # "meanflow" (one-step average-velocity; flip to this once the control trains).
+    head_mode: MeanFlow
+    # MeanFlow (arXiv 2505.13447): adaptive weight w = 1/(||delta||^2 + c)^p; logit-
+    # normal t = sigmoid(N(t_logit_mean, t_logit_std)); fraction of samples with r == t.
+    meanflow_p: 1.0
+    meanflow_c: 1.0e-3
+    t_logit_mean: -0.4
+    t_logit_std: 1.0
+    r_eq_t_prob: 0.75
+    # Masking: keep the first 30% of frames as clean in-context condition; mask a
+    # random suffix of the rest; always mask the terminal frame (trains EOS at the end).
+    protected_prefix_ratio: 0.3
+    always_mask_terminal: true
+    # Context noise for exposure bias: "ramp" (monotonic per-position, leftmost highest,
+    # decays to clean at the mask boundary), "iid" (CALM per-frame U(0,1)), or "none".
+    noise_mode: ramp
+    ramp_max: 1.0
+    ramp_random_intensity: true
+    inject_backbone_noise: true
     # CALM short-context branch: a small sliding-window causal transformer over clean
     # local latents; its output is added to the long-context backbone (Z = z_long + z_short).
     use_short_context: true
     short_context_layers: 2
     short_context_window: 10
-    # Consistency sampling steps per frame at inference (1 = true 1-step).
+    # Sampling steps per frame at inference (1 = true 1-step for MeanFlow).
     sample_steps: 1
-    # EOS stopping probability threshold at inference.
+    # EOS stopping probability threshold + extra frames emitted after EOS fires.
     eos_threshold: 0.5
+    frames_after_eos: 0
+    # Positive-class weight for the EOS BCE (null = auto per-batch neg/pos ratio).
+    eos_pos_weight: null
+    # Default frames decoded per backbone pass at generation (1 = latent-by-latent).
+    default_block_size: 1
     # EMA decay for the running latent mean/std normalization statistics.
     latent_stats_decay: 0.999
-    # Inject VP-schedule noise into the backbone's context latents during training
-    # (exposure-bias regularization; head targets stay clean).
-    inject_backbone_noise: true
 
   llama_config:
     # Must be >= text_token_offset + num_text_vocab_tokens.
