@@ -581,6 +581,66 @@ def _resolve_import_string(path: str, *, field_name: str) -> Any:
         ) from exc
 
 
+def _instantiate_audio_decoder(
+    decoder_obj: Any,
+    decoder_kwargs: dict[str, Any],
+) -> Any:
+    if inspect.isclass(decoder_obj):
+        instance = decoder_obj(**decoder_kwargs)
+        if callable(instance):
+            return instance
+        decode_method = getattr(instance, "decode", None)
+        if callable(decode_method):
+            return decode_method
+        raise ValueError(
+            "Audio decoder class instance must be callable or expose a callable `decode` method."
+        )
+
+    if decoder_kwargs:
+        return lambda latents, fn=decoder_obj, kwargs=dict(decoder_kwargs): fn(latents, **kwargs)
+    return decoder_obj
+
+
+class LazyAudioDecoder:
+    """Initialize an optional audio decoder only when media logging needs it."""
+
+    def __init__(self, decoder_spec: str, decoder_kwargs: dict[str, Any]) -> None:
+        self.decoder_spec = decoder_spec
+        self.decoder_kwargs = dict(decoder_kwargs)
+        self._decoder: Any | None = None
+        self._declared_sample_rate = self.decoder_kwargs.get("sample_rate")
+
+    @property
+    def sample_rate(self) -> Any | None:
+        if self._decoder is None:
+            return self._declared_sample_rate
+        return getattr(self._decoder, "sample_rate", self._declared_sample_rate)
+
+    def _load(self) -> Any:
+        if self._decoder is not None:
+            return self._decoder
+
+        start = time.perf_counter()
+        print(f"[train.py] Initializing lazy audio decoder: {self.decoder_spec}")
+        decoder_obj = _resolve_import_string(
+            self.decoder_spec,
+            field_name="trainer.lightning_module.audio_decoder",
+        )
+        if not callable(decoder_obj):
+            raise ValueError(
+                "trainer.lightning_module.audio_decoder must resolve to a callable."
+            )
+
+        self._decoder = _instantiate_audio_decoder(decoder_obj, self.decoder_kwargs)
+        print(
+            f"[train.py] Audio decoder initialized in {time.perf_counter() - start:.2f}s."
+        )
+        return self._decoder
+
+    def __call__(self, latents: torch.FloatTensor) -> torch.Tensor | Any:
+        return self._load()(latents)
+
+
 def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
     decoder_spec = module_cfg.get("audio_decoder")
     if decoder_spec is None:
@@ -601,8 +661,17 @@ def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
             "trainer.lightning_module.audio_decoder_kwargs must be a mapping when set."
         )
 
+    decoder_spec = decoder_spec.strip()
+    lazy = bool(module_cfg.get("audio_decoder_lazy", True))
+    if lazy:
+        print(
+            "[train.py] Audio decoder initialization is lazy; "
+            "first media decode will load it."
+        )
+        return LazyAudioDecoder(decoder_spec, decoder_kwargs)
+
     decoder_obj = _resolve_import_string(
-        decoder_spec.strip(),
+        decoder_spec,
         field_name="trainer.lightning_module.audio_decoder",
     )
     if not callable(decoder_obj):
@@ -610,20 +679,7 @@ def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
             "trainer.lightning_module.audio_decoder must resolve to a callable."
         )
 
-    if inspect.isclass(decoder_obj):
-        instance = decoder_obj(**decoder_kwargs)
-        if callable(instance):
-            return instance
-        decode_method = getattr(instance, "decode", None)
-        if callable(decode_method):
-            return decode_method
-        raise ValueError(
-            "Audio decoder class instance must be callable or expose a callable `decode` method."
-        )
-
-    if decoder_kwargs:
-        return lambda latents, fn=decoder_obj, kwargs=dict(decoder_kwargs): fn(latents, **kwargs)
-    return decoder_obj
+    return _instantiate_audio_decoder(decoder_obj, decoder_kwargs)
 
 
 def _optional_path(value: Any) -> str | None:
@@ -1290,8 +1346,19 @@ def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any])
     return pl.Trainer(**trainer_kwargs)
 
 
+def _log_startup_stage(stage_name: str, stage_start: float, run_start: float) -> None:
+    print(
+        f"[train.py] {stage_name} completed in {time.perf_counter() - stage_start:.2f}s "
+        f"(startup total {time.perf_counter() - run_start:.2f}s)."
+    )
+
+
 def run(args: argparse.Namespace) -> None:
+    run_start = time.perf_counter()
+    stage_start = time.perf_counter()
     resolved = _load_merged_configs(args)
+    _log_startup_stage("Config loading", stage_start, run_start)
+
     config = resolved.merged
     if _DEFAULTED_CUDA_ALLOC_CONF:
         print(
@@ -1308,14 +1375,24 @@ def run(args: argparse.Namespace) -> None:
     if seed is not None:
         pl.seed_everything(int(seed), workers=bool(trainer_cfg.get("seed_workers", True)))
 
+    stage_start = time.perf_counter()
     train_loader, val_loader, test_loader = _build_data_objects(config)
-    model = _build_model(config)
-    lightning_module = _build_lightning_module(config, model=model)
+    _log_startup_stage("Data setup", stage_start, run_start)
 
+    stage_start = time.perf_counter()
+    model = _build_model(config)
+    _log_startup_stage("Model construction", stage_start, run_start)
+
+    stage_start = time.perf_counter()
+    lightning_module = _build_lightning_module(config, model=model)
+    _log_startup_stage("Lightning module construction", stage_start, run_start)
+
+    stage_start = time.perf_counter()
     logger = _build_logger(_require_mapping(trainer_cfg, "logger"))
     callbacks = _build_callbacks(config)
 
     trainer = _build_trainer(config, logger=logger, callbacks=callbacks)
+    _log_startup_stage("Logger/callback/trainer setup", stage_start, run_start)
 
     supports_ckpt_path = _trainer_supports_ckpt_path()
     if args.ckpt_path is not None and not supports_ckpt_path:

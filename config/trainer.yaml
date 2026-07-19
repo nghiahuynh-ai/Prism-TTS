@@ -12,6 +12,8 @@ trainer:
     audio_sample_rate: 24000
     max_audio_samples: 2
     log_media_on_validation_end: true
+    # Keep startup fast: Mimi is only needed for media logging, not train loss.
+    audio_decoder_lazy: true
     audio_decoder: models.mimi_latent_decoder.MimiPreUpsampleLatentDecoder
     audio_decoder_kwargs:
       pretrained_model_name_or_path: kyutai/mimi
@@ -54,7 +56,8 @@ trainer:
     accumulate_grad_batches: 1
     log_every_n_steps: 10
     val_check_interval: 100000
-    num_sanity_val_steps: 2
+    # Avoid validation/model-media setup before the first train batch.
+    num_sanity_val_steps: 0
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     benchmark: true
