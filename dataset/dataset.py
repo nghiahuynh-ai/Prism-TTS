@@ -184,6 +184,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         # Enable only if a cross-utterance prompt is genuinely needed.
         self.load_prompt = bool(load_prompt)
         self._npy_cache: dict[str, torch.FloatTensor] = {}
+        # Remember whether npy files need allow_pickle so we stop paying a failed
+        # load attempt per file (each retry is an extra open() on networked FS).
+        self._npy_allow_pickle: bool | None = None
         self.continuous_feature_dim = (
             None if continuous_feature_dim is None else int(continuous_feature_dim)
         )
@@ -332,12 +335,17 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             return self._npy_cache[cache_key].clone()
 
         try:
-            try:
-                payload = np.load(npy_path, allow_pickle=False)
-            except ValueError as exc:
-                if "allow_pickle=False" not in str(exc):
-                    raise
-                payload = np.load(npy_path, allow_pickle=True)
+            if self._npy_allow_pickle is None:
+                try:
+                    payload = np.load(npy_path, allow_pickle=False)
+                    self._npy_allow_pickle = False
+                except ValueError as exc:
+                    if "allow_pickle=False" not in str(exc):
+                        raise
+                    payload = np.load(npy_path, allow_pickle=True)
+                    self._npy_allow_pickle = True
+            else:
+                payload = np.load(npy_path, allow_pickle=self._npy_allow_pickle)
 
             continuous_raw = self._extract_continuous_from_npy(payload, npy_path)
             continuous = _to_float_2d(continuous_raw, f"{npy_path}:continuous")
@@ -553,38 +561,33 @@ class BatchCollate:
         target_continuous = sample["continuous_target"].to(dtype=torch.float32)
 
         continuous_dim = int(target_continuous.shape[1])
+        num_text = int(target_text.shape[0])
+        num_frames = int(target_continuous.shape[0])
+        prefix_len = num_text + 1  # text tokens + EOT
+        seq_len = prefix_len + num_frames
 
-        token_ids: list[int] = []
-        token_type_ids: list[int] = []
-        target_block_ids: list[int] = []
-        continuous_values: list[torch.Tensor] = []
+        # Vectorized layout (avoids a per-frame Python loop for long utterances):
+        # [text_target ... EOT] then [target frames]. Text/EOT positions carry the
+        # pad token id and zero latents; frame positions carry pad token id + latent.
+        token_ids = torch.full((seq_len,), self.pad_token_id, dtype=torch.long)
+        token_ids[:num_text] = target_text
+        token_ids[num_text] = self.eot_token_id
 
-        zero_cont = torch.zeros(continuous_dim, dtype=torch.float32)
+        token_type_ids = torch.full((seq_len,), SPEECH_TOKEN_TYPE, dtype=torch.long)
+        token_type_ids[:prefix_len] = TEXT_TOKEN_TYPE
 
-        def append_text(token_id: int) -> None:
-            token_ids.append(int(token_id))
-            token_type_ids.append(TEXT_TOKEN_TYPE)
-            target_block_ids.append(-1)
-            continuous_values.append(zero_cont)
+        target_block_ids = torch.full((seq_len,), -1, dtype=torch.long)
+        if num_frames > 0:
+            target_block_ids[prefix_len:] = torch.arange(num_frames, dtype=torch.long)
 
-        def append_speech(value: torch.Tensor, block_id: int) -> None:
-            token_ids.append(self.pad_token_id)
-            token_type_ids.append(SPEECH_TOKEN_TYPE)
-            target_block_ids.append(int(block_id))
-            continuous_values.append(value)
+        continuous_values = torch.zeros(seq_len, continuous_dim, dtype=torch.float32)
+        if num_frames > 0:
+            continuous_values[prefix_len:] = target_continuous
 
-        for token in target_text.tolist():
-            append_text(token)
-        append_text(self.eot_token_id)
-
-        for block_idx in range(int(target_continuous.shape[0])):
-            append_speech(target_continuous[block_idx], block_idx)
-
-        seq_len = len(token_ids)
         return {
-            "token_ids": torch.tensor(token_ids, dtype=torch.long),
-            "continuous_values": torch.stack(continuous_values, dim=0).to(dtype=torch.float32),
-            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
-            "target_block_ids": torch.tensor(target_block_ids, dtype=torch.long),
+            "token_ids": token_ids,
+            "continuous_values": continuous_values,
+            "token_type_ids": token_type_ids,
+            "target_block_ids": target_block_ids,
             "attention_mask": torch.ones(seq_len, dtype=torch.bool),
         }

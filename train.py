@@ -6,6 +6,7 @@ import inspect
 import math
 import os
 import shutil
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -720,6 +721,7 @@ def _build_data_objects(
     train_manifest = _optional_path(data_cfg.get("train_manifest"))
     if train_manifest is None:
         raise ValueError("data.train_manifest must be set for training.")
+    _t0 = time.perf_counter()
     train_dataset = PrismDataset(source=train_manifest, **dataset_kwargs)
 
     val_manifest = _optional_path(data_cfg.get("val_manifest"))
@@ -727,6 +729,13 @@ def _build_data_objects(
 
     test_manifest = _optional_path(data_cfg.get("test_manifest"))
     test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs) if test_manifest else None
+    print(
+        f"[train.py] Datasets built in {time.perf_counter() - _t0:.2f}s "
+        f"(train={len(train_dataset)}"
+        + (f", val={len(val_dataset)}" if val_dataset is not None else "")
+        + (f", test={len(test_dataset)}" if test_dataset is not None else "")
+        + f", load_prompt={dataset_kwargs['load_prompt']})."
+    )
 
     collate = BatchCollate(
         text_pad_value=collate_cfg.get("text_pad_value"),
@@ -744,15 +753,41 @@ def _build_data_objects(
         shm_mb = "unknown"
         if shm_total is not None:
             shm_mb = f"{(shm_total / (1024 * 1024)):.1f}"
-        print(
-            "[train.py] Detected low shared memory "
-            f"(/dev/shm={shm_mb} MB). "
-            "Overriding data.loader.num_workers=0 and persistent_workers=false "
-            "to avoid DataLoader bus errors. "
-            "Set PRISM_TTS_DISABLE_SHM_GUARD=true to keep configured worker settings."
-        )
-        num_workers = 0
-        persistent_workers = False
+        # Low /dev/shm causes DataLoader bus errors under the default
+        # 'file_descriptor' sharing strategy. Prefer switching to 'file_system'
+        # sharing so parallel workers are kept -- dropping to num_workers=0 would
+        # serialize all (networked) npy reads and make training crawl from step 0.
+        force_single = _parse_env_bool("PRISM_TTS_FORCE_SINGLE_PROCESS_LOADER", False)
+        switched = False
+        if not force_single:
+            try:
+                import torch.multiprocessing as _mp
+
+                _mp.set_sharing_strategy("file_system")
+                switched = True
+            except Exception as exc:  # pragma: no cover - platform dependent
+                print(f"[train.py] Could not set 'file_system' sharing strategy: {exc}")
+        if switched:
+            print(
+                f"[train.py] Low shared memory (/dev/shm={shm_mb} MB): set multiprocessing "
+                f"sharing_strategy='file_system' to keep num_workers={num_workers} without bus "
+                "errors. Set PRISM_TTS_FORCE_SINGLE_PROCESS_LOADER=true to fall back to "
+                "num_workers=0, or PRISM_TTS_DISABLE_SHM_GUARD=true to ignore this guard."
+            )
+        else:
+            print(
+                f"[train.py] Low shared memory (/dev/shm={shm_mb} MB): overriding "
+                "num_workers=0 and persistent_workers=false to avoid DataLoader bus errors."
+            )
+            num_workers = 0
+            persistent_workers = False
+
+    print(
+        "[train.py] Effective dataloader: "
+        f"num_workers={num_workers}, persistent_workers={persistent_workers}, "
+        f"pin_memory={pin_memory}, prefetch_factor={loader_cfg.get('prefetch_factor')}, "
+        f"train_batch_size={int(loader_cfg.get('train_batch_size', 8))}."
+    )
 
     common_loader_kwargs: dict[str, Any] = {
         "num_workers": num_workers,
@@ -889,7 +924,42 @@ def _build_data_objects(
             **common_loader_kwargs,
         )
 
+    if _parse_env_bool("PRISM_TTS_PROFILE_FIRST_BATCH", False):
+        _profile_loader_throughput(train_loader)
+
     return train_loader, val_loader, test_loader
+
+
+def _profile_loader_throughput(loader: DataLoader, num_batches: int = 5) -> None:
+    """Time the first few batches to separate data-pipeline cost from model cost.
+
+    Opt-in via PRISM_TTS_PROFILE_FIRST_BATCH=true. Uses a throwaway iterator, so it
+    consumes a few samples but does not affect the real training iterator.
+    """
+    print(f"[train.py] Profiling first {num_batches} train batches (data pipeline only)...")
+    iterator = iter(loader)
+    start = time.perf_counter()
+    first_batch_time = None
+    seen = 0
+    for _ in range(num_batches):
+        step_start = time.perf_counter()
+        try:
+            next(iterator)
+        except StopIteration:
+            break
+        now = time.perf_counter()
+        if first_batch_time is None:
+            first_batch_time = now - step_start
+        seen += 1
+    total = time.perf_counter() - start
+    if seen > 0 and first_batch_time is not None:
+        steady = (total - first_batch_time) / max(1, seen - 1) if seen > 1 else first_batch_time
+        print(
+            f"[train.py] Data pipeline: first batch {first_batch_time:.2f}s, "
+            f"~{steady:.3f}s/batch steady over {seen} batches "
+            "(if this is fast, remaining slowness is model/CUDA, not data)."
+        )
+    del iterator
 
 
 def _filter_kwargs_for_callable(
