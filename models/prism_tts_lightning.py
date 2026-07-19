@@ -54,6 +54,7 @@ class PrismTTSLightning(pl.LightningModule):
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
         betas: tuple[float, float] = (0.9, 0.95),
+        optimizer_foreach: bool = False,
         eval_every_n_steps: int = 5000,
         scheduler_factory: Optional[SchedulerFactory] = None,
         audio_decoder: Optional[AudioDecoder] = None,
@@ -64,6 +65,7 @@ class PrismTTSLightning(pl.LightningModule):
         ema_start_step: int = 0,
         ema_update_every_n_steps: int = 1,
         ema_warmup_steps: int = 0,
+        ema_device: str = "cpu",
         use_ema_for_validation: bool = True,
         use_ema_for_periodic_eval: bool = True,
         sync_dist_logging: bool = False,
@@ -83,11 +85,15 @@ class PrismTTSLightning(pl.LightningModule):
             raise ValueError("ema_update_every_n_steps must be >= 1.")
         if ema_warmup_steps < 0:
             raise ValueError("ema_warmup_steps must be >= 0.")
+        ema_device = str(ema_device).strip().lower()
+        if ema_device not in {"cpu", "model"}:
+            raise ValueError("ema_device must be one of {'cpu', 'model'}.")
 
         self.model = model
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.betas = betas
+        self.optimizer_foreach = bool(optimizer_foreach)
         self.eval_every_n_steps = eval_every_n_steps
         self.scheduler_factory = scheduler_factory
         self.audio_decoder = audio_decoder
@@ -101,6 +107,7 @@ class PrismTTSLightning(pl.LightningModule):
         self.ema_start_step = ema_start_step
         self.ema_update_every_n_steps = ema_update_every_n_steps
         self.ema_warmup_steps = ema_warmup_steps
+        self.ema_device = ema_device
         self.use_ema_for_validation = use_ema_for_validation
         self.use_ema_for_periodic_eval = use_ema_for_periodic_eval
         self.sync_dist_logging = sync_dist_logging
@@ -121,6 +128,7 @@ class PrismTTSLightning(pl.LightningModule):
                 "learning_rate": learning_rate,
                 "weight_decay": weight_decay,
                 "betas": betas,
+                "optimizer_foreach": optimizer_foreach,
                 "eval_every_n_steps": eval_every_n_steps,
                 "audio_sample_rate": audio_sample_rate,
                 "max_audio_samples": max_audio_samples,
@@ -129,6 +137,7 @@ class PrismTTSLightning(pl.LightningModule):
                 "ema_start_step": ema_start_step,
                 "ema_update_every_n_steps": ema_update_every_n_steps,
                 "ema_warmup_steps": ema_warmup_steps,
+                "ema_device": ema_device,
                 "use_ema_for_validation": use_ema_for_validation,
                 "use_ema_for_periodic_eval": use_ema_for_periodic_eval,
                 "sync_dist_logging": sync_dist_logging,
@@ -144,6 +153,7 @@ class PrismTTSLightning(pl.LightningModule):
             lr=self.learning_rate,
             betas=self.betas,
             weight_decay=self.weight_decay,
+            foreach=self.optimizer_foreach,
         )
         if self.scheduler_factory is None:
             return optimizer
@@ -624,11 +634,21 @@ class PrismTTSLightning(pl.LightningModule):
         return val_loaders
 
     def _initialize_ema_if_needed(self) -> None:
-        if self._ema_state:
-            return
         with torch.no_grad():
             for name, param in self._ema_parameters():
-                self._ema_state[name] = param.detach().clone().float()
+                device = self._ema_storage_device(param)
+                shadow = self._ema_state.get(name)
+                if shadow is None:
+                    self._ema_state[name] = param.detach().to(
+                        device=device,
+                        dtype=torch.float32,
+                        copy=True,
+                    )
+                elif shadow.device != device or shadow.dtype != torch.float32:
+                    self._ema_state[name] = shadow.to(
+                        device=device,
+                        dtype=torch.float32,
+                    )
 
     def _maybe_update_ema(self) -> None:
         trainer = self.trainer
@@ -650,12 +670,15 @@ class PrismTTSLightning(pl.LightningModule):
             for name, param in self._ema_parameters():
                 shadow = self._ema_state.get(name)
                 if shadow is None:
-                    self._ema_state[name] = param.detach().clone().float()
+                    device = self._ema_storage_device(param)
+                    self._ema_state[name] = param.detach().to(
+                        device=device,
+                        dtype=torch.float32,
+                        copy=True,
+                    )
                     continue
-                if shadow.device != param.device:
-                    shadow = shadow.to(device=param.device)
-                    self._ema_state[name] = shadow
-                shadow.mul_(decay).add_(param.detach().float(), alpha=1.0 - decay)
+                current = param.detach().to(device=shadow.device, dtype=shadow.dtype)
+                shadow.mul_(decay).add_(current, alpha=1.0 - decay)
 
         self._ema_updates += 1
         self._last_ema_step = step
@@ -708,8 +731,12 @@ class PrismTTSLightning(pl.LightningModule):
 
     def _backup_current_parameters(self) -> dict[str, torch.Tensor]:
         with torch.no_grad():
+            backup_device = torch.device("cpu") if self.ema_device == "cpu" else None
             return {
-                name: param.detach().clone()
+                name: param.detach().to(
+                    device=param.device if backup_device is None else backup_device,
+                    copy=True,
+                )
                 for name, param in self._ema_parameters()
             }
 
@@ -719,9 +746,7 @@ class PrismTTSLightning(pl.LightningModule):
                 value = backup.get(name)
                 if value is None:
                     continue
-                if value.device != param.device:
-                    value = value.to(device=param.device)
-                param.copy_(value.to(dtype=param.dtype))
+                param.copy_(value.to(device=param.device, dtype=param.dtype))
 
     def _copy_ema_to_model(self) -> None:
         with torch.no_grad():
@@ -729,10 +754,12 @@ class PrismTTSLightning(pl.LightningModule):
                 shadow = self._ema_state.get(name)
                 if shadow is None:
                     continue
-                if shadow.device != param.device:
-                    shadow = shadow.to(device=param.device)
-                    self._ema_state[name] = shadow
-                param.copy_(shadow.to(dtype=param.dtype))
+                param.copy_(shadow.to(device=param.device, dtype=param.dtype))
+
+    def _ema_storage_device(self, param: torch.nn.Parameter) -> torch.device:
+        if self.ema_device == "cpu":
+            return torch.device("cpu")
+        return param.device
 
     def _ema_parameters(self) -> Iterator[tuple[str, torch.nn.Parameter]]:
         for name, param in self.model.named_parameters():

@@ -20,8 +20,11 @@ trainer:
       device: cuda
     ema_decay: 0.999
     ema_start_step: 0
-    ema_update_every_n_steps: 1
+    # EMA shadows live on CPU to avoid a persistent fp32 copy of the 333M
+    # parameter model on every GPU. Update less often to bound transfer overhead.
+    ema_update_every_n_steps: 100
     ema_warmup_steps: 0
+    ema_device: cpu
     use_ema_for_validation: true
     use_ema_for_periodic_eval: true
     sync_dist_logging: false
@@ -40,6 +43,10 @@ trainer:
 
   optimizer:
     name: adamw
+    # The foreach implementation uses about one additional model-sized temporary
+    # tensor list during optimizer.step. The scalar loop trades some speed for a
+    # substantially lower peak.
+    foreach: false
 
   scheduler:
     name: cosine_with_warmup
@@ -55,8 +62,8 @@ trainer:
     max_steps: 1500000
     min_steps: 0
     gradient_clip_val: 1.0
-    # With train_batch_size=2, this keeps effective batch ~= 8.
-    accumulate_grad_batches: 1
+    # Keep the effective batch at 8 while bounding per-step activation memory.
+    accumulate_grad_batches: 4
     log_every_n_steps: 10
     val_check_interval: 100000
     # Avoid validation/model-media setup before the first train batch.
