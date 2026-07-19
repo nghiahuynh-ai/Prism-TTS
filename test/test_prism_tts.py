@@ -102,9 +102,9 @@ def test_print_config_model(pytestconfig):
     assert total_params > 0
     assert model.head_mode == "meanflow"
     assert model.gradient_checkpointing
-    # MeanFlow's JVP cannot traverse torch.utils.checkpoint; its large sequence
-    # activations are still covered by the two transformer checkpoint paths.
-    assert not model.flow_head.grad_checkpointing
+    # The detached JVP target bypasses checkpointing per call, while the
+    # differentiable MeanFlow prediction checkpoints its residual blocks.
+    assert model.flow_head.grad_checkpointing
 
 
 def test_single_utterance_flat_layout():
@@ -181,6 +181,31 @@ def test_gradient_checkpointing_backward(head_mode):
     assert model.backbone.gradient_checkpointing
     assert model.short_encoder.gradient_checkpointing
     assert model.continuous_proj.weight.grad is not None
+
+
+def test_meanflow_jvp_target_does_not_build_reverse_graph(monkeypatch):
+    model = build_tiny_model(
+        head_mode="meanflow",
+        gradient_checkpointing=True,
+    ).train()
+    real_jvp = torch.func.jvp
+    grad_enabled_during_jvp = None
+
+    def recording_jvp(*args, **kwargs):
+        nonlocal grad_enabled_during_jvp
+        grad_enabled_during_jvp = torch.is_grad_enabled()
+        return real_jvp(*args, **kwargs)
+
+    monkeypatch.setattr(torch.func, "jvp", recording_jvp)
+    loss = model._meanflow_loss(
+        torch.randn(6, CONTINUOUS_DIM),
+        torch.randn(6, model.hidden_size, requires_grad=True),
+    )
+    loss.backward()
+
+    assert grad_enabled_during_jvp is False
+    assert model.flow_head.grad_checkpointing
+    assert model.flow_head.input_proj.weight.grad is not None
 
 
 def test_masked_positions_do_not_leak_targets():

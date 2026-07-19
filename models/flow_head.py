@@ -181,7 +181,7 @@ class FlowHead(nn.Module):
         nn.init.constant_(self.logvar_linear.weight, 0)
         nn.init.constant_(self.logvar_linear.bias, 0)
 
-    def forward(self, x, t, c, r=None):
+    def forward(self, x, t, c, r=None, *, checkpoint_blocks=None):
         """
         Apply the model to an input batch.
         :param x: an [N x C] Tensor of inputs.
@@ -191,6 +191,9 @@ class FlowHead(nn.Module):
             provided, the head is additionally conditioned on the interval (t - r)
             (MeanFlow average-velocity field); when None it is a single-timestep
             flow-matching / consistency head.
+        :param checkpoint_blocks: optional per-call override for residual-block
+            checkpointing. MeanFlow disables it only for the no-grad JVP target
+            pass, then enables it for the differentiable prediction pass.
         :return: an [N x C] Tensor of outputs.
         """
         x = self.input_proj(x)
@@ -198,7 +201,12 @@ class FlowHead(nn.Module):
         if r is not None:
             y = y + self.gap_embed(t - r)
 
-        if self.grad_checkpointing and not torch.jit.is_scripting():
+        use_checkpoint = (
+            self.grad_checkpointing
+            if checkpoint_blocks is None
+            else bool(checkpoint_blocks)
+        )
+        if use_checkpoint and not torch.jit.is_scripting():
             for block in self.res_blocks:
                 x = checkpoint(block, x, y, use_reentrant=False)
         else:

@@ -176,10 +176,9 @@ class PrismTTS(nn.Module):
             out_channels=self.continuous_latent_size,
             z_channels=self.hidden_size,
             num_res_blocks=flow_num_res_blocks,
-            # torch.func.jvp (MeanFlow) is incompatible with checkpoint's custom
-            # autograd function. Backbone checkpointing still covers the dominant
-            # sequence activations in that mode.
-            grad_checkpointing=self.gradient_checkpointing and self.head_mode != "meanflow",
+            # MeanFlow bypasses checkpointing only for its detached JVP target
+            # pass. The differentiable prediction still benefits from it.
+            grad_checkpointing=self.gradient_checkpointing,
         )
 
         # Learned text/speech type embeddings added to token/latent embeddings.
@@ -423,14 +422,35 @@ class PrismTTS(nn.Module):
             z_t = (1.0 - t) * x0 + t * e
             v = e - x0
 
-            def fwd(z_in: torch.Tensor, r_in: torch.Tensor, t_in: torch.Tensor) -> torch.Tensor:
-                return self.flow_head(z_in, t_in.reshape(-1), cond, r_in.reshape(-1))
+            # The tangent contributes only to the detached regression target.
+            # Computing it without a reverse-mode graph avoids retaining a second
+            # copy of the fp32 FlowHead activations until backward. Checkpointing
+            # is explicitly bypassed here because torch.func transforms cannot
+            # traverse checkpoint's saved-tensor hooks.
+            with torch.no_grad():
+                def target_fwd(
+                    z_in: torch.Tensor,
+                    r_in: torch.Tensor,
+                    t_in: torch.Tensor,
+                ) -> torch.Tensor:
+                    return self.flow_head(
+                        z_in,
+                        t_in.reshape(-1),
+                        cond,
+                        r_in.reshape(-1),
+                        checkpoint_blocks=False,
+                    )
 
-            u, dudt = torch.func.jvp(
-                fwd,
-                (z_t, r, t),
-                (v, torch.zeros_like(r), torch.ones_like(t)),
-            )
+                _, dudt = torch.func.jvp(
+                    target_fwd,
+                    (z_t, r, t),
+                    (v, torch.zeros_like(r), torch.ones_like(t)),
+                )
+
+            # This is the sole differentiable head pass. When gradient
+            # checkpointing is configured, its residual blocks are recomputed in
+            # backward instead of keeping their large per-frame activations.
+            u = self.flow_head(z_t, t.reshape(-1), cond, r.reshape(-1))
             u_tgt = (v - (t - r) * dudt).detach()
             delta = u - u_tgt
             squared = delta.pow(2)
