@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -152,6 +153,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         append_eos_to_text: bool = False,
         cache_npy: bool = False,
         cache_npz: bool | None = None,
+        load_prompt: bool = False,
     ) -> None:
         self.discrete_token_count = int(discrete_token_count)
         (
@@ -177,6 +179,10 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         if cache_npz is not None:
             cache_npy = bool(cache_npz)
         self.cache_npy = bool(cache_npy)
+        # The single-utterance layout does not consume the prompt npy during
+        # training/eval, so it is skipped by default (halves per-sample disk I/O).
+        # Enable only if a cross-utterance prompt is genuinely needed.
+        self.load_prompt = bool(load_prompt)
         self._npy_cache: dict[str, torch.FloatTensor] = {}
         self.continuous_feature_dim = (
             None if continuous_feature_dim is None else int(continuous_feature_dim)
@@ -274,13 +280,15 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                     f"Relative {field_name} requires manifest_root (line {line_number})."
                 )
             path = self.manifest_root / path
-        path = path.resolve()
 
         if path.suffix.lower() != ".npy":
             raise ValueError(f"{field_name} at line {line_number} must be a .npy path: {path}")
-        if not path.is_file():
-            raise FileNotFoundError(f"{field_name} file not found at line {line_number}: {path}")
-        return path
+        # NOTE: do NOT `.resolve()` or `.is_file()` here. On networked filesystems these
+        # each cost a round-trip, and manifests can have tens of thousands of entries
+        # (target + prompt per line), making dataset construction dominate startup time.
+        # Path normalization is cheap and stat-free; existence is validated lazily when
+        # the file is actually loaded (see `_load_continuous_features`).
+        return Path(os.path.normpath(path))
 
     @staticmethod
     def _extract_continuous_from_npy(payload: Any, npy_path: Path) -> Any:
@@ -359,10 +367,16 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
     def _build_manifest_sample(self, entry: ManifestEntry) -> dict[str, torch.Tensor]:
         continuous_target = self._load_continuous_features(entry.target_npy_path)
-        continuous_prompt = self._load_continuous_features(entry.prompt_npy_path)
-
         text_target = self._encode_text(entry.transcript, "transcript")
-        text_prompt = self._encode_text(entry.prompt_transcript, "prompt_transcript")
+
+        if self.load_prompt:
+            continuous_prompt = self._load_continuous_features(entry.prompt_npy_path)
+            text_prompt = self._encode_text(entry.prompt_transcript, "prompt_transcript")
+        else:
+            # Prompt is unused by the single-utterance layout: skip its npy read and
+            # emit empty placeholders (kept for collate/schema compatibility).
+            continuous_prompt = continuous_target.new_zeros((0, continuous_target.shape[1]))
+            text_prompt = text_target.new_zeros((0,))
 
         return _normalize_split_sample(
             {

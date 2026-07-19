@@ -714,6 +714,7 @@ def _build_data_objects(
         "continuous_feature_dim": dataset_cfg.get("continuous_feature_dim"),
         "append_eos_to_text": bool(dataset_cfg.get("append_eos_to_text", False)),
         "cache_npy": bool(dataset_cfg.get("cache_npy", False)),
+        "load_prompt": bool(dataset_cfg.get("load_prompt", False)),
     }
 
     train_manifest = _optional_path(data_cfg.get("train_manifest"))

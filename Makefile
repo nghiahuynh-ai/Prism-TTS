@@ -26,7 +26,7 @@ CKPT ?=
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
-WANDB_NAME ?= ar-wo-vq
+WANDB_NAME ?= v2.2-meanflow
 WANDB_SAVE_DIR ?= logs
 WANDB_OFFLINE ?= false
 WANDB_LOG_MODEL ?= false

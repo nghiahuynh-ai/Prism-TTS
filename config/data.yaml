@@ -3,8 +3,8 @@
 # file_name|duration|transcript|target_npy|prompt_file_name|prompt_duration|prompt_transcript|prompt_npy
 
 data:
-  train_manifest: /astro/nghiahuynh/data/emilia/metadata-1000-max20-train.txt
-  val_manifest: /astro/nghiahuynh/data/emilia/metadata-1000-max20-val.txt
+  train_manifest: /astro/nghiahuynh/data/emilia/metadata-45k-train.txt
+  val_manifest: /astro/nghiahuynh/data/emilia/metadata-45k-val.txt
   test_manifest: null
   # Keep null to resolve relative paths against the manifest directory.
   manifest_root: null
@@ -13,10 +13,10 @@ data:
   loader:
     # Variable-length batches can spike attention memory; keep a conservative
     # per-device batch size and scale effective batch with grad accumulation.
-    train_batch_size: 32
-    val_batch_size: 32
-    test_batch_size: 32
-    num_workers: 32
+    train_batch_size: 8
+    val_batch_size: 8
+    test_batch_size: 8
+    num_workers: 16
     pin_memory: true
     persistent_workers: true
     prefetch_factor: 2
@@ -26,7 +26,7 @@ data:
     shuffle_test: false
     adaptive_batching:
       # Set true to enable dynamic batch sizes based on estimated memory usage.
-      enabled: true
+      enabled: false
       # Target utilization against the configured/derived memory_budget.
       target_memory_utilization: 0.9
       # Optional absolute budget in "cost units" (batch_size * max_len^2).
@@ -56,6 +56,9 @@ data:
     append_eos_to_text: false
     cache_npy: false
     continuous_feature_dim: 512
+    # The single-utterance layout ignores the prompt npy; keep false to skip that
+    # per-sample read (halves disk I/O). Set true only for cross-utterance prompts.
+    load_prompt: false
 
   collate:
     # BatchCollate(...) arguments.

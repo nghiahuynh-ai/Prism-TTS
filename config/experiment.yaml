@@ -13,10 +13,10 @@ experiment:
   # experiment-specific values here.
   trainer:
     logger:
-      name: ar
+      name: v2.2-meanflow
 
     checkpoint:
-      dirpath: checkpoints/ar-wo-vq
+      dirpath: checkpoints/v2.2-meanflow
 
     distributed:
       enabled: true
