@@ -200,7 +200,7 @@ class FlowHead(nn.Module):
 
         if self.grad_checkpointing and not torch.jit.is_scripting():
             for block in self.res_blocks:
-                x = checkpoint(block, x, y)
+                x = checkpoint(block, x, y, use_reentrant=False)
         else:
             for block in self.res_blocks:
                 x = block(x, y)

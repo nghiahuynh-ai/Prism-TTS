@@ -13,6 +13,46 @@ if str(PROJECT_ROOT) not in sys.path:
 import train
 
 
+def test_train_model_builder_honors_meanflow_and_memory_options():
+    config = {
+        "model": {
+            "name": "prism_tts",
+            "prism_tts": {
+                "continuous_latent_size": 4,
+                "flow_num_res_blocks": 1,
+                "head_mode": "meanflow",
+                "attn_mode": "bidirectional",
+                "use_short_context": True,
+                "short_context_layers": 1,
+                "short_context_window": 2,
+                "short_context_chunk_size": 3,
+                "gradient_checkpointing": True,
+            },
+            "llama_config": {
+                "vocab_size": 32,
+                "hidden_size": 16,
+                "intermediate_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "max_position_embeddings": 32,
+                "pad_token_id": 0,
+                "eos_token_id": 2,
+                "use_cache": False,
+                "_attn_implementation": "eager",
+            },
+        }
+    }
+
+    model = train._build_model(config)
+
+    assert model.head_mode == "meanflow"
+    assert model.gradient_checkpointing
+    assert model.backbone.gradient_checkpointing
+    assert model.short_encoder.gradient_checkpointing
+    assert model.short_encoder.chunk_size == 3
+
+
 def test_audio_decoder_is_lazy_by_default(tmp_path, monkeypatch):
     module_path = tmp_path / "lazy_decoder_target.py"
     module_path.write_text(

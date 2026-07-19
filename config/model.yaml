@@ -39,6 +39,12 @@ model:
     use_short_context: true
     short_context_layers: 2
     short_context_window: 10
+    # Bound the local-attention temporary workspace; this does not change the
+    # effective short-context window.
+    short_context_chunk_size: 128
+    # Recompute transformer blocks in backward rather than retaining every
+    # activation. This is essential for long variable-length utterances.
+    gradient_checkpointing: true
     # Sampling steps per frame at inference (1 = true 1-step for MeanFlow).
     sample_steps: 1
     # EOS stopping probability threshold + extra frames emitted after EOS fires.

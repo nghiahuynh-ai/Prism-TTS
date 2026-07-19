@@ -13,12 +13,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODEL_PATH = PROJECT_ROOT / "models" / "llama_backbone.py"
 
 
-def load_llama_backbone():
+def load_llama_backbone_module():
     spec = importlib.util.spec_from_file_location("prism_llama_backbone", MODEL_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.LlamaBackbone
+    return module
 
 
 def make_config() -> LlamaConfig:
@@ -37,7 +37,8 @@ class TestLlamaBackbone(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.manual_seed(0)
-        cls.LlamaBackbone = load_llama_backbone()
+        cls.module = load_llama_backbone_module()
+        cls.LlamaBackbone = cls.module.LlamaBackbone
 
     def setUp(self):
         torch.manual_seed(0)
@@ -117,6 +118,44 @@ class TestLlamaBackbone(unittest.TestCase):
 
         self.assertEqual(step_outputs.last_hidden_state.shape, (1, 1, 64))
         self.assertEqual(step_outputs.past_key_values.get_seq_length(), 6)
+
+    def test_windowed_encoder_matches_dense_window_reference(self):
+        encoder = self.module.WindowedCausalEncoder(
+            make_config(), num_layers=1, window=3, chunk_size=2
+        ).to(self.device).eval()
+        inputs = torch.randn(2, 6, 64, device=self.device)
+        attention_mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 0, 0]],
+            dtype=torch.bool,
+            device=self.device,
+        )
+
+        with torch.no_grad():
+            actual = encoder(inputs, attention_mask)
+            positions = torch.arange(inputs.shape[1], device=self.device)
+            position_ids = positions.unsqueeze(0)
+            position_embeddings = encoder.rotary_emb(inputs, position_ids=position_ids)
+            dense_mask = self.module._build_causal_4d_mask(
+                padding_mask=attention_mask,
+                batch_size=2,
+                query_length=6,
+                target_length=6,
+                dtype=inputs.dtype,
+                device=self.device,
+                cache_position=positions,
+                window=3,
+            )
+            reference = self.module.FullAttentionLlamaDecoderLayer.forward(
+                encoder.layers[0],
+                hidden_states=inputs,
+                attention_mask=dense_mask,
+                position_ids=position_ids,
+                use_cache=False,
+                position_embeddings=position_embeddings,
+            )
+            reference = encoder.norm(reference)
+
+        self.assertTrue(torch.allclose(actual, reference, atol=1e-5, rtol=1e-5))
 
 
 if __name__ == "__main__":

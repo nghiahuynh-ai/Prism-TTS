@@ -107,6 +107,8 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
         use_short_context=bool(prism_cfg.get("use_short_context", True)),
         short_context_layers=int(prism_cfg.get("short_context_layers", 2)),
         short_context_window=int(prism_cfg.get("short_context_window", 10)),
+        short_context_chunk_size=int(prism_cfg.get("short_context_chunk_size", 128)),
+        gradient_checkpointing=bool(prism_cfg.get("gradient_checkpointing", False)),
         attn_mode=str(prism_cfg.get("attn_mode", "bidirectional")),
         head_mode=str(prism_cfg.get("head_mode", "flowmatch")),
         protected_prefix_ratio=float(prism_cfg.get("protected_prefix_ratio", 0.3)),

@@ -4,6 +4,8 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from transformers import LlamaConfig
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -13,6 +15,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaPreTrainedModel,
     LlamaRMSNorm,
     LlamaRotaryEmbedding,
+    apply_rotary_pos_emb,
 )
 
 
@@ -87,22 +90,34 @@ def build_bidirectional_4d_mask(
     """Build a 4D additive *bidirectional* mask (only padded keys are masked).
 
     Used by the masked-generative (MAR) variant: every query may attend to every
-    non-padded key (no causal triangle). Returned as a fully-specified additive
-    mask so the backbone's 4D-mask branch consumes it verbatim.
+    non-padded key (no causal triangle). The singleton query dimension is
+    intentional: attention kernels broadcast it over all queries, so this stores
+    ``O(batch * sequence)`` values rather than a dense ``O(batch * sequence^2)``
+    mask. The latter was a multi-GiB allocation for long training examples.
     """
-    min_value = torch.finfo(dtype).min
-    mask = torch.zeros(batch_size, 1, seq_len, seq_len, dtype=dtype, device=device)
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1.")
+
     if padding_mask is not None:
         if padding_mask.dim() != 2:
             raise ValueError("Padding attention_mask must be 2D [batch, key_len].")
+        if padding_mask.shape[0] != batch_size:
+            raise ValueError(
+                f"attention_mask batch size ({padding_mask.shape[0]}) does not match "
+                f"batch_size ({batch_size})."
+            )
         if padding_mask.shape[1] < seq_len:
             raise ValueError(
                 f"attention_mask key length ({padding_mask.shape[1]}) is shorter than "
                 f"seq_len ({seq_len})."
             )
-        key_pad = ~padding_mask[:, :seq_len].to(device=device, dtype=torch.bool)
-        mask = mask.masked_fill(key_pad[:, None, None, :], min_value)
-    return mask
+        return _to_additive_mask(
+            padding_mask[:, :seq_len].to(device=device), dtype=dtype
+        )[:, None, None, :]
+
+    # A non-null zero mask explicitly selects bidirectional SDPA. Its singleton
+    # batch/query/key dimensions broadcast without a quadratic allocation.
+    return torch.zeros((1, 1, 1, 1), dtype=dtype, device=device)
 
 
 class FullAttentionLlamaDecoderLayer(nn.Module):
@@ -190,6 +205,113 @@ class FullAttentionLlamaDecoderLayer(nn.Module):
         if output_attentions:
             return hidden_states, attn_weights
         return hidden_states
+
+
+class WindowedLlamaDecoderLayer(FullAttentionLlamaDecoderLayer):
+    """Llama decoder block with memory-bounded sliding-window attention.
+
+    ``scaled_dot_product_attention`` cannot express a sliding window using its
+    ``is_causal`` flag. Constructing a dense [B, H, L, L] mask to do so defeats
+    the point of a local conditioner. This implementation gathers only the local
+    keys/values for a small query chunk, keeping the temporary footprint linear
+    in sequence length (and bounded by ``chunk_size * window`` per operation).
+    """
+
+    def _windowed_attention(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        window: int,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        attention = self.self_attn
+        batch_size, seq_len, _ = hidden_states.shape
+        hidden_shape = (batch_size, seq_len, -1, attention.head_dim)
+
+        query_states = attention.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = attention.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = attention.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        try:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        except TypeError:
+            # transformers<=4.x accepted position_ids as a required argument.
+            position_ids = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin, position_ids
+            )
+
+        if key_states.shape[1] != query_states.shape[1]:
+            if query_states.shape[1] % key_states.shape[1] != 0:
+                raise ValueError("The query-head count must be divisible by the KV-head count.")
+            repeat = query_states.shape[1] // key_states.shape[1]
+            key_states = key_states.repeat_interleave(repeat, dim=1)
+            value_states = value_states.repeat_interleave(repeat, dim=1)
+
+        padding = None
+        if attention_mask is not None:
+            if attention_mask.dim() != 2 or attention_mask.shape != (batch_size, seq_len):
+                raise ValueError("attention_mask must have shape [batch, sequence].")
+            padding = attention_mask.to(device=hidden_states.device, dtype=torch.bool)
+
+        offsets = torch.arange(window, device=hidden_states.device) - (window - 1)
+        dropout_p = float(getattr(attention, "attention_dropout", 0.0)) if self.training else 0.0
+        scaling = getattr(attention, "scaling", attention.head_dim ** -0.5)
+        outputs: list[torch.Tensor] = []
+        for start in range(0, seq_len, chunk_size):
+            end = min(seq_len, start + chunk_size)
+            query_positions = torch.arange(start, end, device=hidden_states.device)
+            key_positions = query_positions[:, None] + offsets[None, :]
+            valid_keys = key_positions >= 0
+            key_positions = key_positions.clamp_min(0)
+
+            # [B, H, Q, W, D]; Q is a batch-like dimension for SDPA below.
+            local_keys = key_states[:, :, key_positions, :]
+            local_values = value_states[:, :, key_positions, :]
+            allowed = valid_keys[None, None, :, None, :]
+            if padding is not None:
+                allowed = allowed & padding[:, None, key_positions].unsqueeze(-2)
+
+            local_output = F.scaled_dot_product_attention(
+                query_states[:, :, start:end, :].unsqueeze(-2),
+                local_keys,
+                local_values,
+                attn_mask=allowed,
+                dropout_p=dropout_p,
+                scale=scaling,
+                is_causal=False,
+            ).squeeze(-2)
+            outputs.append(local_output)
+
+        attn_output = torch.cat(outputs, dim=2)
+        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
+        return attention.o_proj(attn_output)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        window: int,
+        chunk_size: int,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self._windowed_attention(
+            hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            window=window,
+            chunk_size=chunk_size,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
 
 
 class LlamaBackbone(LlamaPreTrainedModel):
@@ -287,21 +409,43 @@ class LlamaBackbone(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
 
+        checkpoint_layers = self.gradient_checkpointing and self.training and not output_attentions
+        if checkpoint_layers and use_cache:
+            # Replaying a checkpointed layer must not append to a KV cache twice.
+            use_cache = False
+
         for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = decoder_layer(
-                hidden_states=hidden_states,
-                attention_mask=resolved_attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                output_attentions=output_attentions,
-                **kwargs,
-            )
+            if checkpoint_layers:
+                layer_outputs = checkpoint(
+                    lambda states, layer=decoder_layer: layer(
+                        hidden_states=states,
+                        attention_mask=resolved_attention_mask,
+                        position_ids=position_ids,
+                        past_key_values=None,
+                        use_cache=False,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        output_attentions=False,
+                        **kwargs,
+                    ),
+                    hidden_states,
+                    use_reentrant=False,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states=hidden_states,
+                    attention_mask=resolved_attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    output_attentions=output_attentions,
+                    **kwargs,
+                )
 
             if output_attentions:
                 hidden_states, attn_weights = layer_outputs
@@ -338,18 +482,28 @@ class WindowedCausalEncoder(nn.Module):
     added to the long-context backbone hidden state before the per-frame head.
     """
 
-    def __init__(self, config: LlamaConfig, num_layers: int, window: int):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        num_layers: int,
+        window: int,
+        chunk_size: int = 128,
+    ):
         super().__init__()
         if num_layers < 1:
             raise ValueError("WindowedCausalEncoder num_layers must be >= 1.")
         if window < 1:
             raise ValueError("WindowedCausalEncoder window must be >= 1.")
+        if chunk_size < 1:
+            raise ValueError("WindowedCausalEncoder chunk_size must be >= 1.")
         self.window = int(window)
+        self.chunk_size = int(chunk_size)
         self.layers = nn.ModuleList(
-            [FullAttentionLlamaDecoderLayer(config, layer_idx) for layer_idx in range(num_layers)]
+            [WindowedLlamaDecoderLayer(config, layer_idx) for layer_idx in range(num_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
 
     def forward(
         self,
@@ -361,25 +515,28 @@ class WindowedCausalEncoder(nn.Module):
         cache_position = torch.arange(seq_len, device=device)
         position_ids = cache_position.unsqueeze(0)
 
-        resolved_mask = _build_causal_4d_mask(
-            padding_mask=attention_mask if (attention_mask is not None and attention_mask.dim() == 2) else None,
-            batch_size=batch_size,
-            query_length=seq_len,
-            target_length=seq_len,
-            dtype=inputs_embeds.dtype,
-            device=device,
-            cache_position=cache_position,
-            window=self.window,
-        )
         position_embeddings = self.rotary_emb(inputs_embeds, position_ids=position_ids)
 
         hidden_states = inputs_embeds
         for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
-                hidden_states=hidden_states,
-                attention_mask=resolved_mask,
-                position_ids=position_ids,
-                use_cache=False,
-                position_embeddings=position_embeddings,
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states = checkpoint(
+                    lambda states, layer=decoder_layer: layer(
+                        hidden_states=states,
+                        position_embeddings=position_embeddings,
+                        attention_mask=attention_mask,
+                        window=self.window,
+                        chunk_size=self.chunk_size,
+                    ),
+                    hidden_states,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = decoder_layer(
+                    hidden_states=hidden_states,
+                    position_embeddings=position_embeddings,
+                    attention_mask=attention_mask,
+                    window=self.window,
+                    chunk_size=self.chunk_size,
+                )
         return self.norm(hidden_states)

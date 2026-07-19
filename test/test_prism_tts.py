@@ -28,6 +28,7 @@ def build_tiny_model(
     head_mode: str = "flowmatch",
     noise_mode: str = "ramp",
     default_block_size: int = 2,
+    gradient_checkpointing: bool = False,
 ) -> PrismTTS:
     torch.manual_seed(0)
     cfg = LlamaConfig(
@@ -55,6 +56,7 @@ def build_tiny_model(
         head_mode=head_mode,
         noise_mode=noise_mode,
         default_block_size=default_block_size,
+        gradient_checkpointing=gradient_checkpointing,
     )
 
 
@@ -98,6 +100,11 @@ def test_print_config_model(pytestconfig):
     model = build_config_model().eval()
     total_params = sum(p.numel() for p in model.parameters())
     assert total_params > 0
+    assert model.head_mode == "meanflow"
+    assert model.gradient_checkpointing
+    # MeanFlow's JVP cannot traverse torch.utils.checkpoint; its large sequence
+    # activations are still covered by the two transformer checkpoint paths.
+    assert not model.flow_head.grad_checkpointing
 
 
 def test_single_utterance_flat_layout():
@@ -155,9 +162,25 @@ def test_backbone_is_bidirectional():
     model = build_tiny_model().eval()
     embeds = torch.randn(1, 5, model.hidden_size)
     mask = model._backbone_attention_mask(torch.ones(1, 5, dtype=torch.bool), embeds)
-    assert mask.shape == (1, 1, 5, 5)
+    # The singleton query dimension broadcasts over all queries, avoiding a
+    # quadratic [B, 1, L, L] allocation for MAR attention.
+    assert mask.shape == (1, 1, 1, 5)
+    assert mask.untyped_storage().nbytes() == 5 * mask.element_size()
     # A query may attend to a future key (no causal triangle).
     assert mask[0, 0, 0, 4].item() == 0.0
+
+
+@pytest.mark.parametrize("head_mode", ["flowmatch", "meanflow"])
+def test_gradient_checkpointing_backward(head_mode):
+    model = build_tiny_model(
+        head_mode=head_mode,
+        gradient_checkpointing=True,
+    ).train()
+    out = _forward(model, make_batch())
+    out.loss.backward()
+    assert model.backbone.gradient_checkpointing
+    assert model.short_encoder.gradient_checkpointing
+    assert model.continuous_proj.weight.grad is not None
 
 
 def test_masked_positions_do_not_leak_targets():

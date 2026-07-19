@@ -465,6 +465,27 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         use_short_context=bool(prism_cfg.get("use_short_context", True)),
         short_context_layers=int(prism_cfg.get("short_context_layers", 2)),
         short_context_window=int(prism_cfg.get("short_context_window", 10)),
+        short_context_chunk_size=int(prism_cfg.get("short_context_chunk_size", 128)),
+        gradient_checkpointing=bool(prism_cfg.get("gradient_checkpointing", False)),
+        attn_mode=str(prism_cfg.get("attn_mode", "bidirectional")),
+        head_mode=str(prism_cfg.get("head_mode", "flowmatch")),
+        protected_prefix_ratio=float(prism_cfg.get("protected_prefix_ratio", 0.3)),
+        always_mask_terminal=bool(prism_cfg.get("always_mask_terminal", True)),
+        noise_mode=str(prism_cfg.get("noise_mode", "ramp")),
+        ramp_max=float(prism_cfg.get("ramp_max", 1.0)),
+        ramp_random_intensity=bool(prism_cfg.get("ramp_random_intensity", True)),
+        meanflow_p=float(prism_cfg.get("meanflow_p", 1.0)),
+        meanflow_c=float(prism_cfg.get("meanflow_c", 1e-3)),
+        t_logit_mean=float(prism_cfg.get("t_logit_mean", -0.4)),
+        t_logit_std=float(prism_cfg.get("t_logit_std", 1.0)),
+        r_eq_t_prob=float(prism_cfg.get("r_eq_t_prob", 0.75)),
+        eos_pos_weight=(
+            None
+            if prism_cfg.get("eos_pos_weight") is None
+            else float(prism_cfg.get("eos_pos_weight"))
+        ),
+        default_block_size=int(prism_cfg.get("default_block_size", 1)),
+        frames_after_eos=int(prism_cfg.get("frames_after_eos", 0)),
     )
 
 

@@ -58,6 +58,8 @@ class PrismTTS(nn.Module):
         use_short_context: bool = True,
         short_context_layers: int = 2,
         short_context_window: int = 10,
+        short_context_chunk_size: int = 128,
+        gradient_checkpointing: bool = False,
         # Masked-generative (MAR) + MeanFlow settings.
         attn_mode: str = "bidirectional",
         head_mode: str = "flowmatch",
@@ -126,6 +128,8 @@ class PrismTTS(nn.Module):
         self.inject_backbone_noise = bool(inject_backbone_noise)
         self.use_short_context = bool(use_short_context)
         self.short_context_window = int(short_context_window)
+        self.short_context_chunk_size = int(short_context_chunk_size)
+        self.gradient_checkpointing = bool(gradient_checkpointing)
 
         self.attn_mode = str(attn_mode)
         self.head_mode = str(head_mode)
@@ -144,6 +148,7 @@ class PrismTTS(nn.Module):
         self.frames_after_eos = int(frames_after_eos)
 
         self.backbone = LlamaBackbone(llama_config)
+        self.backbone.gradient_checkpointing = self.gradient_checkpointing
         self.continuous_proj = nn.Linear(self.continuous_latent_size, self.hidden_size)
         self.eos_head = nn.Linear(self.hidden_size, 1)
 
@@ -155,10 +160,13 @@ class PrismTTS(nn.Module):
                 llama_config,
                 num_layers=int(short_context_layers),
                 window=int(short_context_window),
+                chunk_size=self.short_context_chunk_size,
             )
             if self.use_short_context
             else None
         )
+        if self.short_encoder is not None:
+            self.short_encoder.gradient_checkpointing = self.gradient_checkpointing
 
         # Per-frame head F_theta(x_t, t[, r]; cond) conditioned on the backbone
         # hidden state directly.
@@ -168,6 +176,10 @@ class PrismTTS(nn.Module):
             out_channels=self.continuous_latent_size,
             z_channels=self.hidden_size,
             num_res_blocks=flow_num_res_blocks,
+            # torch.func.jvp (MeanFlow) is incompatible with checkpoint's custom
+            # autograd function. Backbone checkpointing still covers the dominant
+            # sequence activations in that mode.
+            grad_checkpointing=self.gradient_checkpointing and self.head_mode != "meanflow",
         )
 
         # Learned text/speech type embeddings added to token/latent embeddings.
