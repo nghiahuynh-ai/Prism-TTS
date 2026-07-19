@@ -17,6 +17,10 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
     _DEFAULTED_CUDA_ALLOC_CONF = True
 
+# Keep a process-level timestamp so the startup report includes expensive imports
+# (notably torch, transformers, and Lightning), which occur before ``main``.
+_PROCESS_START = time.perf_counter()
+
 import torch
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -753,8 +757,68 @@ def _should_force_single_process_loader(num_workers: int) -> bool:
     return total_bytes < threshold
 
 
+class StartupPrefetchDataLoader(DataLoader):
+    """Reuse a worker-prefetched iterator for the first training epoch only.
+
+    ``DataLoader.__iter__`` resets persistent workers on every call.  A normal
+    early ``iter(loader)`` would therefore cause Lightning to discard and
+    re-read its startup prefetch.  This small specialization returns the primed
+    iterator exactly once, then preserves normal DataLoader behavior for all
+    later epochs.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._reuse_startup_iterator = False
+
+    def warmup_workers(self) -> bool:
+        """Start persistent workers and retain their first prefetched iterator."""
+        if self.num_workers <= 0 or not self.persistent_workers:
+            return False
+        if self._iterator is not None:
+            return True
+
+        start = time.perf_counter()
+        # Call the base implementation directly so this first iterator is
+        # marked for reuse rather than being returned through ``__iter__``.
+        DataLoader.__iter__(self)
+        if self._iterator is None:  # defensive for incompatible DataLoader variants
+            return False
+
+        self._reuse_startup_iterator = True
+        print(
+            f"[train.py] Started {self.num_workers} persistent train DataLoader workers in "
+            f"{time.perf_counter() - start:.2f}s; initial prefetch overlaps model setup."
+        )
+        return True
+
+    def __iter__(self):
+        if self._reuse_startup_iterator and self._iterator is not None:
+            self._reuse_startup_iterator = False
+            return self._iterator
+        return super().__iter__()
+
+
+def _warmup_persistent_loader_workers(loader: DataLoader) -> bool:
+    """Start persistent loader workers without discarding their first prefetch.
+
+    PyTorch starts DataLoader workers lazily on the first ``iter(loader)``.  If
+    that happens in ``Trainer.fit``, Unix ``fork`` workers inherit the fully
+    constructed model (and sometimes initialized CUDA/logger state).  Starting
+    them before model construction avoids that expensive fork and lets their
+    initial prefetch overlap model initialization.
+
+    ``StartupPrefetchDataLoader`` returns the primed iterator once, so
+    Lightning consumes that prefetch rather than resetting and re-reading it.
+    """
+    warmup = getattr(loader, "warmup_workers", None)
+    return bool(warmup()) if callable(warmup) else False
+
+
 def _build_data_objects(
     config: dict[str, Any],
+    *,
+    warmup_train_workers: bool = True,
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
     data_cfg = _require_mapping(config, "data")
     loader_cfg = _require_mapping(data_cfg, "loader")
@@ -936,7 +1000,7 @@ def _build_data_objects(
             drop_last=drop_last_train,
             seed=sampler_seed,
         )
-        train_loader = DataLoader(
+        train_loader = StartupPrefetchDataLoader(
             train_dataset,
             batch_sampler=train_batch_sampler,
             **common_loader_kwargs,
@@ -952,12 +1016,33 @@ def _build_data_objects(
             f"seed={sampler_seed}."
         )
     else:
-        train_loader = DataLoader(
+        train_loader = StartupPrefetchDataLoader(
             train_dataset,
             batch_size=train_batch_size,
             shuffle=shuffle_train,
             drop_last=drop_last_train,
             **common_loader_kwargs,
+        )
+
+    # DataLoader worker creation is otherwise deferred until Trainer.fit, at
+    # which point the 333M-parameter model is already resident in the parent.
+    # Only prime local, persistent workers; DDP launches its own rank-local
+    # loaders after Lightning has spawned the training processes.
+    distributed_cfg = _require_mapping(config, "trainer").get("distributed")
+    distributed_enabled = isinstance(distributed_cfg, dict) and bool(
+        distributed_cfg.get("enabled", False)
+    )
+    worker_warmup_enabled = bool(loader_cfg.get("warmup_workers", False))
+    if worker_warmup_enabled and warmup_train_workers and not distributed_enabled:
+        if not _warmup_persistent_loader_workers(train_loader):
+            print(
+                "[train.py] Train-worker warmup skipped: it requires "
+                "num_workers > 0 and persistent_workers=true."
+            )
+    elif worker_warmup_enabled and distributed_enabled:
+        print(
+            "[train.py] Train-worker warmup skipped for distributed training; "
+            "each Lightning rank starts its own workers."
         )
 
     val_loader = None
@@ -1217,6 +1302,77 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
             version += 1
 
 
+class TrainingStartupTimer(pl.Callback):
+    """Report the time from process launch through the first training batch."""
+
+    def __init__(self, process_start: float) -> None:
+        super().__init__()
+        self.process_start = float(process_start)
+        self.fit_start: float | None = None
+        self.first_batch_start: float | None = None
+        self._reported_first_batch = False
+        self._reported_first_batch_end = False
+
+    @staticmethod
+    def _is_global_zero(trainer: Any) -> bool:
+        return bool(getattr(trainer, "is_global_zero", True))
+
+    def on_fit_start(self, trainer: Any, pl_module: Any) -> None:
+        del pl_module
+        if not self._is_global_zero(trainer):
+            return
+        self.fit_start = time.perf_counter()
+        print(
+            "[train.py] Trainer.fit entered after "
+            f"{self.fit_start - self.process_start:.2f}s from process start."
+        )
+
+    def on_train_batch_start(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        del pl_module, batch
+        if batch_idx != 0 or self._reported_first_batch or not self._is_global_zero(trainer):
+            return
+        self.first_batch_start = time.perf_counter()
+        fit_elapsed = (
+            self.first_batch_start - self.fit_start
+            if self.fit_start is not None
+            else float("nan")
+        )
+        print(
+            "[train.py] First train batch reached the training loop after "
+            f"{self.first_batch_start - self.process_start:.2f}s from process start "
+            f"({fit_elapsed:.2f}s inside Trainer.fit)."
+        )
+        self._reported_first_batch = True
+
+    def on_train_batch_end(
+        self,
+        trainer: Any,
+        pl_module: Any,
+        outputs: Any,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        del pl_module, outputs, batch
+        if batch_idx != 0 or self._reported_first_batch_end or not self._is_global_zero(trainer):
+            return
+        now = time.perf_counter()
+        batch_elapsed = (
+            now - self.first_batch_start if self.first_batch_start is not None else float("nan")
+        )
+        print(
+            "[train.py] First train batch finished after "
+            f"{now - self.process_start:.2f}s from process start "
+            f"({batch_elapsed:.2f}s in the batch loop)."
+        )
+        self._reported_first_batch_end = True
+
+
 def _trainer_supports_ckpt_path() -> bool:
     return "ckpt_path" in inspect.signature(pl.Trainer.fit).parameters
 
@@ -1353,8 +1509,8 @@ def _log_startup_stage(stage_name: str, stage_start: float, run_start: float) ->
     )
 
 
-def run(args: argparse.Namespace) -> None:
-    run_start = time.perf_counter()
+def run(args: argparse.Namespace, *, process_start: float | None = None) -> None:
+    run_start = time.perf_counter() if process_start is None else float(process_start)
     stage_start = time.perf_counter()
     resolved = _load_merged_configs(args)
     _log_startup_stage("Config loading", stage_start, run_start)
@@ -1376,7 +1532,10 @@ def run(args: argparse.Namespace) -> None:
         pl.seed_everything(int(seed), workers=bool(trainer_cfg.get("seed_workers", True)))
 
     stage_start = time.perf_counter()
-    train_loader, val_loader, test_loader = _build_data_objects(config)
+    train_loader, val_loader, test_loader = _build_data_objects(
+        config,
+        warmup_train_workers=not args.validate_only,
+    )
     _log_startup_stage("Data setup", stage_start, run_start)
 
     stage_start = time.perf_counter()
@@ -1390,6 +1549,7 @@ def run(args: argparse.Namespace) -> None:
     stage_start = time.perf_counter()
     logger = _build_logger(_require_mapping(trainer_cfg, "logger"))
     callbacks = _build_callbacks(config)
+    callbacks.append(TrainingStartupTimer(process_start=run_start))
 
     trainer = _build_trainer(config, logger=logger, callbacks=callbacks)
     _log_startup_stage("Logger/callback/trainer setup", stage_start, run_start)
@@ -1438,7 +1598,7 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    run(args)
+    run(args, process_start=_PROCESS_START)
 
 
 if __name__ == "__main__":

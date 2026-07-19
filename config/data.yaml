@@ -19,7 +19,13 @@ data:
     num_workers: 16
     pin_memory: true
     persistent_workers: true
-    prefetch_factor: 2
+    # Start persistent workers before model/CUDA initialization. This avoids
+    # forking the large model at the first Trainer.fit batch, and overlaps the
+    # first feature reads with model construction. Disabled automatically for DDP.
+    warmup_workers: true
+    # With 16 workers, one queued batch per worker is already ample. Keeping this
+    # low avoids an initial NFS I/O stampede and reduces time to the first batch.
+    prefetch_factor: 1
     drop_last_train: false
     shuffle_train: true
     shuffle_val: false
