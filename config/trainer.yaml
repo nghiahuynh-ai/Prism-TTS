@@ -31,7 +31,10 @@ trainer:
     accelerator: gpu
     devices: auto
     gpu_indices: null
-    strategy: ddp_find_unused_parameters_false
+    # PrismTTS has conditional loss/conditioning branches, so a parameter may
+    # legitimately be absent from a particular rank's backward graph. DDP must
+    # detect that rather than assuming every parameter is used every step.
+    strategy: ddp_find_unused_parameters_true
     num_nodes: 1
     sync_dist_logging: true
 
