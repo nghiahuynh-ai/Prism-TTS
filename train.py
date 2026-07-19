@@ -836,19 +836,48 @@ def _build_data_objects(
         "append_eos_to_text": bool(dataset_cfg.get("append_eos_to_text", False)),
         "cache_npy": bool(dataset_cfg.get("cache_npy", False)),
         "load_prompt": bool(dataset_cfg.get("load_prompt", False)),
+        "manifest_progress_every": int(dataset_cfg.get("manifest_progress_every", 0)),
+        "manifest_read_buffer_bytes": int(
+            dataset_cfg.get("manifest_read_buffer_bytes", 4 * 1024 * 1024)
+        ),
     }
 
     train_manifest = _optional_path(data_cfg.get("train_manifest"))
     if train_manifest is None:
         raise ValueError("data.train_manifest must be set for training.")
     _t0 = time.perf_counter()
+    print(f"[train.py] Loading train manifest: {train_manifest}", flush=True)
+    train_start = time.perf_counter()
     train_dataset = PrismDataset(source=train_manifest, **dataset_kwargs)
+    print(
+        f"[train.py] Train manifest ready in {time.perf_counter() - train_start:.2f}s "
+        f"({len(train_dataset):,} samples).",
+        flush=True,
+    )
 
     val_manifest = _optional_path(data_cfg.get("val_manifest"))
-    val_dataset = PrismDataset(source=val_manifest, **dataset_kwargs) if val_manifest else None
+    val_dataset = None
+    if val_manifest:
+        print(f"[train.py] Loading validation manifest: {val_manifest}", flush=True)
+        val_start = time.perf_counter()
+        val_dataset = PrismDataset(source=val_manifest, **dataset_kwargs)
+        print(
+            f"[train.py] Validation manifest ready in {time.perf_counter() - val_start:.2f}s "
+            f"({len(val_dataset):,} samples).",
+            flush=True,
+        )
 
     test_manifest = _optional_path(data_cfg.get("test_manifest"))
-    test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs) if test_manifest else None
+    test_dataset = None
+    if test_manifest:
+        print(f"[train.py] Loading test manifest: {test_manifest}", flush=True)
+        test_start = time.perf_counter()
+        test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs)
+        print(
+            f"[train.py] Test manifest ready in {time.perf_counter() - test_start:.2f}s "
+            f"({len(test_dataset):,} samples).",
+            flush=True,
+        )
     print(
         f"[train.py] Datasets built in {time.perf_counter() - _t0:.2f}s "
         f"(train={len(train_dataset)}"

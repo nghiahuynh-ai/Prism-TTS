@@ -154,6 +154,8 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         cache_npy: bool = False,
         cache_npz: bool | None = None,
         load_prompt: bool = False,
+        manifest_progress_every: int = 0,
+        manifest_read_buffer_bytes: int = 4 * 1024 * 1024,
     ) -> None:
         self.discrete_token_count = int(discrete_token_count)
         (
@@ -164,7 +166,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         ) = build_shared_token_layout(self.discrete_token_count)
 
         resolved_vocab_path = (
-            Path(vocab_path).expanduser().resolve()
+            self._absolute_path(vocab_path)
             if vocab_path is not None
             else Path(__file__).resolve().parent / "vocab.txt"
         )
@@ -183,6 +185,12 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         # training/eval, so it is skipped by default (halves per-sample disk I/O).
         # Enable only if a cross-utterance prompt is genuinely needed.
         self.load_prompt = bool(load_prompt)
+        self.manifest_progress_every = int(manifest_progress_every)
+        if self.manifest_progress_every < 0:
+            raise ValueError("manifest_progress_every must be >= 0.")
+        self.manifest_read_buffer_bytes = int(manifest_read_buffer_bytes)
+        if self.manifest_read_buffer_bytes < 1:
+            raise ValueError("manifest_read_buffer_bytes must be >= 1.")
         self._npy_cache: dict[str, torch.FloatTensor] = {}
         # Remember whether npy files need allow_pickle so we stop paying a failed
         # load attempt per file (each retry is an extra open() on networked FS).
@@ -197,12 +205,13 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         self._samples: list[Mapping[str, Any]] = []
 
         if isinstance(source, (str, Path)):
-            manifest_path = Path(source).expanduser().resolve()
-            if not manifest_path.is_file():
-                raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
+            # Keep manifest setup stat-free until it is opened. ``Path.resolve``
+            # and ``is_file`` can each trigger a network metadata round trip on
+            # NFS/Lustre, which makes an unavailable mount look like a hang.
+            manifest_path = self._absolute_path(source)
             self.manifest_path = manifest_path
             self.manifest_root = (
-                Path(manifest_root).expanduser().resolve()
+                self._absolute_path(manifest_root)
                 if manifest_root is not None
                 else manifest_path.parent
             )
@@ -210,9 +219,17 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         else:
             self.manifest_path = None
             self.manifest_root = (
-                Path(manifest_root).expanduser().resolve() if manifest_root is not None else None
+                self._absolute_path(manifest_root) if manifest_root is not None else None
             )
             self._samples = list(source)
+
+    @staticmethod
+    def _absolute_path(value: str | Path) -> Path:
+        """Make an absolute path without resolving symlinks or touching the filesystem."""
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return Path(os.path.abspath(path))
 
     def __len__(self) -> int:
         return len(self._entries) if self._entries else len(self._samples)
@@ -224,12 +241,34 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
     def _load_manifest(self, manifest_path: Path) -> list[ManifestEntry]:
         entries: list[ManifestEntry] = []
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            for line_number, raw_line in enumerate(handle, start=1):
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                entries.append(self._parse_manifest_line(line, line_number))
+        try:
+            # The default 8 KiB TextIO buffer can turn a 45k-row manifest into
+            # thousands of high-latency NFS reads. A multi-megabyte buffer keeps
+            # parsing streaming and bounded in memory while reducing network
+            # round trips by orders of magnitude.
+            with manifest_path.open(
+                "r",
+                encoding="utf-8",
+                buffering=self.manifest_read_buffer_bytes,
+            ) as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    entries.append(self._parse_manifest_line(line, line_number))
+                    if (
+                        self.manifest_progress_every > 0
+                        and line_number % self.manifest_progress_every == 0
+                    ):
+                        print(
+                            f"[PrismDataset] Parsed {line_number:,} lines from "
+                            f"{manifest_path} ({len(entries):,} samples).",
+                            flush=True,
+                        )
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Manifest file not found: {manifest_path}") from exc
+        except IsADirectoryError as exc:
+            raise ValueError(f"Manifest path is a directory, not a file: {manifest_path}") from exc
         if not entries:
             raise ValueError(f"Manifest has no valid entries: {manifest_path}")
         return entries

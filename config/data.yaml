@@ -62,6 +62,12 @@ data:
     append_eos_to_text: false
     cache_npy: false
     continuous_feature_dim: 512
+    # Emit a heartbeat while parsing large network-hosted manifests. Set 0 to
+    # disable progress output.
+    manifest_progress_every: 10000
+    # Use large sequential reads for network manifests; the normal 8 KiB Python
+    # buffer can make a 45k-row NFS manifest take several minutes to load.
+    manifest_read_buffer_bytes: 4194304  # 4 MiB
     # The single-utterance layout ignores the prompt npy; keep false to skip that
     # per-sample read (halves disk I/O). Set true only for cross-utterance prompts.
     load_prompt: false
