@@ -59,6 +59,14 @@ data:
 
   dataset:
     # PrismDataset(...) arguments.
+    # "lazy" streams and parses metadata only in DataLoader workers. It avoids
+    # the multi-minute startup cost of reading a full NFS manifest; set "eager"
+    # only when using adaptive batching.
+    metadata_mode: lazy
+    # Training-order randomization for lazy metadata; this many entries per
+    # worker are retained while streaming, not the entire manifest.
+    metadata_shuffle_buffer_size: 256
+    metadata_shuffle_seed: null
     append_eos_to_text: false
     cache_npy: false
     continuous_feature_dim: 512

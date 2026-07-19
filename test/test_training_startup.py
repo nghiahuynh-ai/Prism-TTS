@@ -82,6 +82,39 @@ def test_worker_warmup_reuses_prefetched_iterator_once(monkeypatch):
     assert loader.base_iterator_calls == 2
 
 
+def test_lazy_metadata_build_does_not_open_manifest_during_data_setup(tmp_path):
+    missing_manifest = tmp_path / "not-opened-until-training.txt"
+    config = {
+        "data": {
+            "train_manifest": str(missing_manifest),
+            "val_manifest": None,
+            "test_manifest": None,
+            "manifest_root": None,
+            "vocab_path": str(PROJECT_ROOT / "dataset" / "vocab.txt"),
+            "loader": {
+                "train_batch_size": 1,
+                "num_workers": 0,
+                "persistent_workers": False,
+                "pin_memory": False,
+                "shuffle_train": True,
+            },
+            "shared_layout": {"discrete_token_count": 16},
+            "dataset": {"metadata_mode": "lazy"},
+            "collate": {"continuous_pad_value": 0.0, "include_attention_mask": True},
+        },
+        "trainer": {"distributed": {"enabled": False}},
+    }
+
+    train_loader, val_loader, test_loader = train._build_data_objects(
+        config,
+        warmup_train_workers=False,
+    )
+
+    assert isinstance(train_loader.dataset, train.LazyPrismDataset)
+    assert val_loader is None
+    assert test_loader is None
+
+
 @pytest.mark.filterwarnings("ignore:GPU available but not used.*")
 def test_lightning_consumes_startup_prefetch_without_resetting_workers(monkeypatch):
     class TinyModule(train.pl.LightningModule):

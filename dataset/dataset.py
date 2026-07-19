@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import os
+import random
 import warnings
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 from utils.dataset_utils import (
     _normalize_split_sample,
@@ -433,6 +434,160 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                 "continuous_prompt": continuous_prompt,
             }
         )
+
+
+class LazyPrismDataset(PrismDataset, IterableDataset[dict[str, torch.Tensor]]):
+    """Stream a manifest lazily without parsing all metadata at startup.
+
+    Every DataLoader worker reads a disjoint byte range of the manifest. This
+    avoids opening, reading, and parsing the full metadata file in the main
+    process before model construction. Train shuffling is provided by a bounded
+    reservoir-style buffer, so it never needs the full manifest in memory.
+    """
+
+    def __init__(
+        self,
+        source: str | Path,
+        *,
+        shuffle_manifest: bool = False,
+        shuffle_buffer_size: int = 256,
+        shuffle_seed: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if not isinstance(source, (str, Path)):
+            raise TypeError("LazyPrismDataset source must be a manifest path.")
+        if shuffle_buffer_size < 1:
+            raise ValueError("shuffle_buffer_size must be >= 1.")
+
+        manifest_root = kwargs.get("manifest_root")
+        # Reuse PrismDataset's tokenizer and sample construction without asking
+        # it to parse the supplied manifest eagerly.
+        super().__init__(source=[], **kwargs)
+        self.manifest_path = self._absolute_path(source)
+        self.manifest_root = (
+            self._absolute_path(manifest_root)
+            if manifest_root is not None
+            else self.manifest_path.parent
+        )
+        self.shuffle_manifest = bool(shuffle_manifest)
+        self.shuffle_buffer_size = int(shuffle_buffer_size)
+        self.shuffle_seed = None if shuffle_seed is None else int(shuffle_seed)
+        self._stream_epoch = 0
+
+    def __len__(self) -> int:
+        # Returning an invented length would make Lightning stop an iterable
+        # stream early. Trainer.max_steps controls training length instead.
+        raise TypeError("LazyPrismDataset has no eager manifest length.")
+
+    @staticmethod
+    def _distributed_shard() -> tuple[int, int]:
+        """Return the process rank/world size without requiring torch.distributed."""
+        try:
+            rank = int(os.environ.get("RANK", "0"))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        except ValueError:
+            return 0, 1
+        if rank < 0 or world_size < 1 or rank >= world_size:
+            return 0, 1
+        return rank, world_size
+
+    def _iter_manifest_entries(
+        self,
+        *,
+        shard_index: int,
+        shard_count: int,
+    ) -> Iterator[ManifestEntry]:
+        assert self.manifest_path is not None
+        try:
+            file_size = self.manifest_path.stat().st_size
+            start = (file_size * shard_index) // shard_count
+            end = (file_size * (shard_index + 1)) // shard_count
+
+            with self.manifest_path.open(
+                "rb",
+                buffering=self.manifest_read_buffer_bytes,
+            ) as handle:
+                if start > 0:
+                    # Discard the partial line containing the shard boundary;
+                    # the following line is owned wholly by this shard.
+                    handle.seek(start - 1)
+                    handle.readline()
+
+                while True:
+                    line_offset = handle.tell()
+                    if line_offset >= end:
+                        break
+                    raw_line = handle.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode("utf-8").strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # The original line number is intentionally not computed:
+                    # doing so would require scanning all preceding metadata.
+                    yield self._parse_manifest_line(line, line_offset)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Manifest file not found: {self.manifest_path}") from exc
+        except IsADirectoryError as exc:
+            raise ValueError(
+                f"Manifest path is a directory, not a file: {self.manifest_path}"
+            ) from exc
+
+    def _shuffle_entries(
+        self,
+        entries: Iterator[ManifestEntry],
+        *,
+        seed: int,
+    ) -> Iterator[ManifestEntry]:
+        if not self.shuffle_manifest or self.shuffle_buffer_size == 1:
+            yield from entries
+            return
+
+        rng = random.Random(seed)
+        buffer: list[ManifestEntry] = []
+        for entry in entries:
+            if len(buffer) < self.shuffle_buffer_size:
+                buffer.append(entry)
+                continue
+            index = rng.randrange(len(buffer))
+            yield buffer[index]
+            buffer[index] = entry
+
+        while buffer:
+            index = rng.randrange(len(buffer))
+            yield buffer.pop(index)
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        worker = get_worker_info()
+        worker_id = 0 if worker is None else worker.id
+        worker_count = 1 if worker is None else worker.num_workers
+        rank, world_size = self._distributed_shard()
+        shard_count = world_size * worker_count
+        shard_index = rank * worker_count + worker_id
+        epoch = self._stream_epoch
+        self._stream_epoch += 1
+
+        if rank == 0 and worker_id == 0:
+            print(
+                "[LazyPrismDataset] Streaming metadata lazily "
+                f"across {shard_count} shard(s), shuffle_buffer_size="
+                f"{self.shuffle_buffer_size if self.shuffle_manifest else 0}.",
+                flush=True,
+            )
+
+        seed_base = self.shuffle_seed
+        if seed_base is None:
+            seed_base = 0 if worker is None else int(worker.seed)
+        entries = self._iter_manifest_entries(
+            shard_index=shard_index,
+            shard_count=shard_count,
+        )
+        shuffled_entries = self._shuffle_entries(
+            entries,
+            seed=seed_base + shard_index + epoch * shard_count,
+        )
+        for entry in shuffled_entries:
+            yield self._build_manifest_sample(entry)
 
 
 class BatchCollate:

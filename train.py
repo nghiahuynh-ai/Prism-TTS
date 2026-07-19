@@ -23,11 +23,16 @@ _PROCESS_START = time.perf_counter()
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from transformers import LlamaConfig
 
 from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism_sample_lengths
-from dataset.dataset import BatchCollate, PrismDataset, build_shared_token_layout
+from dataset.dataset import (
+    BatchCollate,
+    LazyPrismDataset,
+    PrismDataset,
+    build_shared_token_layout,
+)
 from models.prism_tts import PrismTTS
 from models.prism_tts_lightning import PrismTTSLightning
 
@@ -842,16 +847,48 @@ def _build_data_objects(
         ),
     }
 
+    metadata_mode = str(dataset_cfg.get("metadata_mode", "eager")).strip().lower()
+    if metadata_mode not in {"eager", "lazy"}:
+        raise ValueError("data.dataset.metadata_mode must be either 'eager' or 'lazy'.")
+    shuffle_train = bool(loader_cfg.get("shuffle_train", True))
+    metadata_shuffle_buffer_size = int(
+        dataset_cfg.get("metadata_shuffle_buffer_size", 256)
+    )
+    metadata_shuffle_seed_raw = dataset_cfg.get("metadata_shuffle_seed")
+    metadata_shuffle_seed = (
+        None if metadata_shuffle_seed_raw is None else int(metadata_shuffle_seed_raw)
+    )
+
+    def build_manifest_dataset(
+        manifest: str,
+        *,
+        split: str,
+    ) -> PrismDataset | LazyPrismDataset:
+        if metadata_mode == "eager":
+            return PrismDataset(source=manifest, **dataset_kwargs)
+        return LazyPrismDataset(
+            source=manifest,
+            shuffle_manifest=split == "train" and shuffle_train,
+            shuffle_buffer_size=metadata_shuffle_buffer_size,
+            shuffle_seed=metadata_shuffle_seed,
+            **dataset_kwargs,
+        )
+
+    def dataset_size_label(dataset: PrismDataset | LazyPrismDataset) -> str:
+        if isinstance(dataset, IterableDataset):
+            return "streaming metadata"
+        return f"{len(dataset):,} samples"
+
     train_manifest = _optional_path(data_cfg.get("train_manifest"))
     if train_manifest is None:
         raise ValueError("data.train_manifest must be set for training.")
     _t0 = time.perf_counter()
     print(f"[train.py] Loading train manifest: {train_manifest}", flush=True)
     train_start = time.perf_counter()
-    train_dataset = PrismDataset(source=train_manifest, **dataset_kwargs)
+    train_dataset = build_manifest_dataset(train_manifest, split="train")
     print(
         f"[train.py] Train manifest ready in {time.perf_counter() - train_start:.2f}s "
-        f"({len(train_dataset):,} samples).",
+        f"({dataset_size_label(train_dataset)}; metadata_mode={metadata_mode}).",
         flush=True,
     )
 
@@ -860,10 +897,10 @@ def _build_data_objects(
     if val_manifest:
         print(f"[train.py] Loading validation manifest: {val_manifest}", flush=True)
         val_start = time.perf_counter()
-        val_dataset = PrismDataset(source=val_manifest, **dataset_kwargs)
+        val_dataset = build_manifest_dataset(val_manifest, split="val")
         print(
             f"[train.py] Validation manifest ready in {time.perf_counter() - val_start:.2f}s "
-            f"({len(val_dataset):,} samples).",
+            f"({dataset_size_label(val_dataset)}; metadata_mode={metadata_mode}).",
             flush=True,
         )
 
@@ -872,18 +909,18 @@ def _build_data_objects(
     if test_manifest:
         print(f"[train.py] Loading test manifest: {test_manifest}", flush=True)
         test_start = time.perf_counter()
-        test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs)
+        test_dataset = build_manifest_dataset(test_manifest, split="test")
         print(
             f"[train.py] Test manifest ready in {time.perf_counter() - test_start:.2f}s "
-            f"({len(test_dataset):,} samples).",
+            f"({dataset_size_label(test_dataset)}; metadata_mode={metadata_mode}).",
             flush=True,
         )
     print(
         f"[train.py] Datasets built in {time.perf_counter() - _t0:.2f}s "
-        f"(train={len(train_dataset)}"
-        + (f", val={len(val_dataset)}" if val_dataset is not None else "")
-        + (f", test={len(test_dataset)}" if test_dataset is not None else "")
-        + f", load_prompt={dataset_kwargs['load_prompt']})."
+        f"(train={dataset_size_label(train_dataset)}"
+        + (f", val={dataset_size_label(val_dataset)}" if val_dataset is not None else "")
+        + (f", test={dataset_size_label(test_dataset)}" if test_dataset is not None else "")
+        + f", metadata_mode={metadata_mode}, load_prompt={dataset_kwargs['load_prompt']})."
     )
 
     collate = BatchCollate(
@@ -949,7 +986,6 @@ def _build_data_objects(
         common_loader_kwargs["prefetch_factor"] = int(prefetch_factor)
 
     train_batch_size = int(loader_cfg.get("train_batch_size", 8))
-    shuffle_train = bool(loader_cfg.get("shuffle_train", True))
     configured_drop_last_train = bool(loader_cfg.get("drop_last_train", False))
     if configured_drop_last_train:
         print(
@@ -967,6 +1003,11 @@ def _build_data_objects(
     adaptive_enabled = bool(adaptive_cfg.get("enabled", False))
 
     if adaptive_enabled:
+        if isinstance(train_dataset, IterableDataset):
+            raise ValueError(
+                "Adaptive batching requires data.dataset.metadata_mode='eager' because "
+                "it needs every manifest sample length before training starts."
+            )
         target_memory_utilization = float(adaptive_cfg.get("target_memory_utilization", 0.8))
         if target_memory_utilization <= 0.0 or target_memory_utilization > 1.0:
             raise ValueError(
@@ -1048,7 +1089,7 @@ def _build_data_objects(
         train_loader = StartupPrefetchDataLoader(
             train_dataset,
             batch_size=train_batch_size,
-            shuffle=shuffle_train,
+            shuffle=False if isinstance(train_dataset, IterableDataset) else shuffle_train,
             drop_last=drop_last_train,
             **common_loader_kwargs,
         )
@@ -1076,20 +1117,32 @@ def _build_data_objects(
 
     val_loader = None
     if val_dataset is not None:
+        shuffle_val = bool(loader_cfg.get("shuffle_val", False))
+        if isinstance(val_dataset, IterableDataset) and shuffle_val:
+            print(
+                "[train.py] Ignoring data.loader.shuffle_val=true for lazy metadata; "
+                "validation streams in manifest order."
+            )
         val_loader = DataLoader(
             val_dataset,
             batch_size=int(loader_cfg.get("val_batch_size", 8)),
-            shuffle=bool(loader_cfg.get("shuffle_val", False)),
+            shuffle=False if isinstance(val_dataset, IterableDataset) else shuffle_val,
             drop_last=False,
             **common_loader_kwargs,
         )
 
     test_loader = None
     if test_dataset is not None:
+        shuffle_test = bool(loader_cfg.get("shuffle_test", False))
+        if isinstance(test_dataset, IterableDataset) and shuffle_test:
+            print(
+                "[train.py] Ignoring data.loader.shuffle_test=true for lazy metadata; "
+                "test streams in manifest order."
+            )
         test_loader = DataLoader(
             test_dataset,
             batch_size=int(loader_cfg.get("test_batch_size", 8)),
-            shuffle=bool(loader_cfg.get("shuffle_test", False)),
+            shuffle=False if isinstance(test_dataset, IterableDataset) else shuffle_test,
             drop_last=False,
             **common_loader_kwargs,
         )
