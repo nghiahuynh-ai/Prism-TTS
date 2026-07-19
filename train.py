@@ -8,7 +8,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1361,6 +1361,45 @@ def _build_logger(logger_cfg: dict[str, Any]) -> Any:
     )
 
 
+def _checkpoint_config_path(checkpoint_path: Path) -> Path:
+    """Return the same-stem YAML snapshot path for a checkpoint."""
+    return Path(checkpoint_path).with_suffix(".yaml")
+
+
+def _write_checkpoint_config_snapshot(
+    checkpoint_path: Path,
+    config_snapshot: Mapping[str, Any],
+) -> Path:
+    """Atomically save the resolved configuration next to a checkpoint."""
+    checkpoint_path = Path(checkpoint_path)
+    config_path = _checkpoint_config_path(checkpoint_path)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    serialized = yaml.safe_dump(
+        dict(config_snapshot),
+        allow_unicode=True,
+        default_flow_style=False,
+        sort_keys=False,
+    )
+    temporary_path = config_path.with_name(f".{config_path.name}.tmp")
+    temporary_path.write_text(serialized, encoding="utf-8")
+    temporary_path.replace(config_path)
+    return config_path
+
+
+class ConfigSnapshotModelCheckpoint(ModelCheckpoint):
+    """Lightning checkpoint callback that writes a same-stem config snapshot."""
+
+    def __init__(self, *args: Any, config_snapshot: Mapping[str, Any], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.config_snapshot = dict(config_snapshot)
+
+    def _save_checkpoint(self, trainer: Any, filepath: str) -> None:
+        super()._save_checkpoint(trainer, filepath)
+        if bool(getattr(trainer, "is_global_zero", True)):
+            _write_checkpoint_config_snapshot(Path(filepath), self.config_snapshot)
+
+
 def _build_callbacks(config: dict[str, Any]) -> list[Any]:
     trainer_cfg = _require_mapping(config, "trainer")
     lightning_trainer_cfg = _require_mapping(trainer_cfg, "lightning_trainer")
@@ -1402,13 +1441,19 @@ def _build_callbacks(config: dict[str, Any]) -> list[Any]:
             checkpoint_kwargs,
             context="ModelCheckpoint",
         )
-        callbacks.append(ModelCheckpoint(**checkpoint_kwargs))
+        callbacks.append(
+            ConfigSnapshotModelCheckpoint(
+                **checkpoint_kwargs,
+                config_snapshot=config,
+            )
+        )
         if save_every_validation_stage:
             callbacks.append(
                 SaveEveryValidationStageCheckpoint(
                     dirpath=resolved_ckpt_dir,
                     filename=every_val_filename,
                     save_weights_only=every_val_save_weights_only,
+                    config_snapshot=config,
                 )
             )
 
@@ -1432,11 +1477,13 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
         dirpath: Path,
         filename: str,
         save_weights_only: bool,
+        config_snapshot: Mapping[str, Any],
     ) -> None:
         super().__init__()
         self.dirpath = Path(dirpath).expanduser().resolve()
         self.filename = filename
         self.save_weights_only = save_weights_only
+        self.config_snapshot = dict(config_snapshot)
         self._val_stage = 0
 
     def state_dict(self) -> dict[str, Any]:
@@ -1465,6 +1512,7 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
         self.dirpath.mkdir(parents=True, exist_ok=True)
         checkpoint_path = self._next_available_path(self.dirpath / filename)
         trainer.save_checkpoint(str(checkpoint_path), weights_only=self.save_weights_only)
+        _write_checkpoint_config_snapshot(checkpoint_path, self.config_snapshot)
 
     @staticmethod
     def _next_available_path(path: Path) -> Path:

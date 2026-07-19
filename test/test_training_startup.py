@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -48,6 +50,54 @@ def test_experiment_tracking_preserves_explicit_logger_and_checkpoint_overrides(
     assert config["trainer"]["logger"]["name"] == "comparison-run"
     assert config["trainer"]["checkpoint"]["dirpath"] == "checkpoints/comparison"
     assert tracking.checkpoint_dir == tmp_path / "checkpoints" / "comparison"
+
+
+def test_model_checkpoint_saves_same_stem_resolved_config(tmp_path, monkeypatch):
+    checkpoint_path = tmp_path / "prism_tts-step=0000100.ckpt"
+    config = {"experiment": {"name": "meanflow"}, "trainer": {"max_steps": 100}}
+
+    def fake_save_checkpoint(self, trainer, filepath):
+        del self, trainer
+        Path(filepath).write_bytes(b"checkpoint")
+
+    monkeypatch.setattr(train.ModelCheckpoint, "_save_checkpoint", fake_save_checkpoint)
+    callback = train.ConfigSnapshotModelCheckpoint(
+        dirpath=tmp_path,
+        config_snapshot=config,
+    )
+    callback._save_checkpoint(SimpleNamespace(is_global_zero=True), str(checkpoint_path))
+
+    assert checkpoint_path.read_bytes() == b"checkpoint"
+    assert train._checkpoint_config_path(checkpoint_path) == checkpoint_path.with_suffix(".yaml")
+    assert yaml.safe_load(checkpoint_path.with_suffix(".yaml").read_text()) == config
+
+
+def test_validation_stage_checkpoint_saves_same_stem_resolved_config(tmp_path):
+    saved_paths: list[Path] = []
+
+    class FakeTrainer:
+        sanity_checking = False
+        is_global_zero = True
+        global_step = 100
+        current_epoch = 2
+
+        def save_checkpoint(self, path, weights_only):
+            assert not weights_only
+            checkpoint_path = Path(path)
+            checkpoint_path.write_bytes(b"checkpoint")
+            saved_paths.append(checkpoint_path)
+
+    config = {"experiment": {"name": "meanflow"}, "model": {"name": "prism_tts"}}
+    callback = train.SaveEveryValidationStageCheckpoint(
+        dirpath=tmp_path,
+        filename="prism_tts-val-stage={val_stage:05d}-step={step:07d}",
+        save_weights_only=False,
+        config_snapshot=config,
+    )
+    callback.on_validation_end(FakeTrainer(), None)
+
+    assert len(saved_paths) == 1
+    assert yaml.safe_load(saved_paths[0].with_suffix(".yaml").read_text()) == config
 
 
 def test_train_model_builder_honors_meanflow_and_memory_options():

@@ -70,6 +70,7 @@ trainer:
     enable_model_summary: true
 
   checkpoint:
+    # A resolved same-stem .yaml config snapshot is saved beside every .ckpt.
     dirpath: checkpoints
     filename: prism_tts-{step:07d}
     monitor: val/loss
