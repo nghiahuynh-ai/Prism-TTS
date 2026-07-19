@@ -1127,9 +1127,20 @@ def _build_data_objects(
                 "data.loader.adaptive_batching.reference_length_quantile must be in (0, 1]."
             )
 
+        estimate_start = time.perf_counter()
+        print(
+            f"[train.py] Estimating sample lengths for adaptive batching "
+            f"({len(train_dataset):,} samples)...",
+            flush=True,
+        )
         sample_lengths = estimate_prism_sample_lengths(
             train_dataset,
             codec_frame_rate_hz=float(collate_cfg.get("codec_frame_rate_hz", 12.5)),
+        )
+        print(
+            f"[train.py] Sample-length estimation done in "
+            f"{time.perf_counter() - estimate_start:.2f}s.",
+            flush=True,
         )
 
         reference_length = _length_quantile(sample_lengths, reference_quantile)

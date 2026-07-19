@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import math
+import os
 import random
+import re
+from array import array
 from collections.abc import Mapping, Sequence
-from typing import Any
+from pathlib import Path
+from typing import Any, Optional
 
+import numpy as np
 from torch.utils.data import Sampler
 
 
@@ -65,6 +70,162 @@ def _safe_2d_length(value: Any, *, field_name: str) -> int:
     raise ValueError(f"Unsupported {field_name} value type: {type(value).__name__}.")
 
 
+def _compile_vocab_char_pattern(char_to_id: Mapping[str, int]) -> Optional[re.Pattern[str]]:
+    """Build a character-class regex matching vocab chars, for C-speed counting."""
+    chars = [c for c in char_to_id.keys() if isinstance(c, str) and len(c) == 1]
+    if not chars or len(chars) != len(char_to_id):
+        return None
+    return re.compile("[" + re.escape("".join(chars)) + "]")
+
+
+_LENGTH_CACHE_VERSION = 1
+
+
+def _length_cache_path(manifest_path: Path) -> Path:
+    return manifest_path.with_name(manifest_path.name + ".prism-lengths.npz")
+
+
+def _length_cache_disabled() -> bool:
+    return os.environ.get("PRISM_TTS_DISABLE_LENGTH_CACHE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _load_cached_lengths(
+    manifest_path: Path,
+    *,
+    manifest_stat: os.stat_result,
+    codec_frame_rate_hz: float,
+    append_eos: bool,
+    vocab_size: int,
+) -> Optional[list[int]]:
+    cache_path = _length_cache_path(manifest_path)
+    try:
+        with np.load(cache_path) as data:
+            if (
+                int(data["version"][()]) != _LENGTH_CACHE_VERSION
+                or int(data["manifest_size"][()]) != int(manifest_stat.st_size)
+                or int(data["manifest_mtime_ns"][()]) != int(manifest_stat.st_mtime_ns)
+                or float(data["codec_frame_rate_hz"][()]) != float(codec_frame_rate_hz)
+                or bool(data["append_eos"][()]) != bool(append_eos)
+                or int(data["vocab_size"][()]) != int(vocab_size)
+            ):
+                return None
+            lengths = data["lengths"].astype(np.int64).tolist()
+    except Exception:
+        return None
+    print(
+        f"[adaptive_batching] Loaded {len(lengths):,} cached sample lengths "
+        f"from {cache_path}.",
+        flush=True,
+    )
+    return lengths
+
+
+def _save_cached_lengths(
+    manifest_path: Path,
+    lengths: Sequence[int],
+    *,
+    manifest_stat: os.stat_result,
+    codec_frame_rate_hz: float,
+    append_eos: bool,
+    vocab_size: int,
+) -> None:
+    cache_path = _length_cache_path(manifest_path)
+    tmp_path = cache_path.with_name(f"{cache_path.name}.{os.getpid()}.tmp.npz")
+    try:
+        np.savez(
+            tmp_path,
+            version=_LENGTH_CACHE_VERSION,
+            manifest_size=int(manifest_stat.st_size),
+            manifest_mtime_ns=int(manifest_stat.st_mtime_ns),
+            codec_frame_rate_hz=float(codec_frame_rate_hz),
+            append_eos=bool(append_eos),
+            vocab_size=int(vocab_size),
+            lengths=np.asarray(lengths, dtype=np.int32),
+        )
+        os.replace(tmp_path, cache_path)
+    except OSError as exc:
+        print(
+            f"[adaptive_batching] Could not cache sample lengths to {cache_path}: {exc}",
+            flush=True,
+        )
+        return
+    print(
+        f"[adaptive_batching] Cached {len(lengths):,} sample lengths to {cache_path}.",
+        flush=True,
+    )
+
+
+def _stream_estimate_lengths_from_manifest(
+    manifest_path: Path,
+    *,
+    char_to_id: Mapping[str, int],
+    append_eos: bool,
+    codec_frame_rate_hz: float,
+    read_buffer_bytes: int,
+    progress_every: int,
+) -> list[int]:
+    """Estimate lengths in one sequential manifest read with a light line parse.
+
+    Only `duration` and `transcript` are needed, so this avoids the per-line
+    seek + full ManifestEntry parse of `iter_manifest_entries`, which takes
+    many silent minutes on multi-million-line network manifests.
+    """
+    pattern = _compile_vocab_char_pattern(char_to_id)
+    lengths: list[int] = []
+    with manifest_path.open(
+        "r",
+        encoding="utf-8",
+        buffering=max(8192, int(read_buffer_bytes)),
+    ) as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("|")
+            if len(parts) < 3:
+                raise ValueError(
+                    f"Manifest line {line_number} in {manifest_path} has only "
+                    f"{len(parts)} '|'-separated fields; length estimation needs "
+                    "at least file_name|duration|transcript."
+                )
+            try:
+                duration = float(parts[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Manifest line {line_number} in {manifest_path} has a "
+                    f"non-numeric duration field: {parts[1]!r}."
+                ) from exc
+            # _parse_manifest_line strips every field; mirror it so estimated
+            # text lengths match what the dataset will actually tokenize.
+            transcript = parts[2].strip()
+            if pattern is not None:
+                text_len = len(pattern.findall(transcript))
+            else:
+                text_len = sum(1 for ch in transcript if ch in char_to_id)
+            if append_eos:
+                text_len += 1
+            lengths.append(
+                _estimate_concat_sequence_length(
+                    text_target_length=max(1, text_len),
+                    speech_target_length=_estimate_discrete_length(
+                        duration, codec_frame_rate_hz
+                    ),
+                )
+            )
+            if progress_every > 0 and line_number % progress_every == 0:
+                print(
+                    f"[adaptive_batching] Estimated lengths for {line_number:,} "
+                    f"manifest lines ({len(lengths):,} samples) from {manifest_path}.",
+                    flush=True,
+                )
+    return lengths
+
+
 def estimate_prism_sample_lengths(
     dataset: Any,
     *,
@@ -103,6 +264,63 @@ def estimate_prism_sample_lengths(
                     text_target_length=text_target_len,
                     speech_target_length=target_frame_len,
                 )
+            )
+        return lengths
+
+    manifest_path = getattr(dataset, "manifest_path", None)
+    if (
+        manifest_path is not None
+        and tokenizer is not None
+        and isinstance(getattr(tokenizer, "char_to_id", None), Mapping)
+    ):
+        manifest_path = Path(manifest_path)
+        char_to_id = tokenizer.char_to_id
+        append_eos = bool(getattr(tokenizer, "append_eos", False))
+        expected_count: Optional[int] = None
+        try:
+            expected_count = len(dataset)
+        except TypeError:
+            pass
+
+        manifest_stat = manifest_path.stat()
+        cache_enabled = not _length_cache_disabled()
+        if cache_enabled:
+            cached = _load_cached_lengths(
+                manifest_path,
+                manifest_stat=manifest_stat,
+                codec_frame_rate_hz=codec_frame_rate_hz,
+                append_eos=append_eos,
+                vocab_size=len(char_to_id),
+            )
+            if cached is not None and (
+                expected_count is None or len(cached) == expected_count
+            ):
+                return cached
+
+        lengths = _stream_estimate_lengths_from_manifest(
+            manifest_path,
+            char_to_id=char_to_id,
+            append_eos=append_eos,
+            codec_frame_rate_hz=codec_frame_rate_hz,
+            read_buffer_bytes=int(
+                getattr(dataset, "manifest_read_buffer_bytes", 4 * 1024 * 1024)
+            ),
+            progress_every=int(getattr(dataset, "manifest_progress_every", 0)),
+        )
+        if expected_count is not None and len(lengths) != expected_count:
+            raise ValueError(
+                f"Estimated {len(lengths)} sample lengths from {manifest_path} but the "
+                f"dataset reports {expected_count} samples; the manifest appears to "
+                "have changed since it was indexed."
+            )
+        if cache_enabled:
+            _save_cached_lengths(
+                manifest_path,
+                lengths,
+                manifest_stat=manifest_stat,
+                codec_frame_rate_hz=codec_frame_rate_hz,
+                append_eos=append_eos,
+                vocab_size=len(char_to_id),
             )
         return lengths
 
@@ -187,14 +405,17 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int]]):
                 "all training samples must be used."
             )
 
-        normalized_lengths = [max(1, int(length)) for length in sample_lengths]
-        self.sample_lengths = normalized_lengths
+        # Compact typed storage: a Python list of ints costs ~36 bytes/sample
+        # (and is copied into every forked DataLoader worker); at multi-million
+        # sample manifests that is hundreds of MB.
+        self.sample_lengths = array("I", (max(1, int(length)) for length in sample_lengths))
         self.target_batch_cost = int(target_batch_cost)
         self.max_batch_size = int(max_batch_size)
         self.shuffle = bool(shuffle)
         self.drop_last = False
         self.seed = int(seed)
         self._epoch = 0
+        self._cached_len: Optional[int] = None
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
@@ -243,5 +464,8 @@ class AdaptiveMemoryBatchSampler(Sampler[list[int]]):
             yield batch
 
     def __len__(self) -> int:
-        ordered = list(range(len(self.sample_lengths)))
-        return len(self._build_batches(ordered))
+        # Deterministic (unshuffled order), and Lightning queries it repeatedly;
+        # rebuilding every batch per call is an O(dataset) pass each time.
+        if self._cached_len is None:
+            self._cached_len = len(self._build_batches(range(len(self.sample_lengths))))
+        return self._cached_len
