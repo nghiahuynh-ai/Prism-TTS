@@ -13,6 +13,43 @@ if str(PROJECT_ROOT) not in sys.path:
 import train
 
 
+def _tracking_config(*, experiment_name: str) -> dict:
+    return {
+        "experiment": {"name": experiment_name},
+        "trainer": {
+            "logger": {"type": "csv", "name": None, "save_dir": "logs"},
+            "checkpoint": {"dirpath": "checkpoints"},
+        },
+    }
+
+
+def test_experiment_name_scopes_default_logger_and_checkpoint_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = _tracking_config(experiment_name="meanflow / ablation 1")
+
+    tracking = train._apply_experiment_tracking_defaults(config)
+
+    assert tracking.name == "meanflow / ablation 1"
+    assert tracking.artifact_name == "meanflow-ablation-1"
+    assert config["trainer"]["logger"]["name"] == "meanflow-ablation-1"
+    assert config["trainer"]["checkpoint"]["dirpath"] == "checkpoints/meanflow-ablation-1"
+    assert tracking.checkpoint_dir == tmp_path / "checkpoints" / "meanflow-ablation-1"
+
+
+def test_experiment_tracking_preserves_explicit_logger_and_checkpoint_overrides(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    config = _tracking_config(experiment_name="meanflow")
+    config["trainer"]["logger"]["name"] = "comparison-run"
+    config["trainer"]["checkpoint"]["dirpath"] = "checkpoints/comparison"
+
+    tracking = train._apply_experiment_tracking_defaults(config)
+
+    assert tracking.artifact_name == "meanflow"
+    assert config["trainer"]["logger"]["name"] == "comparison-run"
+    assert config["trainer"]["checkpoint"]["dirpath"] == "checkpoints/comparison"
+    assert tracking.checkpoint_dir == tmp_path / "checkpoints" / "comparison"
+
+
 def test_train_model_builder_honors_meanflow_and_memory_options():
     config = {
         "model": {

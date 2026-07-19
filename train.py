@@ -5,6 +5,7 @@ import importlib
 import inspect
 import math
 import os
+import re
 import shutil
 import time
 from collections.abc import Sequence
@@ -294,6 +295,15 @@ class ResolvedConfigs:
     experiment_config_path: Path
 
 
+@dataclass(frozen=True)
+class ExperimentTracking:
+    """Resolved names and locations used to keep experiment artifacts separate."""
+
+    name: str
+    artifact_name: str
+    checkpoint_dir: Path
+
+
 def _resolve_config_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
     experiment_path = args.experiment_config.expanduser()
     if not experiment_path.is_absolute():
@@ -350,6 +360,69 @@ def _load_merged_configs(args: argparse.Namespace) -> ResolvedConfigs:
         model_config_path=model_path,
         data_config_path=data_path,
         experiment_config_path=experiment_path,
+    )
+
+
+def _experiment_name(config: dict[str, Any]) -> str:
+    """Return the configured experiment name, falling back to a stable default."""
+    experiment_cfg = config.get("experiment")
+    value: Any = None
+    if isinstance(experiment_cfg, dict):
+        value = experiment_cfg.get("name")
+    if value is None:
+        # ``_load_merged_configs`` also merges the nested experiment mapping at
+        # the root for backwards compatibility with the existing YAML layout.
+        value = config.get("name")
+
+    if value is None:
+        return "prism_tts"
+    if not isinstance(value, str) or value.strip() == "":
+        raise ValueError("experiment.name must be a non-empty string when configured.")
+    return value.strip()
+
+
+def _experiment_artifact_name(experiment_name: str) -> str:
+    """Convert an experiment label into a safe, stable single directory name."""
+    artifact_name = re.sub(r"[^\w.-]+", "-", experiment_name, flags=re.UNICODE)
+    artifact_name = artifact_name.strip(".-")
+    if artifact_name == "":
+        raise ValueError(
+            "experiment.name must include at least one letter, number, underscore, or hyphen "
+            "to create its artifact directory."
+        )
+    return artifact_name
+
+
+def _apply_experiment_tracking_defaults(config: dict[str, Any]) -> ExperimentTracking:
+    """Namespace default logging and checkpoints by ``experiment.name``.
+
+    Experiment YAMLs may still provide explicit ``trainer.logger.name`` or
+    ``trainer.checkpoint.dirpath`` values.  When omitted, this mirrors the
+    v2.2 convention (one named run and one checkpoint directory per
+    experiment) without making users repeat the experiment name in two places.
+    """
+    experiment_name = _experiment_name(config)
+    artifact_name = _experiment_artifact_name(experiment_name)
+    trainer_cfg = _require_mapping(config, "trainer")
+    logger_cfg = _require_mapping(trainer_cfg, "logger")
+    checkpoint_cfg = _require_mapping(trainer_cfg, "checkpoint")
+
+    if _maybe_str(logger_cfg.get("name")) is None:
+        # CSV/TensorBoard logger names become path components, so use the
+        # filesystem-safe form rather than the display label.
+        logger_cfg["name"] = artifact_name
+
+    configured_dirpath = checkpoint_cfg.get("dirpath")
+    if configured_dirpath is None or str(configured_dirpath).strip() in {"", "checkpoints"}:
+        checkpoint_cfg["dirpath"] = str(Path("checkpoints") / artifact_name)
+
+    checkpoint_dir = Path(str(checkpoint_cfg["dirpath"])).expanduser()
+    if not checkpoint_dir.is_absolute():
+        checkpoint_dir = Path.cwd() / checkpoint_dir
+    return ExperimentTracking(
+        name=experiment_name,
+        artifact_name=artifact_name,
+        checkpoint_dir=checkpoint_dir.resolve(),
     )
 
 
@@ -1239,7 +1312,7 @@ def _build_logger(logger_cfg: dict[str, Any]) -> Any:
     if logger_type == "wandb":
         if WandbLogger is None:
             print("[train.py] WandB logger requested but unavailable. Falling back to CSV logger.")
-            return CSVLogger(save_dir=save_dir, name="prism_tts")
+            return CSVLogger(save_dir=save_dir, name=logger_cfg.get("name", "prism_tts"))
         kwargs = {
             "project": logger_cfg.get("project"),
             "name": logger_cfg.get("name"),
@@ -1625,6 +1698,12 @@ def run(args: argparse.Namespace, *, process_start: float | None = None) -> None
             "'backend:cudaMallocAsync' to avoid NVML-related allocator assertions."
         )
     _apply_wandb_cli_overrides(config, args)
+    tracking = _apply_experiment_tracking_defaults(config)
+    print(
+        f"[train.py] Experiment '{tracking.name}': "
+        f"logs='{_require_mapping(_require_mapping(config, 'trainer'), 'logger').get('name')}', "
+        f"checkpoints='{tracking.checkpoint_dir}'."
+    )
 
     _validate_config_consistency(config)
     _apply_distributed_training_config(config)

@@ -24,9 +24,10 @@ endif
 
 CKPT ?=
 
-# Defaults aligned with config/experiment.yaml
+# Configuration supplies the experiment-specific run name and checkpoint
+# directory. Set WANDB_NAME explicitly only when overriding that run name.
 WANDB_PROJECT ?= prism_tts
-WANDB_NAME ?= v2.2-meanflow
+WANDB_NAME ?=
 WANDB_SAVE_DIR ?= logs
 WANDB_OFFLINE ?= false
 WANDB_LOG_MODEL ?= false
@@ -99,7 +100,7 @@ help:
 	@echo "  MODEL_CONFIG=...       Override model config"
 	@echo "  DATA_CONFIG=...        Override data config"
 	@echo "  WANDB_PROJECT=...      WandB project (default: prism_tts)"
-	@echo "  WANDB_NAME=...         WandB run name (default: baseline_local)"
+	@echo "  WANDB_NAME=...         Override the experiment's WandB run name"
 	@echo "  WANDB_SAVE_DIR=...     WandB save dir (default: logs)"
 	@echo "  WANDB_OFFLINE=true     WandB offline mode (default: false)"
 	@echo "  WANDB_LOG_MODEL=...    WandB log_model (default: false)"

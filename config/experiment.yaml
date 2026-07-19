@@ -6,18 +6,13 @@ experiment:
     model: config/model.yaml
     data: config/data.yaml
 
-  # Free-form experiment name (used for logging/checkpoint naming below).
-  name: prism_tts
+  # Used as the default logger run name and checkpoint subdirectory. Explicit
+  # trainer.logger.name or trainer.checkpoint.dirpath values override it.
+  name: v2.2-meanflow
 
   # Keep trainer defaults in config/trainer.yaml and override only
   # experiment-specific values here.
   trainer:
-    logger:
-      name: v2.2-meanflow
-
-    checkpoint:
-      dirpath: checkpoints/v2.2-meanflow
-
     distributed:
       enabled: true
 
