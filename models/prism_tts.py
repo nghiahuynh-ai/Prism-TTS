@@ -798,6 +798,7 @@ class PrismTTS(nn.Module):
         raw_text_target: str | Sequence[str],
         *,
         raw_speech_condition: Any | list[Any] | None = None,
+        raw_text_prompt: str | Sequence[Optional[str]] | None = None,
         text_tokenizer: Optional[Callable[[str], Sequence[int]]] = None,
         speech_encoder: Optional[Callable[[Any], torch.Tensor]] = None,
         speech_decoder: Optional[Callable[[torch.Tensor], Any]] = None,
@@ -814,6 +815,10 @@ class PrismTTS(nn.Module):
 
         The optional reference clip (`raw_speech_condition`) seeds the in-context
         condition frames for zeroshot voice cloning; without it this is plain TTS.
+        When a reference clip is given, pass its transcript as `raw_text_prompt` so
+        the assembled sequence matches the training layout
+        (text_prompt + text_target -> EOT -> [condition frames] -> [generated]);
+        condition frames without their transcript are out-of-distribution.
         """
         output_type_normalized = str(output_type).strip().lower()
         if output_type_normalized not in ("tensor", "speech"):
@@ -830,6 +835,17 @@ class PrismTTS(nn.Module):
             speech_condition_list = [raw_speech_condition]
         if len(speech_condition_list) != batch_size:
             raise ValueError("raw_speech_condition batch size must match raw_text_target.")
+
+        if raw_text_prompt is None:
+            prompt_text_list: list[str] = [""] * batch_size
+        elif isinstance(raw_text_prompt, str):
+            prompt_text_list = [raw_text_prompt]
+        else:
+            prompt_text_list = ["" if item is None else item for item in raw_text_prompt]
+            if not all(isinstance(item, str) for item in prompt_text_list):
+                raise ValueError("raw_text_prompt must contain only strings (or None).")
+        if len(prompt_text_list) != batch_size:
+            raise ValueError("raw_text_prompt batch size must match raw_text_target.")
 
         params = list(self.parameters())
         if len(params) == 0:
@@ -873,8 +889,19 @@ class PrismTTS(nn.Module):
         target_token_lists: list[list[int]] = []
         continuous_list: list[Optional[torch.FloatTensor]] = []
         for sample_idx in range(batch_size):
+            prompt_text = prompt_text_list[sample_idx]
+            prompt_tokens = (
+                [int(tok) for tok in text_tokenizer(prompt_text)] if prompt_text else []
+            )
+            if prompt_tokens and speech_condition_list[sample_idx] is None:
+                raise ValueError(
+                    f"raw_text_prompt was given for sample {sample_idx} without a "
+                    "matching raw_speech_condition; the prompt transcript must "
+                    "describe the reference audio's condition frames."
+                )
             target_token_lists.append(
-                [int(tok) for tok in text_tokenizer(target_text_list[sample_idx])]
+                prompt_tokens
+                + [int(tok) for tok in text_tokenizer(target_text_list[sample_idx])]
             )
             raw_condition = speech_condition_list[sample_idx]
             if raw_condition is None:

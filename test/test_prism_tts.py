@@ -350,6 +350,53 @@ def test_generate_e2e_tensor_with_injected_components():
     assert torch.isfinite(gen.continuous_latents).all()
 
 
+def test_generate_e2e_prepends_prompt_transcript():
+    torch.manual_seed(0)
+    model = build_tiny_model().eval()
+
+    tokenized_texts: list[str] = []
+
+    def fake_tokenizer(text: str):
+        tokenized_texts.append(text)
+        return [TEXT_OFFSET + (ord(c) % 20) for c in text][:6] or [TEXT_OFFSET]
+
+    def fake_encoder(_prompt):
+        return torch.randn(3, CONTINUOUS_DIM)
+
+    gen = model.generate_e2e(
+        raw_text_target="world",
+        raw_speech_condition=object(),
+        raw_text_prompt="hello",
+        text_tokenizer=fake_tokenizer,
+        speech_encoder=fake_encoder,
+        output_type="tensor",
+        return_dict=True,
+        max_new_frames=4,
+        eos_threshold=2.0,
+    )
+    assert tokenized_texts == ["hello", "world"]
+    # text_ids carries prompt + target tokens (5 chars each under fake_tokenizer).
+    assert gen.text_ids.shape == (1, 10)
+    assert gen.continuous_latents.shape == (1, 4, CONTINUOUS_DIM)
+    assert torch.isfinite(gen.continuous_latents).all()
+
+
+def test_generate_e2e_rejects_prompt_without_condition():
+    model = build_tiny_model().eval()
+
+    def fake_tokenizer(text: str):
+        return [TEXT_OFFSET + (ord(c) % 20) for c in text][:6] or [TEXT_OFFSET]
+
+    with pytest.raises(ValueError, match="raw_text_prompt"):
+        model.generate_e2e(
+            raw_text_target="world",
+            raw_text_prompt="hello",
+            text_tokenizer=fake_tokenizer,
+            output_type="tensor",
+            max_new_frames=2,
+        )
+
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     build_config_model().eval()

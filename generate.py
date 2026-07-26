@@ -176,9 +176,12 @@ def main() -> None:
     if max_new_frames < 1:
         raise ValueError("--max-new-frames must be >= 1.")
 
-    text_prompt = prompt_text_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
+    # Prepend the prompt transcript so the text section covers the condition
+    # frames, matching the training layout:
+    # text_prompt + text_target -> EOT -> [condition frames] -> [generated].
+    full_text_tokens = torch.cat([prompt_text_tokens, target_text_tokens], dim=0)
+    text_target = full_text_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
     continuous_prompt = raw_prompt_continuous.unsqueeze(0).to(device=device, dtype=model_dtype)
-    text_target = target_text_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
 
     generate_kwargs: dict = {"max_new_frames": int(max_new_frames)}
     if args.eos_threshold is not None:
@@ -187,7 +190,8 @@ def main() -> None:
         generate_kwargs["num_sample_steps"] = int(args.sample_steps)
 
     # Single-utterance layout: the reference audio seeds the in-context condition
-    # frames (zeroshot voice), and `text` is the utterance to synthesize.
+    # frames (zeroshot voice); the text section is the prompt transcript followed
+    # by the target text, so generation continues the reference into `text`.
     with torch.no_grad():
         generation = model.generate(
             text_target=text_target,
