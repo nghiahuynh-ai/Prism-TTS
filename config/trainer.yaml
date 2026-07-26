@@ -16,7 +16,7 @@ trainer:
     # cycle-held tensors and inactive allocator blocks that accumulate from
     # variable-length batches. Every step would force a device sync per step
     # for no extra benefit. Set 0 to disable.
-    cuda_cache_cleanup_every_n_steps: 100
+    cuda_cache_cleanup_every_n_steps: 0
     # Keep startup fast: the Mimi decoder is only needed for media logging, not
     # the train loss, so defer loading it to the first media decode.
     audio_decoder_lazy: true
