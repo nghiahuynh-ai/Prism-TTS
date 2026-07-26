@@ -8,10 +8,18 @@ trainer:
     learning_rate: 1.0e-4
     weight_decay: 0.01
     betas: [0.9, 0.95]
-    eval_every_n_steps: 25000
+    eval_every_n_steps: 100000
     audio_sample_rate: 24000
     max_audio_samples: 2
     log_media_on_validation_end: true
+    # Periodically run gc.collect() + torch.cuda.empty_cache() to release
+    # cycle-held tensors and inactive allocator blocks that accumulate from
+    # variable-length batches. Every step would force a device sync per step
+    # for no extra benefit. Set 0 to disable.
+    cuda_cache_cleanup_every_n_steps: 100
+    # Keep startup fast: the Mimi decoder is only needed for media logging, not
+    # the train loss, so defer loading it to the first media decode.
+    audio_decoder_lazy: true
     audio_decoder: models.mimi_latent_decoder.MimiPreUpsampleLatentDecoder
     audio_decoder_kwargs:
       pretrained_model_name_or_path: kyutai/mimi
@@ -35,6 +43,10 @@ trainer:
 
   optimizer:
     name: adamw
+    # The foreach implementation uses about one extra model-sized temporary
+    # tensor list during optimizer.step. The scalar loop trades some speed for a
+    # substantially lower peak, which matters under fragmentation-prone batches.
+    foreach: false
 
   scheduler:
     name: cosine_with_warmup
@@ -47,14 +59,16 @@ trainer:
     devices: 1
     strategy: auto
     precision: bf16-mixed
-    max_steps: 1000000
+    max_steps: 2000000
     min_steps: 0
     gradient_clip_val: 1.0
     # With train_batch_size=2, this keeps effective batch ~= 8.
     accumulate_grad_batches: 1
     log_every_n_steps: 10
-    val_check_interval: 25000
-    num_sanity_val_steps: 2
+    val_check_interval: 100000
+    # Avoid validation/model-media setup (and loading the audio decoder) before
+    # the first train batch, which otherwise inflates time-to-first-step.
+    num_sanity_val_steps: 0
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     benchmark: true
@@ -70,7 +84,7 @@ trainer:
     mode: min
     save_top_k: 3
     save_last: true
-    every_n_train_steps: 25000
+    every_n_train_steps: 100000
     save_every_validation_stage: true
     every_val_filename: prism_tts-val-stage={val_stage:05d}-step={step:07d}
     every_val_save_weights_only: false

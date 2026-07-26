@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -55,12 +56,14 @@ class PrismTTSLightning(pl.LightningModule):
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
         betas: tuple[float, float] = (0.9, 0.95),
+        optimizer_foreach: bool = False,
         eval_every_n_steps: int = 5000,
         scheduler_factory: Optional[SchedulerFactory] = None,
         audio_decoder: Optional[AudioDecoder] = None,
         audio_sample_rate: int = 24_000,
         max_audio_samples: int = 2,
         log_media_on_validation_end: bool = True,
+        cuda_cache_cleanup_every_n_steps: int = 100,
         ema_decay: float = 0.999,
         ema_start_step: int = 0,
         ema_update_every_n_steps: int = 1,
@@ -76,6 +79,8 @@ class PrismTTSLightning(pl.LightningModule):
             raise ValueError("audio_sample_rate must be >= 1.")
         if max_audio_samples < 1:
             raise ValueError("max_audio_samples must be >= 1.")
+        if cuda_cache_cleanup_every_n_steps < 0:
+            raise ValueError("cuda_cache_cleanup_every_n_steps must be >= 0.")
         if not (0.0 < ema_decay < 1.0):
             raise ValueError("ema_decay must be in (0, 1).")
         if ema_start_step < 0:
@@ -89,6 +94,7 @@ class PrismTTSLightning(pl.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.betas = betas
+        self.optimizer_foreach = bool(optimizer_foreach)
         self.eval_every_n_steps = eval_every_n_steps
         self.scheduler_factory = scheduler_factory
         self.audio_decoder = audio_decoder
@@ -98,6 +104,7 @@ class PrismTTSLightning(pl.LightningModule):
         self.audio_sample_rate = audio_sample_rate
         self.max_audio_samples = max_audio_samples
         self.log_media_on_validation_end = log_media_on_validation_end
+        self.cuda_cache_cleanup_every_n_steps = int(cuda_cache_cleanup_every_n_steps)
         self.ema_decay = ema_decay
         self.ema_start_step = ema_start_step
         self.ema_update_every_n_steps = ema_update_every_n_steps
@@ -112,6 +119,7 @@ class PrismTTSLightning(pl.LightningModule):
         self._train_loader_iter: Optional[Iterator[Any]] = None
         self._cached_text_id_to_char: Optional[dict[int, str]] = None
         self._periodic_eval_active = False
+        self._last_cuda_cache_cleanup_step = -1
         self._ema_state: dict[str, torch.Tensor] = {}
         self._ema_updates = 0
         self._last_ema_step = -1
@@ -122,10 +130,12 @@ class PrismTTSLightning(pl.LightningModule):
                 "learning_rate": learning_rate,
                 "weight_decay": weight_decay,
                 "betas": betas,
+                "optimizer_foreach": optimizer_foreach,
                 "eval_every_n_steps": eval_every_n_steps,
                 "audio_sample_rate": audio_sample_rate,
                 "max_audio_samples": max_audio_samples,
                 "log_media_on_validation_end": log_media_on_validation_end,
+                "cuda_cache_cleanup_every_n_steps": cuda_cache_cleanup_every_n_steps,
                 "ema_decay": ema_decay,
                 "ema_start_step": ema_start_step,
                 "ema_update_every_n_steps": ema_update_every_n_steps,
@@ -145,6 +155,7 @@ class PrismTTSLightning(pl.LightningModule):
             lr=self.learning_rate,
             betas=self.betas,
             weight_decay=self.weight_decay,
+            foreach=self.optimizer_foreach,
         )
         if self.scheduler_factory is None:
             return optimizer
@@ -280,6 +291,7 @@ class PrismTTSLightning(pl.LightningModule):
     def on_train_batch_end(self, outputs: Any, batch: Any, batch_idx: int) -> None:
         del outputs, batch_idx
         self._maybe_update_ema()
+        self._maybe_cleanup_cuda_cache(step=int(self.global_step))
         if self._periodic_eval_active:
             return
         trainer = self.trainer
@@ -482,6 +494,59 @@ class PrismTTSLightning(pl.LightningModule):
         if trainer is None or not trainer.optimizers:
             return None
         return float(trainer.optimizers[0].param_groups[0]["lr"])
+
+    def _maybe_cleanup_cuda_cache(self, *, step: int) -> None:
+        interval = self.cuda_cache_cleanup_every_n_steps
+        if (
+            interval < 1
+            or step < 1
+            or step % interval != 0
+            or step == self._last_cuda_cache_cleanup_step
+            or not torch.cuda.is_available()
+        ):
+            return
+
+        # Variable-length training batches fragment the CUDA caching allocator, so
+        # reserved memory ratchets up across steps. gc.collect() first breaks any
+        # reference cycles holding CUDA tensors (they are invisible to empty_cache
+        # until the Python GC frees them), then empty_cache releases inactive
+        # blocks back to the driver. Doing this every step would force a device
+        # sync per step for no extra benefit.
+        gc.collect()
+        gib = float(1024**3)
+        allocated_gib = float(torch.cuda.memory_allocated()) / gib
+        reserved_before_gib = float(torch.cuda.memory_reserved()) / gib
+        torch.cuda.empty_cache()
+        reserved_after_gib = float(torch.cuda.memory_reserved()) / gib
+        self._last_cuda_cache_cleanup_step = step
+
+        self.log(
+            "train/cuda_allocated_gib",
+            allocated_gib,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+            sync_dist=False,
+        )
+        self.log(
+            "train/cuda_reserved_gib",
+            reserved_after_gib,
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+            sync_dist=False,
+        )
+        self.log(
+            "train/cuda_cache_released_gib",
+            max(0.0, reserved_before_gib - reserved_after_gib),
+            prog_bar=False,
+            on_step=True,
+            on_epoch=False,
+            batch_size=1,
+            sync_dist=False,
+        )
 
     def _run_periodic_eval(self, train_batch: Optional[Any] = None) -> None:
         eval_batch = self._next_eval_batch()

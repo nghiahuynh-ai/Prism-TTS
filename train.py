@@ -6,15 +6,23 @@ import inspect
 import math
 import os
 import shutil
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 _DEFAULTED_CUDA_ALLOC_CONF = False
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "backend:cudaMallocAsync"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "expandable_segments:True,garbage_collection_threshold:0.8"
+    )
     _DEFAULTED_CUDA_ALLOC_CONF = True
+
+# Process-level timestamp so the startup report includes expensive imports
+# (torch, transformers, Lightning), which happen before ``run``.
+_PROCESS_START = time.perf_counter()
 
 import torch
 from torch.optim.lr_scheduler import LambdaLR
@@ -562,12 +570,16 @@ def _build_lightning_module(
         learning_rate=float(module_cfg.get("learning_rate", 3.0e-4)),
         weight_decay=float(module_cfg.get("weight_decay", 0.01)),
         betas=_coerce_betas(module_cfg.get("betas", [0.9, 0.95])),
+        optimizer_foreach=bool(optimizer_cfg.get("foreach", False)),
         eval_every_n_steps=int(module_cfg.get("eval_every_n_steps", 5000)),
         scheduler_factory=scheduler_factory,
         audio_decoder=audio_decoder,
         audio_sample_rate=int(module_cfg.get("audio_sample_rate", 24_000)),
         max_audio_samples=int(module_cfg.get("max_audio_samples", 2)),
         log_media_on_validation_end=bool(module_cfg.get("log_media_on_validation_end", True)),
+        cuda_cache_cleanup_every_n_steps=int(
+            module_cfg.get("cuda_cache_cleanup_every_n_steps", 100)
+        ),
         ema_decay=float(module_cfg.get("ema_decay", 0.999)),
         ema_start_step=int(module_cfg.get("ema_start_step", 0)),
         ema_update_every_n_steps=int(module_cfg.get("ema_update_every_n_steps", 1)),
@@ -611,6 +623,71 @@ def _resolve_import_string(path: str, *, field_name: str) -> Any:
         ) from exc
 
 
+def _instantiate_audio_decoder(
+    decoder_obj: Any,
+    decoder_kwargs: dict[str, Any],
+) -> Any:
+    if inspect.isclass(decoder_obj):
+        instance = decoder_obj(**decoder_kwargs)
+        if callable(instance):
+            return instance
+        decode_method = getattr(instance, "decode", None)
+        if callable(decode_method):
+            return decode_method
+        raise ValueError(
+            "Audio decoder class instance must be callable or expose a callable `decode` method."
+        )
+
+    if decoder_kwargs:
+        return lambda latents, fn=decoder_obj, kwargs=dict(decoder_kwargs): fn(latents, **kwargs)
+    return decoder_obj
+
+
+class LazyAudioDecoder:
+    """Initialize an optional audio decoder only when media logging needs it.
+
+    Loading the Mimi decoder eagerly pulls a pretrained model onto CUDA before
+    the first training step, adding minutes of startup and GPU memory that the
+    train loss never uses. This defers that cost to the first media decode.
+    """
+
+    def __init__(self, decoder_spec: str, decoder_kwargs: dict[str, Any]) -> None:
+        self.decoder_spec = decoder_spec
+        self.decoder_kwargs = dict(decoder_kwargs)
+        self._decoder: Any | None = None
+        self._declared_sample_rate = self.decoder_kwargs.get("sample_rate")
+
+    @property
+    def sample_rate(self) -> Any | None:
+        if self._decoder is None:
+            return self._declared_sample_rate
+        return getattr(self._decoder, "sample_rate", self._declared_sample_rate)
+
+    def _load(self) -> Any:
+        if self._decoder is not None:
+            return self._decoder
+
+        start = time.perf_counter()
+        print(f"[train.py] Initializing lazy audio decoder: {self.decoder_spec}")
+        decoder_obj = _resolve_import_string(
+            self.decoder_spec,
+            field_name="trainer.lightning_module.audio_decoder",
+        )
+        if not callable(decoder_obj):
+            raise ValueError(
+                "trainer.lightning_module.audio_decoder must resolve to a callable."
+            )
+
+        self._decoder = _instantiate_audio_decoder(decoder_obj, self.decoder_kwargs)
+        print(
+            f"[train.py] Audio decoder initialized in {time.perf_counter() - start:.2f}s."
+        )
+        return self._decoder
+
+    def __call__(self, latents: torch.FloatTensor) -> torch.Tensor | Any:
+        return self._load()(latents)
+
+
 def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
     decoder_spec = module_cfg.get("audio_decoder")
     if decoder_spec is None:
@@ -631,8 +708,17 @@ def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
             "trainer.lightning_module.audio_decoder_kwargs must be a mapping when set."
         )
 
+    decoder_spec = decoder_spec.strip()
+    lazy = bool(module_cfg.get("audio_decoder_lazy", True))
+    if lazy:
+        print(
+            "[train.py] Audio decoder initialization is lazy; "
+            "first media decode will load it."
+        )
+        return LazyAudioDecoder(decoder_spec, decoder_kwargs)
+
     decoder_obj = _resolve_import_string(
-        decoder_spec.strip(),
+        decoder_spec,
         field_name="trainer.lightning_module.audio_decoder",
     )
     if not callable(decoder_obj):
@@ -640,20 +726,7 @@ def _build_audio_decoder(module_cfg: dict[str, Any]) -> Any | None:
             "trainer.lightning_module.audio_decoder must resolve to a callable."
         )
 
-    if inspect.isclass(decoder_obj):
-        instance = decoder_obj(**decoder_kwargs)
-        if callable(instance):
-            return instance
-        decode_method = getattr(instance, "decode", None)
-        if callable(decode_method):
-            return decode_method
-        raise ValueError(
-            "Audio decoder class instance must be callable or expose a callable `decode` method."
-        )
-
-    if decoder_kwargs:
-        return lambda latents, fn=decoder_obj, kwargs=dict(decoder_kwargs): fn(latents, **kwargs)
-    return decoder_obj
+    return _instantiate_audio_decoder(decoder_obj, decoder_kwargs)
 
 
 def _optional_path(value: Any) -> str | None:
@@ -727,8 +800,64 @@ def _should_force_single_process_loader(num_workers: int) -> bool:
     return total_bytes < threshold
 
 
+class StartupPrefetchDataLoader(DataLoader):
+    """Reuse a worker-prefetched iterator for the first training epoch only.
+
+    ``DataLoader.__iter__`` resets persistent workers on every call. A normal
+    early ``iter(loader)`` would therefore make Lightning discard and re-read
+    its startup prefetch. This specialization returns the primed iterator
+    exactly once, then preserves normal DataLoader behavior for later epochs.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._reuse_startup_iterator = False
+
+    def warmup_workers(self) -> bool:
+        """Start persistent workers and retain their first prefetched iterator."""
+        if self.num_workers <= 0 or not self.persistent_workers:
+            return False
+        if self._iterator is not None:
+            return True
+
+        start = time.perf_counter()
+        # Call the base implementation directly so this first iterator is marked
+        # for reuse rather than being returned through ``__iter__``.
+        DataLoader.__iter__(self)
+        if self._iterator is None:  # defensive for incompatible DataLoader variants
+            return False
+
+        self._reuse_startup_iterator = True
+        print(
+            f"[train.py] Started {self.num_workers} persistent train DataLoader workers in "
+            f"{time.perf_counter() - start:.2f}s; initial prefetch overlaps model setup."
+        )
+        return True
+
+    def __iter__(self):
+        if self._reuse_startup_iterator and self._iterator is not None:
+            self._reuse_startup_iterator = False
+            return self._iterator
+        return super().__iter__()
+
+
+def _warmup_persistent_loader_workers(loader: DataLoader) -> bool:
+    """Start persistent loader workers without discarding their first prefetch.
+
+    PyTorch starts DataLoader workers lazily on the first ``iter(loader)``. If
+    that happens inside ``Trainer.fit``, Unix ``fork`` workers inherit the fully
+    constructed model (and sometimes initialized CUDA/logger state). Starting
+    them before model construction avoids that expensive fork and lets their
+    initial prefetch overlap model initialization.
+    """
+    warmup = getattr(loader, "warmup_workers", None)
+    return bool(warmup()) if callable(warmup) else False
+
+
 def _build_data_objects(
     config: dict[str, Any],
+    *,
+    warmup_train_workers: bool = False,
 ) -> tuple[DataLoader, DataLoader | None, DataLoader | None]:
     data_cfg = _require_mapping(config, "data")
     loader_cfg = _require_mapping(data_cfg, "loader")
@@ -746,18 +875,34 @@ def _build_data_objects(
         "continuous_feature_dim": dataset_cfg.get("continuous_feature_dim"),
         "append_eos_to_text": bool(dataset_cfg.get("append_eos_to_text", False)),
         "cache_npy": bool(dataset_cfg.get("cache_npy", False)),
+        "load_prompt": bool(dataset_cfg.get("load_prompt", True)),
+        "manifest_progress_every": int(dataset_cfg.get("manifest_progress_every", 0)),
+        "manifest_read_buffer_bytes": int(
+            dataset_cfg.get("manifest_read_buffer_bytes", 4 * 1024 * 1024)
+        ),
     }
+
+    def build_manifest_dataset(manifest: str, *, split: str) -> PrismDataset:
+        start = time.perf_counter()
+        print(f"[train.py] Loading {split} manifest: {manifest}", flush=True)
+        dataset = PrismDataset(source=manifest, **dataset_kwargs)
+        print(
+            f"[train.py] {split.capitalize()} manifest ready in "
+            f"{time.perf_counter() - start:.2f}s ({len(dataset):,} samples).",
+            flush=True,
+        )
+        return dataset
 
     train_manifest = _optional_path(data_cfg.get("train_manifest"))
     if train_manifest is None:
         raise ValueError("data.train_manifest must be set for training.")
-    train_dataset = PrismDataset(source=train_manifest, **dataset_kwargs)
+    train_dataset = build_manifest_dataset(train_manifest, split="train")
 
     val_manifest = _optional_path(data_cfg.get("val_manifest"))
-    val_dataset = PrismDataset(source=val_manifest, **dataset_kwargs) if val_manifest else None
+    val_dataset = build_manifest_dataset(val_manifest, split="val") if val_manifest else None
 
     test_manifest = _optional_path(data_cfg.get("test_manifest"))
-    test_dataset = PrismDataset(source=test_manifest, **dataset_kwargs) if test_manifest else None
+    test_dataset = build_manifest_dataset(test_manifest, split="test") if test_manifest else None
 
     collate = BatchCollate(
         text_pad_value=collate_cfg.get("text_pad_value"),
@@ -765,6 +910,9 @@ def _build_data_objects(
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
         include_attention_mask=bool(collate_cfg.get("include_attention_mask", True)),
         discrete_token_count=discrete_token_count,
+        flat_sequence_length_multiple=int(
+            collate_cfg.get("flat_sequence_length_multiple", 1)
+        ),
     )
 
     num_workers = int(loader_cfg.get("num_workers", 0))
@@ -877,7 +1025,7 @@ def _build_data_objects(
             drop_last=drop_last_train,
             seed=sampler_seed,
         )
-        train_loader = DataLoader(
+        train_loader = StartupPrefetchDataLoader(
             train_dataset,
             batch_sampler=train_batch_sampler,
             **common_loader_kwargs,
@@ -893,12 +1041,35 @@ def _build_data_objects(
             f"seed={sampler_seed}."
         )
     else:
-        train_loader = DataLoader(
+        train_loader = StartupPrefetchDataLoader(
             train_dataset,
             batch_size=train_batch_size,
             shuffle=shuffle_train,
             drop_last=drop_last_train,
             **common_loader_kwargs,
+        )
+
+    # DataLoader worker creation is otherwise deferred until Trainer.fit, at which
+    # point the model is already resident in the parent and gets copied into every
+    # forked worker. Prime local persistent workers before model construction so
+    # the fork is cheap and the first prefetch overlaps model setup. DDP launches
+    # its own rank-local loaders after Lightning spawns the training processes, so
+    # skip warmup there.
+    distributed_cfg = _require_mapping(config, "trainer").get("distributed")
+    distributed_enabled = isinstance(distributed_cfg, dict) and bool(
+        distributed_cfg.get("enabled", False)
+    )
+    worker_warmup_enabled = bool(loader_cfg.get("warmup_workers", False))
+    if worker_warmup_enabled and warmup_train_workers and not distributed_enabled:
+        if not _warmup_persistent_loader_workers(train_loader):
+            print(
+                "[train.py] Train-worker warmup skipped: it requires "
+                "num_workers > 0 and persistent_workers=true."
+            )
+    elif worker_warmup_enabled and distributed_enabled:
+        print(
+            "[train.py] Train-worker warmup skipped for distributed training; "
+            "each Lightning rank starts its own workers."
         )
 
     val_loader = None
@@ -1094,9 +1265,9 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
         del pl_module
         if trainer.sanity_checking:
             return
-        if not bool(getattr(trainer, "is_global_zero", True)):
-            return
 
+        # Advance the stage counter on every rank so the checkpointed callback
+        # state (state_dict) stays consistent across the process group.
         self._val_stage += 1
         format_values = {
             "step": int(trainer.global_step),
@@ -1107,9 +1278,22 @@ class SaveEveryValidationStageCheckpoint(pl.Callback):
         if not filename.endswith(".ckpt"):
             filename = f"{filename}.ckpt"
 
-        self.dirpath.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = self._next_available_path(self.dirpath / filename)
-        trainer.save_checkpoint(str(checkpoint_path), weights_only=self.save_weights_only)
+        # Resolving the concrete path touches the filesystem (mkdir + collision
+        # probing), so do it once on the global-zero rank and broadcast the
+        # result; every rank must then save to the same target path.
+        if trainer.is_global_zero:
+            self.dirpath.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = str(self._next_available_path(self.dirpath / filename))
+        else:
+            checkpoint_path = ""
+        checkpoint_path = trainer.strategy.broadcast(checkpoint_path, src=0)
+
+        # trainer.save_checkpoint() performs collective communication (it ends
+        # in strategy.barrier()), so it MUST run on every rank. Guarding it
+        # behind is_global_zero deadlocks DDP: rank 0 blocks in the barrier
+        # while the other ranks march on to the next step's gradient all-reduce,
+        # leaving the process group stuck on mismatched collectives.
+        trainer.save_checkpoint(checkpoint_path, weights_only=self.save_weights_only)
 
     @staticmethod
     def _next_available_path(path: Path) -> Path:
@@ -1252,27 +1436,235 @@ def _build_trainer(config: dict[str, Any], *, logger: Any, callbacks: list[Any])
     return pl.Trainer(**trainer_kwargs)
 
 
+def _resolve_experiment_root_dir(config: dict[str, Any]) -> Path:
+    """Resolve the top-level experiment directory (defaults to ``exp/``)."""
+    raw_root: str | None = None
+    experiment_cfg = config.get("experiment")
+    if isinstance(experiment_cfg, dict):
+        for key in ("exp_root", "run_root", "output_root", "root_dir"):
+            raw_root = _maybe_str(experiment_cfg.get(key))
+            if raw_root is not None:
+                break
+    if raw_root is None:
+        for key in ("exp_root", "run_root", "output_root", "root_dir"):
+            raw_root = _maybe_str(config.get(key))
+            if raw_root is not None:
+                break
+
+    resolved = Path(raw_root or "exp").expanduser()
+    if not resolved.is_absolute():
+        resolved = (Path.cwd() / resolved).resolve()
+    else:
+        resolved = resolved.resolve()
+    return resolved
+
+
+def _sanitize_run_name(name: str) -> str:
+    sanitized = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "-"
+        for character in name.strip()
+    )
+    sanitized = sanitized.strip("-.")
+    return sanitized or "prism_tts"
+
+
+def _resolve_logger_name(config: dict[str, Any], *, fallback: str) -> str:
+    """Pick the ``exp/<name>/`` folder name from config (logger/experiment name)."""
+    trainer_cfg = config.get("trainer")
+    if isinstance(trainer_cfg, dict):
+        for key in ("local_exp_name", "run_name"):
+            local_name = _maybe_str(trainer_cfg.get(key))
+            if local_name is not None:
+                return _sanitize_run_name(local_name)
+
+        logger_cfg = trainer_cfg.get("logger")
+        if isinstance(logger_cfg, dict):
+            logger_name = _maybe_str(logger_cfg.get("name"))
+            if logger_name is not None:
+                return _sanitize_run_name(logger_name)
+
+    experiment_cfg = config.get("experiment")
+    if isinstance(experiment_cfg, dict):
+        for key in ("local_exp_name", "run_name", "name"):
+            nested_name = _maybe_str(experiment_cfg.get(key))
+            if nested_name is not None:
+                return _sanitize_run_name(nested_name)
+
+    for key in ("local_exp_name", "run_name", "name"):
+        root_name = _maybe_str(config.get(key))
+        if root_name is not None:
+            return _sanitize_run_name(root_name)
+    return _sanitize_run_name(fallback)
+
+
+def _next_available_directory(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    version = 1
+    while True:
+        candidate = path.with_name(f"{path.name}-v{version}")
+        if not candidate.exists():
+            return candidate
+        version += 1
+
+
+def _to_yaml_text(payload: dict[str, Any]) -> str:
+    text = yaml.safe_dump(payload, sort_keys=False, allow_unicode=False)
+    if text.strip() == "":
+        return "{}\n"
+    return text
+
+
+def _save_run_configs(
+    *,
+    config: dict[str, Any],
+    resolved: ResolvedConfigs,
+    run_dir: Path,
+    args: argparse.Namespace,
+) -> None:
+    """Snapshot the resolved configs + run metadata into ``<run_dir>/configs``."""
+    config_dir = run_dir / "configs"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    source_configs: tuple[tuple[str, Path], ...] = (
+        ("trainer.yaml", resolved.trainer_config_path),
+        ("model.yaml", resolved.model_config_path),
+        ("data.yaml", resolved.data_config_path),
+        ("experiment.yaml", resolved.experiment_config_path),
+    )
+    for filename, source_path in source_configs:
+        target_path = config_dir / filename
+        if source_path.exists() and source_path.is_file():
+            shutil.copy2(source_path, target_path)
+        else:
+            target_path.write_text("{}\n", encoding="utf-8")
+
+    (config_dir / "merged.yaml").write_text(_to_yaml_text(config), encoding="utf-8")
+
+    cli_args = {
+        key: (str(value) if isinstance(value, Path) else value)
+        for key, value in vars(args).items()
+    }
+    metadata = {
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "cwd": str(Path.cwd()),
+        "run_dir": str(run_dir),
+        "cli_args": cli_args,
+        "source_config_paths": {
+            "trainer": str(resolved.trainer_config_path),
+            "model": str(resolved.model_config_path),
+            "data": str(resolved.data_config_path),
+            "experiment": str(resolved.experiment_config_path),
+        },
+    }
+    (config_dir / "meta.yaml").write_text(_to_yaml_text(metadata), encoding="utf-8")
+
+
+def _point_config_at_run_dir(config: dict[str, Any], run_dir: Path) -> None:
+    """Redirect the WandB save_dir and checkpoint dirpath under ``run_dir``."""
+    trainer_cfg = _require_mapping(config, "trainer")
+
+    logger_cfg_raw = trainer_cfg.get("logger")
+    if isinstance(logger_cfg_raw, dict):
+        logger_cfg = logger_cfg_raw
+    else:
+        logger_cfg = {}
+        trainer_cfg["logger"] = logger_cfg
+    logger_cfg["save_dir"] = str(run_dir / "logs")
+
+    checkpoint_cfg_raw = trainer_cfg.get("checkpoint")
+    if isinstance(checkpoint_cfg_raw, dict):
+        checkpoint_cfg = checkpoint_cfg_raw
+    else:
+        checkpoint_cfg = {}
+        trainer_cfg["checkpoint"] = checkpoint_cfg
+    checkpoint_cfg["dirpath"] = str(run_dir / "checkpoints")
+
+    config["run_dir"] = str(run_dir)
+
+
+def _prepare_experiment_run_dir(
+    *,
+    config: dict[str, Any],
+    resolved: ResolvedConfigs,
+    args: argparse.Namespace,
+) -> Path:
+    """Create ``exp/<name>/<timestamp>/`` and route checkpoints + logs into it.
+
+    Layout produced per run::
+
+        exp/<run_name>/<YYYYMMDD-HHMMSS>/
+            checkpoints/            # ModelCheckpoint + per-validation-stage ckpts
+            logs/wandb/             # WandbLogger save_dir
+            configs/                # snapshot of resolved yaml + run metadata
+
+    DDP subprocess launch re-executes this whole script for ranks > 0. The
+    rank-0 parent creates the directory and exports ``PRISM_TTS_RUN_DIR`` into
+    the environment the children inherit, so every rank writes into the SAME
+    run directory instead of each minting its own timestamped folder.
+    """
+    existing = os.environ.get("PRISM_TTS_RUN_DIR")
+    if existing:
+        run_dir = Path(existing).expanduser().resolve()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        _point_config_at_run_dir(config, run_dir)
+        return run_dir
+
+    experiment_root = _resolve_experiment_root_dir(config)
+    fallback_name = resolved.experiment_config_path.stem or "prism_tts"
+    logger_name = _resolve_logger_name(config, fallback=fallback_name)
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+
+    run_dir = _next_available_directory(experiment_root / logger_name / timestamp)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    _point_config_at_run_dir(config, run_dir)
+    _save_run_configs(config=config, resolved=resolved, run_dir=run_dir, args=args)
+    return run_dir
+
+
 def run(args: argparse.Namespace) -> None:
     resolved = _load_merged_configs(args)
     config = resolved.merged
     if _DEFAULTED_CUDA_ALLOC_CONF:
         print(
             "[train.py] PYTORCH_CUDA_ALLOC_CONF was unset; defaulting to "
-            "'backend:cudaMallocAsync' to avoid NVML-related allocator assertions."
+            "'expandable_segments:True,garbage_collection_threshold:0.8' to reduce "
+            "fragmentation from variable sequence lengths."
         )
     _apply_wandb_cli_overrides(config, args)
 
     _validate_config_consistency(config)
     _apply_distributed_training_config(config)
 
+    # Route checkpoints + logs into exp/<name>/<timestamp>/ and share that dir
+    # across DDP ranks via PRISM_TTS_RUN_DIR (set before Trainer.fit spawns them).
+    run_dir = _prepare_experiment_run_dir(config=config, resolved=resolved, args=args)
+    os.environ["PRISM_TTS_RUN_DIR"] = str(run_dir)
+    print(f"[train.py] experiment run directory: {run_dir}")
+
     trainer_cfg = _require_mapping(config, "trainer")
     seed = trainer_cfg.get("seed")
     if seed is not None:
         pl.seed_everything(int(seed), workers=bool(trainer_cfg.get("seed_workers", True)))
 
-    train_loader, val_loader, test_loader = _build_data_objects(config)
+    stage_start = time.perf_counter()
+    train_loader, val_loader, test_loader = _build_data_objects(
+        config,
+        warmup_train_workers=not args.validate_only,
+    )
+    print(
+        f"[train.py] Data setup done in {time.perf_counter() - stage_start:.2f}s "
+        f"({time.perf_counter() - _PROCESS_START:.2f}s since process start)."
+    )
+
+    stage_start = time.perf_counter()
     model = _build_model(config)
     lightning_module = _build_lightning_module(config, model=model)
+    print(
+        f"[train.py] Model + Lightning module built in {time.perf_counter() - stage_start:.2f}s."
+    )
 
     logger = _build_logger(_require_mapping(trainer_cfg, "logger"))
     callbacks = _build_callbacks(config)

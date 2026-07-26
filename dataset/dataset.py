@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -154,6 +155,9 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         append_eos_to_text: bool = False,
         cache_npy: bool = False,
         cache_npz: bool | None = None,
+        load_prompt: bool = True,
+        manifest_progress_every: int = 0,
+        manifest_read_buffer_bytes: int = 4 * 1024 * 1024,
     ) -> None:
         self.discrete_token_count = int(discrete_token_count)
         (
@@ -164,7 +168,7 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         ) = build_shared_token_layout(self.discrete_token_count)
 
         resolved_vocab_path = (
-            Path(vocab_path).expanduser().resolve()
+            self._absolute_path(vocab_path)
             if vocab_path is not None
             else Path(__file__).resolve().parent / "vocab.txt"
         )
@@ -180,6 +184,18 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             cache_npy = bool(cache_npz)
         self.cache_npy = bool(cache_npy)
         self._npy_cache: dict[str, tuple[torch.LongTensor, torch.FloatTensor]] = {}
+        # Remember whether npy files need allow_pickle so we stop paying a failed
+        # load attempt per file (each retry is an extra open() on networked FS).
+        self._npy_allow_pickle: bool | None = None
+        # The prompt npy is only needed for cross-utterance conditioning. Skipping
+        # it halves per-sample disk I/O; keep True to preserve existing behavior.
+        self.load_prompt = bool(load_prompt)
+        self.manifest_progress_every = int(manifest_progress_every)
+        if self.manifest_progress_every < 0:
+            raise ValueError("manifest_progress_every must be >= 0.")
+        self.manifest_read_buffer_bytes = int(manifest_read_buffer_bytes)
+        if self.manifest_read_buffer_bytes < 1:
+            raise ValueError("manifest_read_buffer_bytes must be >= 1.")
         self.discrete_stream_count = (
             None if discrete_stream_count is None else int(discrete_stream_count)
         )
@@ -195,12 +211,14 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         self._samples: list[Mapping[str, Any]] = []
 
         if isinstance(source, (str, Path)):
-            manifest_path = Path(source).expanduser().resolve()
-            if not manifest_path.is_file():
-                raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
+            # Keep manifest setup stat-free until it is opened. ``Path.resolve``
+            # and ``is_file`` can each trigger a network metadata round trip on
+            # NFS/Lustre, which makes dataset construction dominate startup time
+            # (and an unavailable mount look like a hang).
+            manifest_path = self._absolute_path(source)
             self.manifest_path = manifest_path
             self.manifest_root = (
-                Path(manifest_root).expanduser().resolve()
+                self._absolute_path(manifest_root)
                 if manifest_root is not None
                 else manifest_path.parent
             )
@@ -208,9 +226,17 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
         else:
             self.manifest_path = None
             self.manifest_root = (
-                Path(manifest_root).expanduser().resolve() if manifest_root is not None else None
+                self._absolute_path(manifest_root) if manifest_root is not None else None
             )
             self._samples = list(source)
+
+    @staticmethod
+    def _absolute_path(value: str | Path) -> Path:
+        """Make an absolute path without resolving symlinks or touching the filesystem."""
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return Path(os.path.abspath(path))
 
     def __len__(self) -> int:
         return len(self._entries) if self._entries else len(self._samples)
@@ -222,12 +248,34 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
     def _load_manifest(self, manifest_path: Path) -> list[ManifestEntry]:
         entries: list[ManifestEntry] = []
-        with manifest_path.open("r", encoding="utf-8") as handle:
-            for line_number, raw_line in enumerate(handle, start=1):
-                line = raw_line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                entries.append(self._parse_manifest_line(line, line_number))
+        try:
+            # The default 8 KiB TextIO buffer can turn a 45k-row manifest into
+            # thousands of high-latency NFS reads. A multi-megabyte buffer keeps
+            # parsing streaming and bounded in memory while reducing network
+            # round trips by orders of magnitude.
+            with manifest_path.open(
+                "r",
+                encoding="utf-8",
+                buffering=self.manifest_read_buffer_bytes,
+            ) as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    entries.append(self._parse_manifest_line(line, line_number))
+                    if (
+                        self.manifest_progress_every > 0
+                        and line_number % self.manifest_progress_every == 0
+                    ):
+                        print(
+                            f"[PrismDataset] Parsed {line_number:,} lines from "
+                            f"{manifest_path} ({len(entries):,} samples).",
+                            flush=True,
+                        )
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"Manifest file not found: {manifest_path}") from exc
+        except IsADirectoryError as exc:
+            raise ValueError(f"Manifest path is a directory, not a file: {manifest_path}") from exc
         if not entries:
             raise ValueError(f"Manifest has no valid entries: {manifest_path}")
         return entries
@@ -281,13 +329,15 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
                     f"Relative {field_name} requires manifest_root (line {line_number})."
                 )
             path = self.manifest_root / path
-        path = path.resolve()
 
         if path.suffix.lower() != ".npy":
             raise ValueError(f"{field_name} at line {line_number} must be a .npy path: {path}")
-        if not path.is_file():
-            raise FileNotFoundError(f"{field_name} file not found at line {line_number}: {path}")
-        return path
+        # NOTE: do NOT `.resolve()` or `.is_file()` here. On networked filesystems these
+        # each cost a round-trip, and manifests can have tens of thousands of entries
+        # (target + prompt per line), making dataset construction dominate startup time.
+        # Path normalization is cheap and stat-free; existence is validated lazily when
+        # the file is actually loaded (see `_load_npy_features`).
+        return Path(os.path.normpath(path))
 
     @staticmethod
     def _extract_modal_arrays_from_npy(
@@ -334,12 +384,17 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
             return discrete.clone(), continuous.clone()
 
         try:
-            try:
-                payload = np.load(npy_path, allow_pickle=False)
-            except ValueError as exc:
-                if "allow_pickle=False" not in str(exc):
-                    raise
-                payload = np.load(npy_path, allow_pickle=True)
+            if self._npy_allow_pickle is None:
+                try:
+                    payload = np.load(npy_path, allow_pickle=False)
+                    self._npy_allow_pickle = False
+                except ValueError as exc:
+                    if "allow_pickle=False" not in str(exc):
+                        raise
+                    payload = np.load(npy_path, allow_pickle=True)
+                    self._npy_allow_pickle = True
+            else:
+                payload = np.load(npy_path, allow_pickle=self._npy_allow_pickle)
 
             discrete_raw, continuous_raw = self._extract_modal_arrays_from_npy(
                 payload,
@@ -402,10 +457,17 @@ class PrismDataset(Dataset[dict[str, torch.Tensor]]):
 
     def _build_manifest_sample(self, entry: ManifestEntry) -> dict[str, torch.Tensor]:
         discrete_target, continuous_target = self._load_npy_features(entry.target_npy_path)
-        discrete_prompt, continuous_prompt = self._load_npy_features(entry.prompt_npy_path)
-
         text_target = self._encode_text(entry.transcript, "transcript")
-        text_prompt = self._encode_text(entry.prompt_transcript, "prompt_transcript")
+
+        if self.load_prompt:
+            discrete_prompt, continuous_prompt = self._load_npy_features(entry.prompt_npy_path)
+            text_prompt = self._encode_text(entry.prompt_transcript, "prompt_transcript")
+        else:
+            # Skip the prompt npy read and emit empty placeholders with matching
+            # channel counts (kept for collate/schema compatibility).
+            discrete_prompt = discrete_target.new_zeros((0, discrete_target.shape[1]))
+            continuous_prompt = continuous_target.new_zeros((0, continuous_target.shape[1]))
+            text_prompt = text_target.new_zeros((0,))
 
         return _normalize_split_sample(
             {
@@ -429,6 +491,7 @@ class BatchCollate:
         continuous_pad_value: float = 0.0,
         include_attention_mask: bool = True,
         discrete_token_count: int = DEFAULT_DISCRETE_TOKEN_COUNT,
+        flat_sequence_length_multiple: int = 1,
     ) -> None:
         (
             self.eot_token_id,
@@ -443,6 +506,12 @@ class BatchCollate:
         self.continuous_pad_value = continuous_pad_value
         self.include_attention_mask = include_attention_mask
         self.discrete_token_count = int(discrete_token_count)
+        # Round only the flattened model sequence length up to this multiple.
+        # Fixed-shape length buckets let the CUDA caching allocator reuse blocks
+        # instead of ratcheting reserved memory up across variable-length steps.
+        self.flat_sequence_length_multiple = int(flat_sequence_length_multiple)
+        if self.flat_sequence_length_multiple < 1:
+            raise ValueError("flat_sequence_length_multiple must be >= 1.")
 
     def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
         if not batch:
@@ -493,25 +562,31 @@ class BatchCollate:
         }
 
         flat_per_sample = [self._build_flat_sample(sample) for sample in samples]
+        flat_multiple = self.flat_sequence_length_multiple
         collated["flat_token_ids"] = _pad_1d(
             [item["token_ids"] for item in flat_per_sample],
             self.pad_token_id,
+            pad_to_multiple=flat_multiple,
         )
         collated["flat_token_type_ids"] = _pad_1d(
             [item["token_type_ids"] for item in flat_per_sample],
             TEXT_TOKEN_TYPE,
+            pad_to_multiple=flat_multiple,
         )
         collated["flat_speech_stream_ids"] = _pad_1d(
             [item["speech_stream_ids"] for item in flat_per_sample],
             -1,
+            pad_to_multiple=flat_multiple,
         )
         collated["flat_target_block_ids"] = _pad_1d(
             [item["target_block_ids"] for item in flat_per_sample],
             -1,
+            pad_to_multiple=flat_multiple,
         )
         collated["flat_continuous_values"] = _pad_2d(
             [item["continuous_values"] for item in flat_per_sample],
             0.0,
+            pad_to_multiple=flat_multiple,
         )
         collated["flat_target_block_counts"] = speech_target_lengths
         collated["flat_summary"] = torch.stack(
@@ -523,6 +598,7 @@ class BatchCollate:
             collated["attention_mask"] = _pad_1d(
                 [item["attention_mask"] for item in flat_per_sample],
                 False,
+                pad_to_multiple=flat_multiple,
             ).to(dtype=torch.bool)
 
         self._collate_optional_1d(samples, collated, key="flow_timesteps", pad_value=0.0)

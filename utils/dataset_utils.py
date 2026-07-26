@@ -103,12 +103,28 @@ def _normalize_split_sample(sample: Mapping[str, Any]) -> dict[str, torch.Tensor
     return normalized
 
 
-def _pad_1d(tensors: Sequence[torch.Tensor], pad_value: int | float | bool) -> torch.Tensor:
+def _padded_length(length: int, multiple: int) -> int:
+    if multiple < 1:
+        raise ValueError("pad_to_multiple must be >= 1.")
+    if multiple == 1:
+        return length
+    return ((length + multiple - 1) // multiple) * multiple
+
+
+def _pad_1d(
+    tensors: Sequence[torch.Tensor],
+    pad_value: int | float | bool,
+    *,
+    pad_to_multiple: int = 1,
+) -> torch.Tensor:
     if not tensors:
         raise ValueError("Cannot pad an empty tensor list.")
     dtype = tensors[0].dtype
     device = tensors[0].device
-    max_length = max(int(t.shape[0]) for t in tensors)
+    max_length = _padded_length(
+        max(int(t.shape[0]) for t in tensors),
+        int(pad_to_multiple),
+    )
     padded = torch.full((len(tensors), max_length), pad_value, dtype=dtype, device=device)
     for idx, tensor in enumerate(tensors):
         if tensor.dim() != 1:
@@ -117,13 +133,21 @@ def _pad_1d(tensors: Sequence[torch.Tensor], pad_value: int | float | bool) -> t
     return padded
 
 
-def _pad_2d(tensors: Sequence[torch.Tensor], pad_value: int | float) -> torch.Tensor:
+def _pad_2d(
+    tensors: Sequence[torch.Tensor],
+    pad_value: int | float,
+    *,
+    pad_to_multiple: int = 1,
+) -> torch.Tensor:
     if not tensors:
         raise ValueError("Cannot pad an empty tensor list.")
     dtype = tensors[0].dtype
     device = tensors[0].device
     channels = int(tensors[0].shape[1])
-    max_length = max(int(t.shape[0]) for t in tensors)
+    max_length = _padded_length(
+        max(int(t.shape[0]) for t in tensors),
+        int(pad_to_multiple),
+    )
     padded = torch.full((len(tensors), max_length, channels), pad_value, dtype=dtype, device=device)
     for idx, tensor in enumerate(tensors):
         if tensor.dim() != 2:

@@ -3,8 +3,8 @@
 # file_name|duration|transcript|target_npy|prompt_file_name|prompt_duration|prompt_transcript|prompt_npy
 
 data:
-  train_manifest: /astro/nghiahuynh/data/emilia/metadata-1000-max20-train.txt
-  val_manifest: /astro/nghiahuynh/data/emilia/metadata-1000-max20-val.txt
+  train_manifest: /astro/nghiahuynh/data/emilia/metadata-45k-train.txt
+  val_manifest: /astro/nghiahuynh/data/emilia/metadata-45k-val.txt
   test_manifest: null
   # Keep null to resolve relative paths against the manifest directory.
   manifest_root: null
@@ -13,20 +13,26 @@ data:
   loader:
     # Variable-length batches can spike attention memory; keep a conservative
     # per-device batch size and scale effective batch with grad accumulation.
-    train_batch_size: 32
-    val_batch_size: 32
-    test_batch_size: 32
-    num_workers: 32
+    train_batch_size: 16
+    val_batch_size: 16
+    test_batch_size: 16
+    num_workers: 4
     pin_memory: true
-    persistent_workers: true
-    prefetch_factor: 2
+    persistent_workers: false
+    # Start persistent workers before model/CUDA initialization. This avoids
+    # forking the large model at the first Trainer.fit batch, and overlaps the
+    # first feature reads with model construction. Disabled automatically for DDP.
+    warmup_workers: true
+    # With many workers, one queued batch per worker is already ample. Keeping
+    # this low avoids an initial NFS I/O stampede and reduces time to first batch.
+    prefetch_factor: 1
     drop_last_train: false
     shuffle_train: true
     shuffle_val: false
     shuffle_test: false
     adaptive_batching:
       # Set true to enable dynamic batch sizes based on estimated memory usage.
-      enabled: true
+      enabled: false
       # Target utilization against the configured/derived memory_budget.
       target_memory_utilization: 0.9
       # Optional absolute budget in "cost units" (batch_size * max_len^2).
@@ -56,6 +62,15 @@ data:
     cache_npy: false
     discrete_stream_count: 1
     continuous_feature_dim: 512
+    # Emit a heartbeat while parsing large network-hosted manifests. Set 0 to
+    # disable progress output.
+    manifest_progress_every: 10000
+    # Use large sequential reads for network manifests; the default ~8 KiB Python
+    # buffer can make a 45k-row NFS manifest take minutes to load.
+    manifest_read_buffer_bytes: 4194304  # 4 MiB
+    # Load the prompt npy per sample. Set false to skip that read (halves disk
+    # I/O) only if the model does not consume cross-utterance prompts.
+    load_prompt: true
 
   collate:
     # BatchCollate(...) arguments.
@@ -63,4 +78,8 @@ data:
     discrete_pad_value: null
     continuous_pad_value: 0.0
     include_attention_mask: true
+    # Round only the flattened model sequence length up to this multiple. Fixed
+    # shape buckets let the CUDA allocator reuse blocks instead of ratcheting
+    # reserved memory up across variable-length steps. Set 1 to disable.
+    flat_sequence_length_multiple: 64
     codec_frame_rate_hz: 12.5
