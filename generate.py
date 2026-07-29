@@ -152,17 +152,11 @@ def parse_args() -> argparse.Namespace:
         help="Override flow sampling steps for continuous latents.",
     )
     parser.add_argument(
-        "--parallel-num-steps",
-        type=int,
-        default=64,
-        help="Number of iterative refinement steps for parallel generation.",
-    )
-    parser.add_argument(
         "--generation-method",
         type=str,
-        default="causal",
-        choices=("causal", "parallel", "parallel_stable"),
-        help="Speech block generation strategy.",
+        default="ar",
+        choices=("ar", "causal"),
+        help="Autoregressive speech-frame generation strategy.",
     )
     parser.add_argument(
         "--force-silent-special-tokens",
@@ -282,11 +276,15 @@ def main() -> None:
             raise ValueError(f"Unexpected Mimi padding_mask shape: {tuple(padding_mask.shape)}")
         padding_mask = padding_mask.to(device=device)
 
+    # Dataset continuous targets are Mimi latents reconstructed from the full
+    # codec stack. Keep that prefix representation at inference even when the
+    # model predicts only a subset of discrete codebooks.
+    prompt_quantizers = int(mimi_model.config.num_quantizers)
     with torch.no_grad():
         encoded = mimi_model.encode(
             input_values=input_values,
             padding_mask=padding_mask,
-            num_quantizers=int(model.num_discrete_tokens),
+            num_quantizers=prompt_quantizers,
             return_dict=True,
         )
         prompt_codes = encoded.audio_codes
@@ -295,7 +293,9 @@ def main() -> None:
         prompt_latents = mimi_model.quantizer.decode(prompt_codes)
         # prompt_codes: [B, N, T], prompt_latents: [B, C, T]
 
-    raw_prompt_discrete = prompt_codes[0].transpose(0, 1).to(dtype=torch.long).cpu()
+    raw_prompt_discrete = prompt_codes[0, : model.num_discrete_tokens].transpose(0, 1).to(
+        dtype=torch.long
+    ).cpu()
     raw_prompt_continuous = prompt_latents[0].transpose(0, 1).to(dtype=torch.float32).cpu()
 
     prompt_text_tokens = generate_utils.safe_tokenize(tokenizer, args.prompt_text, "prompt_text")
@@ -356,7 +356,6 @@ def main() -> None:
                 top_p=top_p,
                 do_sample=do_sample,
                 flow_num_steps=args.flow_num_steps,
-                parallel_num_steps=args.parallel_num_steps,
                 generation_method=str(args.generation_method),
                 force_silent_special_tokens=bool(args.force_silent_special_tokens),
                 return_dict=True,

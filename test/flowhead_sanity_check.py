@@ -20,16 +20,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.mimi_latent_decoder import MimiPreUpsampleLatentDecoder
-from utils import generate_utils
-from utils.model_utils import normalize_discrete_tokens
+from models.mimi_latent_decoder import MimiPreUpsampleLatentDecoder  # noqa: E402
+from dataset.dataset import BatchCollate  # noqa: E402
+from utils import generate_utils  # noqa: E402
+from utils import model_utils as MU  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "FlowHead-only sanity check: sample continuous latents from GT discrete tokens "
-            "and compare against GT continuous latents from target audio."
+            "Teacher-forced AR-flow sanity check: sample continuous latents from "
+            "ground-truth previous frames and compare with target audio latents."
         )
     )
     parser.add_argument(
@@ -137,7 +138,7 @@ def _encode_audio_with_mimi(
     mimi_model: MimiModel,
     mimi_sample_rate: int,
     device: torch.device,
-    num_quantizers: int,
+    num_discrete_tokens: int,
 ) -> tuple[torch.LongTensor, torch.FloatTensor]:
     audio, sample_rate = generate_utils.read_wav(audio_path)
     audio = generate_utils.resample_if_needed(audio, sample_rate, mimi_sample_rate)
@@ -166,7 +167,7 @@ def _encode_audio_with_mimi(
         encoded = mimi_model.encode(
             input_values=input_values,
             padding_mask=padding_mask,
-            num_quantizers=num_quantizers,
+            num_quantizers=int(mimi_model.config.num_quantizers),
             return_dict=True,
         )
         codes = encoded.audio_codes
@@ -174,7 +175,7 @@ def _encode_audio_with_mimi(
             raise RuntimeError("Mimi encode did not return audio_codes.")
         latents = mimi_model.quantizer.decode(codes)
 
-    discrete = codes[0].transpose(0, 1).to(dtype=torch.long).cpu()  # [L, N]
+    discrete = codes[0, :num_discrete_tokens].transpose(0, 1).to(dtype=torch.long).cpu()  # [L, N]
     continuous = latents[0].transpose(0, 1).to(dtype=torch.float32).cpu()  # [L, C]
     return discrete, continuous
 
@@ -282,23 +283,51 @@ def main() -> None:
         mimi_model=mimi_model,
         mimi_sample_rate=mimi_sample_rate,
         device=device,
-        num_quantizers=int(model.num_discrete_tokens),
+        num_discrete_tokens=int(model.num_discrete_tokens),
     )
 
-    gt_discrete = gt_discrete_raw.unsqueeze(0).to(device=device, dtype=torch.long)
+    collate = BatchCollate(discrete_token_count=int(model.discrete_vocab_size) - 3)
+    empty_text = torch.empty(0, dtype=torch.long)
+    empty_discrete = torch.empty((0, model.num_discrete_tokens), dtype=torch.long)
+    empty_continuous = torch.empty((0, model.continuous_latent_size), dtype=torch.float32)
+    teacher_forced = collate(
+        [
+            {
+                "text_prompt": empty_text,
+                "discrete_prompt": empty_discrete,
+                "continuous_prompt": empty_continuous,
+                "text_target": empty_text,
+                "discrete_target": gt_discrete_raw,
+                "continuous_target": gt_continuous_raw,
+            }
+        ]
+    )
+    teacher_forced = {key: value.to(device) for key, value in teacher_forced.items()}
     with torch.no_grad():
-        normalized_gt_discrete = normalize_discrete_tokens(
-            gt_discrete,
-            "groundtruth_discrete",
+        flat = MU.build_autoregressive_batch_from_collate(
+            flat_token_ids=teacher_forced["flat_token_ids"],
+            flat_discrete_values=teacher_forced["flat_discrete_values"],
+            flat_continuous_values=teacher_forced["flat_continuous_values"],
+            flat_token_type_ids=teacher_forced["flat_token_type_ids"],
+            flat_target_discrete_values=teacher_forced["flat_target_discrete_values"],
+            flat_target_continuous_values=teacher_forced["flat_target_continuous_values"],
+            flat_target_block_ids=teacher_forced["flat_target_block_ids"],
+            flat_target_block_counts=teacher_forced["flat_target_block_counts"],
+            attention_mask=teacher_forced["attention_mask"],
             num_discrete_tokens=model.num_discrete_tokens,
+            continuous_latent_size=model.continuous_latent_size,
         )
-        cond = model._discrete_condition(normalized_gt_discrete)
+        hidden = model._encode(flat)
+        _, continuous_hidden = model._split_hidden(hidden)
+        prediction_mask = flat.attention_mask & (flat.target_block_ids >= 0)
+        cond = model.continuous_prior_head(continuous_hidden[prediction_mask])
         sampled_latents = model.sample_continuous_latent(
             cond=cond,
             num_steps=args.flow_num_steps,
         )
 
-    sampled_latents_cpu = sampled_latents[0].detach().to(dtype=torch.float32).cpu()
+    # Drop the collator-appended EOS frame before comparing source-audio latents.
+    sampled_latents_cpu = sampled_latents[:-1].detach().to(dtype=torch.float32).cpu()
     gt_continuous_cpu = gt_continuous_raw.to(dtype=torch.float32)
 
     if sampled_latents_cpu.shape != gt_continuous_cpu.shape:

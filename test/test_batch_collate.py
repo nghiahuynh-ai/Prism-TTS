@@ -9,10 +9,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset.dataset import BatchCollate, build_shared_token_layout
+from dataset.dataset import BatchCollate, SPEECH_FRAME_TOKEN_TYPE, build_shared_token_layout  # noqa: E402
 
 
-def _make_sample(
+def _sample(
     text_prompt: list[int],
     discrete_prompt: list[list[int]],
     continuous_prompt: list[list[float]],
@@ -30,16 +30,10 @@ def _make_sample(
     }
 
 
-def _expected_flat_len(text_len: int, speech_len: int, num_discrete_streams: int) -> int:
-    num_streams = num_discrete_streams + 1
-    return text_len + 1 + speech_len * num_streams + 1
-
-
-def test_batch_collate_builds_split_parts_and_lengths_without_delay():
+def test_batch_collate_builds_fused_shifted_ar_frames() -> None:
     collate = BatchCollate(discrete_token_count=100)
-    _, eos_token_id, pad_token_id, _ = build_shared_token_layout(100)
-
-    sample_a = _make_sample(
+    eot_id, eos_id, pad_id, _ = build_shared_token_layout(100)
+    first = _sample(
         text_prompt=[200, 201, 202],
         discrete_prompt=[[1, 10], [2, 20]],
         continuous_prompt=[[0.1], [0.2]],
@@ -47,7 +41,7 @@ def test_batch_collate_builds_split_parts_and_lengths_without_delay():
         discrete_target=[[3, 30], [4, 40]],
         continuous_target=[[0.3], [0.4]],
     )
-    sample_b = _make_sample(
+    second = _sample(
         text_prompt=[300],
         discrete_prompt=[[5, 50]],
         continuous_prompt=[[0.5]],
@@ -56,66 +50,41 @@ def test_batch_collate_builds_split_parts_and_lengths_without_delay():
         continuous_target=[[0.6]],
     )
 
-    out = collate([sample_a, sample_b])
+    out = collate([first, second])
 
-    assert tuple(out["text_prompt"].shape) == (2, 3)
-    assert tuple(out["discrete_prompt"].shape) == (2, 2, 2)
-    assert tuple(out["continuous_prompt"].shape) == (2, 2, 1)
-    assert tuple(out["text_target"].shape) == (2, 2)
-    assert tuple(out["discrete_target"].shape) == (2, 3, 2)
-    assert tuple(out["continuous_target"].shape) == (2, 3, 1)
-
-    assert out["text_prompt_lengths"].tolist() == [3, 1]
-    assert out["speech_prompt_lengths"].tolist() == [2, 1]
-    assert out["text_target_lengths"].tolist() == [2, 1]
+    # Target EOS frames are appended before building the shifted sequence.
     assert out["speech_target_lengths"].tolist() == [3, 2]
-    # Terminal EOS speech block was appended to each sample.
-    assert out["discrete_target"][0, 2].tolist() == [eos_token_id, eos_token_id]
-    assert out["discrete_target"][1, 1].tolist() == [eos_token_id, eos_token_id]
+    assert out["discrete_target"][0, 2].tolist() == [eos_id, eos_id]
     assert out["continuous_target"][0, 2].tolist() == [0.0]
-    assert out["continuous_target"][1, 1].tolist() == [0.0]
 
-    # Padding check for split parts.
-    assert out["text_prompt"][1].tolist() == [300, pad_token_id, pad_token_id]
+    # One model token per speech frame: text+EOT+prompt+EOS+text+EOT+(T-1) inputs.
+    first_len = 3 + 1 + 2 + 1 + 2 + 1 + (3 - 1)
+    second_len = 1 + 1 + 1 + 1 + 1 + 1 + (2 - 1)
+    assert tuple(out["flat_token_ids"].shape) == (2, first_len)
+    assert out["attention_mask"][0].tolist() == [True] * first_len
+    assert out["attention_mask"][1].tolist() == [True] * second_len + [False] * (first_len - second_len)
+    assert tuple(out["flat_discrete_values"].shape) == (2, first_len, 2)
+    assert tuple(out["flat_continuous_values"].shape) == (2, first_len, 1)
+    assert tuple(out["flat_target_discrete_values"].shape) == (2, first_len, 2)
+    assert tuple(out["flat_target_continuous_values"].shape) == (2, first_len, 1)
 
-    # Flat attention mask follows: prompt_text+EOT+prompt_speech+EOS+target_text+EOT+target_speech+EOS.
-    len_a = _expected_flat_len(3, 2, 2) + _expected_flat_len(2, 3, 2)
-    len_b = _expected_flat_len(1, 1, 2) + _expected_flat_len(1, 2, 2)
-    assert tuple(out["attention_mask"].shape) == (2, len_a)
-    assert out["attention_mask"][0].tolist() == [True] * len_a
-    assert out["attention_mask"][1].tolist() == [True] * len_b + [False] * (len_a - len_b)
+    # Target EOT is the anchor for frame 0. Each following input frame predicts its successor.
+    target_ids = out["flat_target_block_ids"][0]
+    anchors = torch.nonzero(target_ids >= 0, as_tuple=False).squeeze(1)
+    assert anchors.tolist() == [9, 10, 11]
+    assert target_ids[anchors].tolist() == [0, 1, 2]
+    assert out["flat_token_ids"][0, 9].item() == eot_id
+    assert out["flat_token_type_ids"][0, 10:12].tolist() == [SPEECH_FRAME_TOKEN_TYPE] * 2
+    assert out["flat_discrete_values"][0, 10].tolist() == [3, 30]
+    assert out["flat_discrete_values"][0, 11].tolist() == [4, 40]
+    assert out["flat_target_discrete_values"][0, anchors].tolist() == [
+        [3, 30],
+        [4, 40],
+        [eos_id, eos_id],
+    ]
+    assert torch.allclose(out["flat_target_continuous_values"][0, anchors[-1]], torch.zeros(1))
 
-    # Pre-flattened tensors are produced in collate and padded to the same sequence length.
-    assert tuple(out["flat_token_ids"].shape) == (2, len_a)
-    assert tuple(out["flat_token_type_ids"].shape) == (2, len_a)
-    assert tuple(out["flat_speech_stream_ids"].shape) == (2, len_a)
-    assert tuple(out["flat_target_block_ids"].shape) == (2, len_a)
-    assert tuple(out["flat_continuous_values"].shape) == (2, len_a, 1)
-    assert out["flat_target_block_counts"].tolist() == [3, 2]
-    assert tuple(out["flat_summary"].shape) == (2, 14)
-
-    # Sample A starts with prompt text then EOT.
-    assert out["flat_token_ids"][0, :4].tolist() == [200, 201, 202, 100]
-    # [text_prompt_start, text_prompt_end, speech_prompt_start, speech_prompt_end, ...]
-    assert out["flat_summary"][0, :4].tolist() == [0, 3, 4, 10]
-    assert int(out["flat_summary"][0, 8].item()) == len_a
-    # stream summary: [text_stream_idx, speech_discrete_start, speech_discrete_end, speech_continuous_idx]
-    assert out["flat_summary"][0, 10:14].tolist() == [0, 0, 1, 2]
-
-    # The appended terminal EOS speech block is part of target block ids, so it is mask-eligible.
-    final_block_id = int(out["flat_target_block_counts"][0].item()) - 1
-    target_block_ids = out["flat_target_block_ids"][0]
-    valid_tokens = out["attention_mask"][0]
-    final_block_positions = valid_tokens & (target_block_ids == final_block_id)
-    assert int(final_block_positions.sum().item()) == 3  # N + 1 streams
-
-    final_block_token_types = out["flat_token_type_ids"][0][final_block_positions]
-    final_block_token_ids = out["flat_token_ids"][0][final_block_positions]
-    final_block_continuous = out["flat_continuous_values"][0][final_block_positions]
-
-    # Two discrete EOS ids + one continuous latent row (represented by pad token id and zeros).
-    assert int((final_block_token_types == 1).sum().item()) == 2
-    assert int((final_block_token_types == 2).sum().item()) == 1
-    assert int((final_block_token_ids == eos_token_id).sum().item()) == 2
-    assert int((final_block_token_ids == pad_token_id).sum().item()) == 1
-    assert torch.allclose(final_block_continuous, torch.zeros_like(final_block_continuous))
+    # Text positions have no speech-frame input and use the discrete pad value only as storage.
+    assert out["flat_token_ids"][0, :4].tolist() == [200, 201, 202, eot_id]
+    assert out["flat_discrete_values"][0, 0].tolist() == [pad_id, pad_id]
+    assert tuple(out["flat_summary"].shape) == (2, 10)

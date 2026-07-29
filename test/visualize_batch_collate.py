@@ -18,13 +18,13 @@ os.environ.setdefault(
     str(Path(tempfile.gettempdir()) / "prism_tts_matplotlib"),
 )
 
-import matplotlib
+import matplotlib  # noqa: E402
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
+import matplotlib.pyplot as plt  # noqa: E402
+from matplotlib.colors import ListedColormap  # noqa: E402
 
-from dataset.dataset import BatchCollate, build_shared_token_layout
+from dataset.dataset import BatchCollate, build_shared_token_layout  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -370,22 +370,22 @@ def _save_overview_figure(
     plt.close(fig)
 
 
-def _expected_flat_length(sample: dict[str, torch.Tensor], num_discrete_streams: int) -> int:
+def _expected_flat_length(sample: dict[str, torch.Tensor]) -> int:
     text_prompt_len = int(sample["text_prompt"].shape[0])
     speech_prompt_len = int(sample["discrete_prompt"].shape[0])
     text_target_len = int(sample["text_target"].shape[0])
     speech_target_len = int(sample["discrete_target"].shape[0])
 
-    speech_block_size = num_discrete_streams + 1
     return (
         text_prompt_len
         + 1
-        + speech_prompt_len * speech_block_size
+        + speech_prompt_len
         + 1
         + text_target_len
         + 1
-        + speech_target_len * speech_block_size
-        + 1
+        # The first target frame is predicted from target EOT. The remaining
+        # target frames are input positions that predict their successors.
+        + max(0, speech_target_len - 1)
     )
 
 
@@ -395,8 +395,6 @@ def _validate_collated_batch(batch: dict[str, torch.Tensor]) -> None:
         raise RuntimeError("Prompt tensors do not agree on batch dimension.")
     if batch["discrete_target"].shape[0] != batch_size or batch["continuous_target"].shape[0] != batch_size:
         raise RuntimeError("Target tensors do not agree on batch dimension.")
-
-    num_discrete_streams = int(batch["discrete_prompt"].shape[2])
 
     for idx in range(batch_size):
         sample = {
@@ -409,7 +407,7 @@ def _validate_collated_batch(batch: dict[str, torch.Tensor]) -> None:
                 idx, : int(batch["speech_target_lengths"][idx].item()), :
             ],
         }
-        expected_valid = _expected_flat_length(sample, num_discrete_streams=num_discrete_streams)
+        expected_valid = _expected_flat_length(sample)
         actual_valid = int(batch["attention_mask"][idx].sum().item())
         if actual_valid != expected_valid:
             raise RuntimeError(

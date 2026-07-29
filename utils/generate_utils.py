@@ -105,7 +105,6 @@ def build_model(model_config: dict[str, Any]) -> PrismTTS:
             prism_cfg.get("discrete_special_token_loss_weight", 1.0)
         ),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
-        parallel_sample_steps=int(prism_cfg.get("parallel_sample_steps", 64)),
     )
 
 

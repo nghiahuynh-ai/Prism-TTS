@@ -7,7 +7,6 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.optim import AdamW
 
 from models.prism_tts import PrismTTS
@@ -350,22 +349,27 @@ class PrismTTSLightning(pl.LightningModule):
     def _forward_batch(self, batch_inputs: PrismBatch) -> PrismTTSOutput:
         if (
             batch_inputs.flat_token_ids is None
+            or batch_inputs.flat_discrete_values is None
             or batch_inputs.flat_continuous_values is None
             or batch_inputs.flat_token_type_ids is None
-            or batch_inputs.flat_speech_stream_ids is None
+            or batch_inputs.flat_target_discrete_values is None
+            or batch_inputs.flat_target_continuous_values is None
             or batch_inputs.flat_target_block_ids is None
         ):
             raise ValueError(
                 "Batch is missing required pre-flattened tensors: "
-                "flat_token_ids, flat_continuous_values, flat_token_type_ids, "
-                "flat_speech_stream_ids, flat_target_block_ids."
+                "flat_token_ids, flat_discrete_values, flat_continuous_values, "
+                "flat_token_type_ids, flat_target_discrete_values, "
+                "flat_target_continuous_values, flat_target_block_ids."
             )
 
         return self.model(
             flat_token_ids=batch_inputs.flat_token_ids,
+            flat_discrete_values=batch_inputs.flat_discrete_values,
             flat_continuous_values=batch_inputs.flat_continuous_values,
             flat_token_type_ids=batch_inputs.flat_token_type_ids,
-            flat_speech_stream_ids=batch_inputs.flat_speech_stream_ids,
+            flat_target_discrete_values=batch_inputs.flat_target_discrete_values,
+            flat_target_continuous_values=batch_inputs.flat_target_continuous_values,
             flat_target_block_ids=batch_inputs.flat_target_block_ids,
             flat_target_block_counts=batch_inputs.flat_target_block_counts,
             attention_mask=batch_inputs.attention_mask,
@@ -386,9 +390,11 @@ class PrismTTSLightning(pl.LightningModule):
     def _parse_mapping_batch(self, batch: Mapping[str, Any]) -> PrismBatch:
         required_flat = (
             "flat_token_ids",
+            "flat_discrete_values",
             "flat_continuous_values",
             "flat_token_type_ids",
-            "flat_speech_stream_ids",
+            "flat_target_discrete_values",
+            "flat_target_continuous_values",
             "flat_target_block_ids",
         )
         required = (
@@ -413,9 +419,11 @@ class PrismTTSLightning(pl.LightningModule):
                 speech_target_lengths=batch.get("speech_target_lengths"),
                 attention_mask=batch.get("attention_mask"),
                 flat_token_ids=batch.get("flat_token_ids"),
+                flat_discrete_values=batch.get("flat_discrete_values"),
                 flat_continuous_values=batch.get("flat_continuous_values"),
                 flat_token_type_ids=batch.get("flat_token_type_ids"),
-                flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
+                flat_target_discrete_values=batch.get("flat_target_discrete_values"),
+                flat_target_continuous_values=batch.get("flat_target_continuous_values"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
                 flow_timesteps=batch.get("flow_timesteps"),
@@ -426,9 +434,11 @@ class PrismTTSLightning(pl.LightningModule):
             return PrismBatch(
                 attention_mask=batch.get("attention_mask"),
                 flat_token_ids=batch.get("flat_token_ids"),
+                flat_discrete_values=batch.get("flat_discrete_values"),
                 flat_continuous_values=batch.get("flat_continuous_values"),
                 flat_token_type_ids=batch.get("flat_token_type_ids"),
-                flat_speech_stream_ids=batch.get("flat_speech_stream_ids"),
+                flat_target_discrete_values=batch.get("flat_target_discrete_values"),
+                flat_target_continuous_values=batch.get("flat_target_continuous_values"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
                 flow_timesteps=batch.get("flow_timesteps"),
@@ -461,8 +471,9 @@ class PrismTTSLightning(pl.LightningModule):
             "Mapping batch is missing PrismTTS keys. Required keys: "
             "(text_target, discrete_target, continuous_target, text_prompt, "
             "discrete_prompt, continuous_prompt) or "
-            "(flat_token_ids, flat_continuous_values, flat_token_type_ids, "
-            "flat_speech_stream_ids, flat_target_block_ids)."
+            "(flat_token_ids, flat_discrete_values, flat_continuous_values, "
+            "flat_token_type_ids, flat_target_discrete_values, "
+            "flat_target_continuous_values, flat_target_block_ids)."
         )
 
     def _parse_sequence_batch(self, batch: list[Any] | tuple[Any, ...]) -> PrismBatch:
@@ -642,7 +653,7 @@ class PrismTTSLightning(pl.LightningModule):
         text_target = batch_inputs.text_target[:, :target_text_len]
 
         generation_outputs: dict[str, PrismTTSGenerationOutput] = {}
-        for generation_method in ("causal", "parallel", "parallel_stable"):
+        for generation_method in ("ar",):
             generation_outputs[generation_method] = self.model.generate(
                 text_prompt=text_prompt,
                 discrete_prompt=discrete_prompt,

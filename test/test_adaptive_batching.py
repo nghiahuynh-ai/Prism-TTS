@@ -8,7 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism_sample_lengths
+from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism_sample_lengths  # noqa: E402
 
 
 def test_adaptive_sampler_carries_overflow_and_packs_short_samples():
@@ -48,4 +48,4 @@ def test_estimate_prism_sample_lengths_from_manifest_metadata():
         dataset,
         codec_frame_rate_hz=12.5,
     )
-    assert lengths == [19, 20]
+    assert lengths == [12, 13]

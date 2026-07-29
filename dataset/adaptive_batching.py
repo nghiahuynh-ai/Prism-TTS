@@ -29,24 +29,22 @@ def _estimate_concat_sequence_length(
     speech_prompt_length: int,
     text_target_length: int,
     speech_target_length: int,
-    num_discrete_streams: int,
 ) -> int:
     text_prompt_length = max(1, int(text_prompt_length))
     speech_prompt_length = max(1, int(speech_prompt_length))
     text_target_length = max(1, int(text_target_length))
-    # Training collate appends one explicit terminal EOS speech block.
-    speech_target_length = max(1, int(speech_target_length)) + 1
-    num_discrete_streams = max(1, int(num_discrete_streams))
-    speech_block_size = num_discrete_streams + 1
+    # Collate appends an EOS target frame, but it is predicted from the final
+    # real target frame rather than inserted as an input. Thus the number of
+    # target-frame inputs remains the original speech length.
+    speech_target_length = max(1, int(speech_target_length))
     return (
         text_prompt_length
         + 1  # EOT after text prompt
-        + speech_prompt_length * speech_block_size
+        + speech_prompt_length
         + 1  # EOS after speech prompt
         + text_target_length
         + 1  # EOT after text target
-        + speech_target_length * speech_block_size
-        + 1  # EOS after speech target
+        + speech_target_length
     )
 
 
@@ -97,8 +95,6 @@ def estimate_prism_sample_lengths(
         append_eos = bool(getattr(tokenizer, "append_eos", False))
         if not isinstance(char_to_id, Mapping):
             raise ValueError("dataset.tokenizer.char_to_id must be a mapping.")
-        num_discrete_streams = int(getattr(dataset, "discrete_stream_count", 1) or 1)
-
         lengths: list[int] = []
         for entry in entries:
             text_prompt_len = _estimate_text_token_count(
@@ -125,7 +121,6 @@ def estimate_prism_sample_lengths(
                     speech_prompt_length=prompt_discrete_len,
                     text_target_length=text_target_len,
                     speech_target_length=target_discrete_len,
-                    num_discrete_streams=num_discrete_streams,
                 )
             )
         return lengths
@@ -149,15 +144,12 @@ def estimate_prism_sample_lengths(
                 sample.get("discrete_target"),
                 field_name="discrete_target",
             )
-            discrete_prompt = sample.get("discrete_prompt")
-            num_discrete_streams = int(getattr(discrete_prompt, "shape", [1, 1])[1])
             lengths.append(
                 _estimate_concat_sequence_length(
                     text_prompt_length=text_prompt_len,
                     speech_prompt_length=prompt_discrete_len,
                     text_target_length=text_target_len,
                     speech_target_length=target_discrete_len,
-                    num_discrete_streams=num_discrete_streams,
                 )
             )
         return lengths

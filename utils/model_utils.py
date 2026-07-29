@@ -16,6 +16,9 @@ from transformers.utils import ModelOutput
 TEXT_TOKEN_TYPE = 0
 SPEECH_DISCRETE_TOKEN_TYPE = 1
 SPEECH_CONTINUOUS_TOKEN_TYPE = 2
+# A fused speech frame contains every discrete stream and its continuous latent.
+# The legacy stream token types remain defined for checkpoint/data migration helpers.
+SPEECH_FRAME_TOKEN_TYPE = 3
 
 
 @dataclass
@@ -24,6 +27,21 @@ class FlatBatch:
     continuous_values: torch.FloatTensor
     token_type_ids: torch.LongTensor
     speech_stream_ids: torch.LongTensor
+    target_block_ids: torch.LongTensor
+    attention_mask: torch.BoolTensor
+    target_block_counts: torch.LongTensor
+
+
+@dataclass
+class AutoregressiveBatch:
+    """Causally shifted fused-frame inputs and aligned speech-frame labels."""
+
+    token_ids: torch.LongTensor
+    discrete_values: torch.LongTensor
+    continuous_values: torch.FloatTensor
+    token_type_ids: torch.LongTensor
+    target_discrete_values: torch.LongTensor
+    target_continuous_values: torch.FloatTensor
     target_block_ids: torch.LongTensor
     attention_mask: torch.BoolTensor
     target_block_counts: torch.LongTensor
@@ -351,10 +369,11 @@ def build_default_mimi_speech_encoder(
                 raise ValueError(f"Unexpected Mimi padding_mask shape: {tuple(padding_mask.shape)}")
             padding_mask = padding_mask.to(device=device)
 
+        prompt_quantizers = int(mimi_model.config.num_quantizers)
         encoded = mimi_model.encode(
             input_values=input_values,
             padding_mask=padding_mask,
-            num_quantizers=int(num_discrete_tokens),
+            num_quantizers=prompt_quantizers,
             return_dict=True,
         )
         prompt_codes = encoded.audio_codes
@@ -362,7 +381,7 @@ def build_default_mimi_speech_encoder(
             raise RuntimeError("Mimi encode did not return audio_codes.")
         prompt_latents = mimi_model.quantizer.decode(prompt_codes)
 
-        discrete = prompt_codes[0].transpose(0, 1).to(dtype=torch.long)
+        discrete = prompt_codes[0, :num_discrete_tokens].transpose(0, 1).to(dtype=torch.long)
         continuous = prompt_latents[0].transpose(0, 1).to(dtype=continuous_dtype)
         return discrete, continuous
 
@@ -727,6 +746,149 @@ def build_flat_batch_from_collate(
     )
 
 
+def build_autoregressive_batch_from_collate(
+    *,
+    flat_token_ids: torch.LongTensor,
+    flat_discrete_values: torch.LongTensor,
+    flat_continuous_values: torch.FloatTensor,
+    flat_token_type_ids: torch.LongTensor,
+    flat_target_discrete_values: torch.LongTensor,
+    flat_target_continuous_values: torch.FloatTensor,
+    flat_target_block_ids: torch.LongTensor,
+    flat_target_block_counts: Optional[torch.LongTensor],
+    attention_mask: Optional[torch.Tensor],
+    num_discrete_tokens: int,
+    continuous_latent_size: int,
+) -> AutoregressiveBatch:
+    """Validate collate-produced fused AR tensors and pack them into a batch object.
+
+    `flat_target_block_ids` marks only prediction anchors.  The aligned target
+    tensors hold frame ``t`` while the input at that same location is the
+    preceding context token, preventing target-frame leakage under causal attention.
+    """
+    if flat_token_ids.dim() != 2:
+        raise ValueError("flat_token_ids must have shape [batch, sequence].")
+    batch_size, seq_len = flat_token_ids.shape
+    device = flat_token_ids.device
+
+    def _require_2d(name: str, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dim() != 2 or tensor.shape != (batch_size, seq_len):
+            raise ValueError(
+                f"{name} must match flat_token_ids shape [batch, sequence], "
+                f"got {tuple(tensor.shape)}."
+            )
+        return tensor
+
+    def _require_3d(name: str, tensor: torch.Tensor, channels: int) -> torch.Tensor:
+        if tensor.dim() != 3 or tensor.shape[:2] != (batch_size, seq_len):
+            raise ValueError(
+                f"{name} must match flat_token_ids shape [batch, sequence, channels], "
+                f"got {tuple(tensor.shape)}."
+            )
+        if tensor.shape[2] != channels:
+            raise ValueError(
+                f"{name} channel mismatch: expected {channels}, got {tensor.shape[2]}."
+            )
+        return tensor
+
+    flat_discrete_values = _require_3d(
+        "flat_discrete_values", flat_discrete_values, num_discrete_tokens
+    )
+    flat_continuous_values = _require_3d(
+        "flat_continuous_values", flat_continuous_values, continuous_latent_size
+    )
+    flat_token_type_ids = _require_2d("flat_token_type_ids", flat_token_type_ids)
+    flat_target_discrete_values = _require_3d(
+        "flat_target_discrete_values", flat_target_discrete_values, num_discrete_tokens
+    )
+    flat_target_continuous_values = _require_3d(
+        "flat_target_continuous_values",
+        flat_target_continuous_values,
+        continuous_latent_size,
+    )
+    flat_target_block_ids = _require_2d("flat_target_block_ids", flat_target_block_ids)
+
+    if attention_mask is None:
+        resolved_attention = torch.ones(batch_size, seq_len, dtype=torch.bool, device=device)
+    else:
+        resolved_attention = _require_2d("attention_mask", attention_mask).to(
+            device=device,
+            dtype=torch.bool,
+        )
+
+    label_mask = resolved_attention & (flat_target_block_ids >= 0)
+    if flat_target_block_counts is None:
+        counts = torch.zeros(batch_size, dtype=torch.long, device=device)
+        for sample_idx in range(batch_size):
+            sample_labels = flat_target_block_ids[sample_idx][label_mask[sample_idx]]
+            if sample_labels.numel() > 0:
+                counts[sample_idx] = int(sample_labels.max().item()) + 1
+    else:
+        counts = torch.as_tensor(flat_target_block_counts, dtype=torch.long, device=device)
+        if counts.dim() == 0:
+            counts = counts.repeat(batch_size)
+        if counts.dim() != 1 or counts.shape[0] != batch_size:
+            raise ValueError("flat_target_block_counts must have shape [batch].")
+        if (counts < 0).any():
+            raise ValueError("flat_target_block_counts must be non-negative.")
+
+    for sample_idx in range(batch_size):
+        expected_count = int(counts[sample_idx].item())
+        sample_ids = flat_target_block_ids[sample_idx][label_mask[sample_idx]]
+        if expected_count == 0:
+            if sample_ids.numel() != 0:
+                raise ValueError("Target labels are present for a sample with zero target blocks.")
+            continue
+        if sample_ids.numel() != expected_count:
+            raise ValueError(
+                "Every target speech block must have exactly one autoregressive prediction anchor."
+            )
+        expected_ids = torch.arange(expected_count, dtype=torch.long, device=device)
+        if not torch.equal(torch.sort(sample_ids).values, expected_ids):
+            raise ValueError("Autoregressive target block ids must be contiguous [0, target_blocks).")
+
+    return AutoregressiveBatch(
+        token_ids=flat_token_ids.to(dtype=torch.long, device=device),
+        discrete_values=flat_discrete_values.to(dtype=torch.long, device=device),
+        continuous_values=flat_continuous_values.to(device=device),
+        token_type_ids=flat_token_type_ids.to(dtype=torch.long, device=device),
+        target_discrete_values=flat_target_discrete_values.to(dtype=torch.long, device=device),
+        target_continuous_values=flat_target_continuous_values.to(device=device),
+        target_block_ids=flat_target_block_ids.to(dtype=torch.long, device=device),
+        attention_mask=resolved_attention,
+        target_block_counts=counts,
+    )
+
+
+def build_causal_attention_mask(
+    attention_mask: torch.BoolTensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return an additive causal mask that also excludes right-padding keys."""
+    if attention_mask.dim() != 2:
+        raise ValueError("attention_mask must have shape [batch, sequence].")
+
+    batch_size, seq_len = attention_mask.shape
+    device = attention_mask.device
+    positions = torch.arange(seq_len, device=device)
+    causal = positions.view(1, 1, seq_len, 1) >= positions.view(1, 1, 1, seq_len)
+    valid_keys = attention_mask.view(batch_size, 1, 1, seq_len)
+    allowed = causal & valid_keys
+
+    # Avoid all-masked padded query rows, which can produce NaNs in some attention kernels.
+    valid_queries = attention_mask.view(batch_size, 1, seq_len, 1)
+    diagonal = torch.eye(seq_len, dtype=torch.bool, device=device).view(1, 1, seq_len, seq_len)
+    allowed = allowed | ((~valid_queries) & diagonal)
+
+    min_value = torch.finfo(dtype).min
+    return torch.zeros(
+        (batch_size, 1, seq_len, seq_len),
+        dtype=dtype,
+        device=device,
+    ).masked_fill(~allowed, min_value)
+
+
 def build_two_level_rope_position_embeddings(
     *,
     inputs_embeds: torch.FloatTensor,
@@ -921,7 +1083,12 @@ def resolve_generation_discrete_eos_token_id(
 ) -> int:
     """Resolve the discrete EOS id used during generation."""
     if discrete_eos_token_id is not None:
-        return int(discrete_eos_token_id)
+        resolved = int(discrete_eos_token_id)
+        if not 0 <= resolved < discrete_vocab_size:
+            raise ValueError(
+                f"discrete_eos_token_id must be in [0, {discrete_vocab_size}), got {resolved}."
+            )
+        return resolved
     candidate = backbone_eos_token_id
     if candidate is None or not (0 <= int(candidate) < discrete_vocab_size):
         return 0

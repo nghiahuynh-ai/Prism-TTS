@@ -13,15 +13,15 @@ model:
     continuous_latent_size: 512
     flow_num_res_blocks: 4
     flow_model_channels: null
-    # Loss weights for masked speech-block reconstruction.
+    # Loss weights for shifted autoregressive fused-frame prediction.
     continuous_loss_weight: 1.0
     flow_loss_weight: 1.0
     # Per-token CE weights for discrete stream training:
     # regular = codec IDs, special = EOT/EOS/PAD.
     discrete_regular_token_loss_weight: 1.0
-    discrete_special_token_loss_weight: 0.1
+    # EOS is an autoregressive stopping signal and should not be de-emphasized.
+    discrete_special_token_loss_weight: 1.0
     flow_sample_steps: 64
-    parallel_sample_steps: 64
 
   llama_config:
     # Must be >= text_token_offset + num_text_vocab_tokens.
