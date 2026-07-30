@@ -493,6 +493,10 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
             prism_cfg.get("discrete_special_token_loss_weight", 1.0)
         ),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
+        normalize_continuous_latents=prism_cfg.get("normalize_continuous_latents", False),
+        continuous_latent_mean=prism_cfg.get("continuous_latent_mean", 0.0),
+        continuous_latent_std=prism_cfg.get("continuous_latent_std", 1.0),
+        continuous_latent_std_eps=float(prism_cfg.get("continuous_latent_std_eps", 1e-6)),
     )
 
 

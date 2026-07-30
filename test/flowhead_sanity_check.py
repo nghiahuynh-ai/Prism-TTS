@@ -317,6 +317,7 @@ def main() -> None:
             num_discrete_tokens=model.num_discrete_tokens,
             continuous_latent_size=model.continuous_latent_size,
         )
+        flat = model._normalize_autoregressive_batch(flat)
         hidden = model._encode(flat)
         _, continuous_hidden = model._split_hidden(hidden)
         prediction_mask = flat.attention_mask & (flat.target_block_ids >= 0)
@@ -325,6 +326,7 @@ def main() -> None:
             cond=cond,
             num_steps=args.flow_num_steps,
         )
+        sampled_latents = model._denormalize_continuous_latent_values(sampled_latents)
 
     # Drop the collator-appended EOS frame before comparing source-audio latents.
     sampled_latents_cpu = sampled_latents[:-1].detach().to(dtype=torch.float32).cpu()

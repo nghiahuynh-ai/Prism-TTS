@@ -11,6 +11,15 @@ model:
     # For discrete_token_count=2048, minimum valid value is 2051.
     discrete_vocab_size: 2051
     continuous_latent_size: 512
+    # Standardize real continuous-latent payloads as (x - mean) / std during
+    # model training/generation. Generation outputs are converted back to the
+    # original latent scale before audio decoding. Keep disabled unless the
+    # mean/std values match the training feature distribution.
+    normalize_continuous_latents: true
+    # Scalars apply to every channel; a 512-value list enables per-channel stats.
+    continuous_latent_mean: 0.008161894
+    continuous_latent_std: 3.101865141
+    continuous_latent_std_eps: 1.0e-6
     flow_num_res_blocks: 4
     flow_model_channels: null
     # Loss weights for shifted autoregressive fused-frame prediction.

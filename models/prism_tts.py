@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -37,6 +38,10 @@ class PrismTTS(nn.Module):
         discrete_regular_token_loss_weight: float = 1.0,
         discrete_special_token_loss_weight: float = 1.0,
         flow_sample_steps: int = 64,
+        normalize_continuous_latents: bool | int | str = False,
+        continuous_latent_mean: float | Sequence[float] | torch.Tensor = 0.0,
+        continuous_latent_std: float | Sequence[float] | torch.Tensor = 1.0,
+        continuous_latent_std_eps: float = 1e-6,
     ) -> None:
         super().__init__()
         if num_discrete_tokens < 1:
@@ -59,6 +64,8 @@ class PrismTTS(nn.Module):
             raise ValueError("At least one discrete loss weight must be > 0.")
         if flow_sample_steps < 1:
             raise ValueError("flow_sample_steps must be at least 1.")
+        if continuous_latent_std_eps <= 0.0:
+            raise ValueError("continuous_latent_std_eps must be > 0.")
 
         self.hidden_size = int(llama_config.hidden_size)
         self.discrete_hidden_size = self.hidden_size // 2
@@ -71,6 +78,11 @@ class PrismTTS(nn.Module):
         self.discrete_regular_token_loss_weight = float(discrete_regular_token_loss_weight)
         self.discrete_special_token_loss_weight = float(discrete_special_token_loss_weight)
         self.flow_sample_steps = int(flow_sample_steps)
+        self.normalize_continuous_latents = self._coerce_bool(
+            normalize_continuous_latents,
+            name="normalize_continuous_latents",
+        )
+        self.continuous_latent_std_eps = float(continuous_latent_std_eps)
 
         self.backbone = LlamaBackbone(llama_config)
         self.discrete_frame_proj = nn.Linear(self.hidden_size, self.discrete_hidden_size)
@@ -114,7 +126,67 @@ class PrismTTS(nn.Module):
             backbone_pad_token_id=self.backbone.config.pad_token_id,
             discrete_vocab_size=self.discrete_vocab_size,
         )
+        mean = self._coerce_continuous_latent_stat(
+            continuous_latent_mean,
+            name="continuous_latent_mean",
+            continuous_latent_size=self.continuous_latent_size,
+        )
+        std = self._coerce_continuous_latent_stat(
+            continuous_latent_std,
+            name="continuous_latent_std",
+            continuous_latent_size=self.continuous_latent_size,
+        )
+        if not torch.isfinite(mean).all():
+            raise ValueError("continuous_latent_mean must contain only finite values.")
+        if not torch.isfinite(std).all():
+            raise ValueError("continuous_latent_std must contain only finite values.")
+        if torch.le(std, self.continuous_latent_std_eps).any():
+            raise ValueError(
+                "continuous_latent_std values must be greater than continuous_latent_std_eps."
+            )
+        stat_device = self.continuous_proj.weight.device
+        self.register_buffer(
+            "continuous_latent_mean",
+            mean.to(device=stat_device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "continuous_latent_std",
+            std.to(device=stat_device),
+            persistent=False,
+        )
         self.reset_parameters()
+
+    @staticmethod
+    def _coerce_bool(value: bool | int | str, *, name: str) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "y", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "n", "off"}:
+                return False
+        raise ValueError(f"{name} must be a boolean value.")
+
+    @staticmethod
+    def _coerce_continuous_latent_stat(
+        value: float | Sequence[float] | torch.Tensor,
+        *,
+        name: str,
+        continuous_latent_size: int,
+    ) -> torch.FloatTensor:
+        stat = torch.as_tensor(value, dtype=torch.float32, device="cpu")
+        if stat.dim() == 0 or stat.numel() == 1:
+            return stat.reshape(1).repeat(int(continuous_latent_size)).contiguous()
+        if stat.dim() == 1 and int(stat.numel()) == int(continuous_latent_size):
+            return stat.contiguous()
+        raise ValueError(
+            f"{name} must be a scalar or a 1D sequence with "
+            f"continuous_latent_size={continuous_latent_size} values."
+        )
 
     def reset_parameters(self) -> None:
         """Initialize fused projections and task heads without resetting the backbone."""
@@ -137,6 +209,96 @@ class PrismTTS(nn.Module):
     @property
     def discrete_embedding(self) -> nn.Embedding:
         return self.backbone.embed_tokens
+
+    def _continuous_stat_view(self, stat: torch.Tensor, latents: torch.Tensor) -> torch.Tensor:
+        view_shape = (1,) * (latents.dim() - 1) + (self.continuous_latent_size,)
+        return stat.to(device=latents.device, dtype=latents.dtype).view(view_shape)
+
+    def _normalize_continuous_latent_values(
+        self,
+        latents: torch.FloatTensor,
+        *,
+        payload_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.FloatTensor:
+        if not self.normalize_continuous_latents:
+            return latents
+        mean = self._continuous_stat_view(self.continuous_latent_mean, latents)
+        std = self._continuous_stat_view(self.continuous_latent_std, latents)
+        normalized = (latents - mean) / std
+        if payload_mask is None:
+            return normalized
+        return torch.where(payload_mask.unsqueeze(-1), normalized, latents)
+
+    def _denormalize_continuous_latent_values(
+        self,
+        latents: torch.FloatTensor,
+        *,
+        payload_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.FloatTensor:
+        if not self.normalize_continuous_latents:
+            return latents
+        mean = self._continuous_stat_view(self.continuous_latent_mean, latents)
+        std = self._continuous_stat_view(self.continuous_latent_std, latents)
+        denormalized = latents * std + mean
+        if payload_mask is None:
+            return denormalized
+        return torch.where(payload_mask.unsqueeze(-1), denormalized, latents)
+
+    def _non_special_discrete_block_mask(
+        self,
+        discrete_values: torch.LongTensor,
+    ) -> torch.BoolTensor:
+        if not self.training_special_discrete_token_ids:
+            return torch.ones(
+                discrete_values.shape[:-1],
+                dtype=torch.bool,
+                device=discrete_values.device,
+            )
+        return ~MU.build_special_block_mask(
+            discrete_values,
+            self.training_special_discrete_token_ids,
+        )
+
+    def _continuous_input_payload_mask(
+        self,
+        *,
+        discrete_values: torch.LongTensor,
+        token_type_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.BoolTensor:
+        mask = token_type_ids == MU.SPEECH_FRAME_TOKEN_TYPE
+        mask = mask & self._non_special_discrete_block_mask(discrete_values)
+        if attention_mask is not None:
+            mask = mask & attention_mask.to(device=mask.device, dtype=torch.bool)
+        return mask
+
+    def _normalize_autoregressive_batch(
+        self,
+        flat: MU.AutoregressiveBatch,
+    ) -> MU.AutoregressiveBatch:
+        if not self.normalize_continuous_latents:
+            return flat
+        input_payload_mask = self._continuous_input_payload_mask(
+            discrete_values=flat.discrete_values,
+            token_type_ids=flat.token_type_ids,
+            attention_mask=flat.attention_mask,
+        )
+        target_payload_mask = (
+            flat.attention_mask
+            & (flat.target_block_ids >= 0)
+            & self._non_special_discrete_block_mask(flat.target_discrete_values)
+        )
+        return replace(
+            flat,
+            continuous_values=self._normalize_continuous_latent_values(
+                flat.continuous_values,
+                payload_mask=input_payload_mask,
+            ),
+            target_continuous_values=self._normalize_continuous_latent_values(
+                flat.target_continuous_values,
+                payload_mask=target_payload_mask,
+            ),
+        )
 
     def _build_inputs_embeds(
         self,
@@ -355,6 +517,7 @@ class PrismTTS(nn.Module):
             num_discrete_tokens=self.num_discrete_tokens,
             continuous_latent_size=self.continuous_latent_size,
         )
+        flat = self._normalize_autoregressive_batch(flat)
         hidden_states = self._encode(flat)
         discrete_hidden, continuous_hidden = self._split_hidden(hidden_states)
         prediction_mask = flat.attention_mask & (flat.target_block_ids >= 0)
@@ -542,16 +705,21 @@ class PrismTTS(nn.Module):
                 )[0].item()
             )
             if is_terminal or (force_silent_special_tokens and is_special):
-                sampled_continuous = prior.new_zeros((self.continuous_latent_size,))
+                sampled_continuous_model = prior.new_zeros((self.continuous_latent_size,))
+                sampled_continuous_out = sampled_continuous_model
             else:
-                sampled_continuous = self.sample_continuous_latent(
+                sampled_continuous_model = self.sample_continuous_latent(
                     prior.unsqueeze(0),
                     num_steps=flow_num_steps,
                 )[0]
+                sampled_continuous_out = self._denormalize_continuous_latent_values(
+                    sampled_continuous_model,
+                )
+            prior_out = self._denormalize_continuous_latent_values(prior)
 
             generated_discrete.append(sampled_discrete)
-            generated_continuous.append(sampled_continuous)
-            generated_prior.append(prior)
+            generated_continuous.append(sampled_continuous_out)
+            generated_prior.append(prior_out)
             generated_logits.append(logits)
             if is_terminal:
                 break
@@ -560,7 +728,7 @@ class PrismTTS(nn.Module):
                 (1, 1), self.pad_token_id, dtype=torch.long, device=hidden.device
             )
             next_discrete = sampled_discrete.view(1, 1, self.num_discrete_tokens)
-            next_continuous = sampled_continuous.view(1, 1, self.continuous_latent_size)
+            next_continuous = sampled_continuous_model.view(1, 1, self.continuous_latent_size)
             next_types = torch.full(
                 (1, 1), MU.SPEECH_FRAME_TOKEN_TYPE, dtype=torch.long, device=hidden.device
             )
@@ -635,6 +803,11 @@ class PrismTTS(nn.Module):
             expected_len=int(discrete_prompt.shape[1]),
             name="continuous_prompt",
             continuous_latent_size=self.continuous_latent_size,
+        )
+        prompt_payload_mask = self._non_special_discrete_block_mask(discrete_prompt)
+        continuous_prompt = self._normalize_continuous_latent_values(
+            continuous_prompt,
+            payload_mask=prompt_payload_mask,
         )
         batch_size = int(text_prompt.shape[0])
         if text_target is None:

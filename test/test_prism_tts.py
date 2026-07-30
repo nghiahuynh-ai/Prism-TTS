@@ -114,7 +114,7 @@ def _config() -> LlamaConfig:
     return config
 
 
-def _model() -> PrismTTS:
+def _model(**kwargs: object) -> PrismTTS:
     return PrismTTS(
         llama_config=_config(),
         num_discrete_tokens=2,
@@ -122,6 +122,7 @@ def _model() -> PrismTTS:
         continuous_latent_size=8,
         flow_num_res_blocks=2,
         flow_sample_steps=2,
+        **kwargs,
     )
 
 
@@ -174,6 +175,49 @@ def test_forward_computes_fused_ar_losses() -> None:
     assert torch.isfinite(outputs.flow_loss)
     assert batch["flat_target_block_counts"].tolist() == [4, 4]
     assert int((batch["flat_target_block_ids"] >= 0).sum().item()) == 8
+
+
+def test_continuous_latent_normalization_keeps_structural_zeros() -> None:
+    model = _model(
+        normalize_continuous_latents=True,
+        continuous_latent_mean=1.0,
+        continuous_latent_std=2.0,
+    )
+    batch = _batch(_sample())
+    flat = MU.build_autoregressive_batch_from_collate(
+        flat_token_ids=batch["flat_token_ids"],
+        flat_discrete_values=batch["flat_discrete_values"],
+        flat_continuous_values=batch["flat_continuous_values"],
+        flat_token_type_ids=batch["flat_token_type_ids"],
+        flat_target_discrete_values=batch["flat_target_discrete_values"],
+        flat_target_continuous_values=batch["flat_target_continuous_values"],
+        flat_target_block_ids=batch["flat_target_block_ids"],
+        flat_target_block_counts=batch["flat_target_block_counts"],
+        attention_mask=batch["attention_mask"],
+        num_discrete_tokens=model.num_discrete_tokens,
+        continuous_latent_size=model.continuous_latent_size,
+    )
+
+    normalized = model._normalize_autoregressive_batch(flat)
+    first_prompt_pos = torch.nonzero(
+        flat.token_type_ids[0] == MU.SPEECH_FRAME_TOKEN_TYPE,
+        as_tuple=False,
+    )[0].item()
+    first_target_pos = torch.nonzero(flat.target_block_ids[0] == 0, as_tuple=False).item()
+    eos_target_pos = torch.nonzero(flat.target_block_ids[0] == 3, as_tuple=False).item()
+
+    assert torch.allclose(
+        normalized.continuous_values[0, first_prompt_pos],
+        torch.full((8,), -0.45),
+    )
+    assert torch.allclose(
+        normalized.target_continuous_values[0, first_target_pos],
+        torch.full((8,), -0.3),
+    )
+    assert torch.equal(
+        normalized.target_continuous_values[0, eos_target_pos],
+        torch.zeros(8),
+    )
 
 
 def test_first_frame_prediction_cannot_see_future_target_frames() -> None:
@@ -282,6 +326,48 @@ def test_generation_stops_when_the_discrete_head_emits_eos() -> None:
     assert generated.discrete_ids.shape == (1, 2, 1)
     assert torch.equal(generated.discrete_ids[0, :, 0], torch.tensor([eos_id, eos_id]))
     assert torch.equal(generated.continuous_latents, torch.zeros_like(generated.continuous_latents))
+
+
+def test_generation_denormalizes_continuous_latents_before_return() -> None:
+    torch.manual_seed(4)
+    model = _model(
+        normalize_continuous_latents=True,
+        continuous_latent_mean=3.0,
+        continuous_latent_std=2.0,
+    ).eval()
+    batch = _batch(_sample())
+    original_sampler = model._sample_discrete_ids
+    original_sample_continuous = model.sample_continuous_latent
+
+    def emit_regular(logits: torch.Tensor, **_: object) -> torch.LongTensor:
+        return torch.ones(logits.shape[:-1], dtype=torch.long, device=logits.device)
+
+    def emit_zero_latent(cond: torch.Tensor, num_steps: int | None = None) -> torch.FloatTensor:
+        del num_steps
+        return torch.zeros(
+            (*cond.shape[:-1], model.continuous_latent_size),
+            dtype=cond.dtype,
+            device=cond.device,
+        )
+
+    model._sample_discrete_ids = emit_regular  # type: ignore[method-assign]
+    model.sample_continuous_latent = emit_zero_latent  # type: ignore[method-assign]
+    try:
+        generated = model.generate(
+            text_prompt=batch["text_prompt"],
+            discrete_prompt=batch["discrete_prompt"].transpose(1, 2),
+            continuous_prompt=batch["continuous_prompt"],
+            text_target=batch["text_target"],
+            max_new_blocks=1,
+            do_sample=False,
+            flow_num_steps=2,
+        )
+    finally:
+        model._sample_discrete_ids = original_sampler  # type: ignore[method-assign]
+        model.sample_continuous_latent = original_sample_continuous  # type: ignore[method-assign]
+
+    assert generated.continuous_latents.shape == (1, 1, 8)
+    assert torch.allclose(generated.continuous_latents, torch.full((1, 1, 8), 3.0))
 
 
 def test_generation_defaults_to_the_configured_eos_id() -> None:
