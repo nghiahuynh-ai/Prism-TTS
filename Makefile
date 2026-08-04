@@ -23,6 +23,7 @@ EXPERIMENT_CONFIG ?= config/experiment.yaml
 endif
 
 CKPT ?=
+PRETRAINED_WEIGHTS ?=
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
@@ -80,6 +81,12 @@ else
 CKPT_ARG :=
 endif
 
+ifneq ($(strip $(PRETRAINED_WEIGHTS)),)
+PRETRAINED_WEIGHTS_ARG := --pretrained-weights $(PRETRAINED_WEIGHTS)
+else
+PRETRAINED_WEIGHTS_ARG :=
+endif
+
 help:
 	@echo "Prism-TTS workflow automation"
 	@echo ""
@@ -93,6 +100,7 @@ help:
 	@echo ""
 	@echo "Common overrides:"
 	@echo "  CKPT=<path>            Add --ckpt-path"
+	@echo "  PRETRAINED_WEIGHTS=<path>  Initialize model weights without resuming Trainer state"
 	@echo "  EXPERIMENT=<name>      Use config/<name>.yaml as experiment config"
 	@echo "  EXPERIMENT_CONFIG=...  Override experiment config"
 	@echo "  TRAINER_CONFIG=...     Override trainer config"
@@ -118,18 +126,18 @@ help:
 
 train:
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) $(CKPT_ARG) $(TRAIN_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) $(CKPT_ARG) $(PRETRAINED_WEIGHTS_ARG) $(TRAIN_ARGS)
 
 validate:
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --validate-only $(CKPT_ARG) $(VALIDATE_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --validate-only $(CKPT_ARG) $(PRETRAINED_WEIGHTS_ARG) $(VALIDATE_ARGS)
 
 test:
 	@if [ -z "$(CKPT)" ]; then \
 		echo "[make test] CKPT is empty: this will run fit before test."; \
 	fi
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
-	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --test-after-fit $(CKPT_ARG) $(TEST_ARGS)
+	$(PYTHON) $(TRAIN_SCRIPT) $(COMMON_TRAIN_ARGS) $(WANDB_ARGS) --test-after-fit $(CKPT_ARG) $(PRETRAINED_WEIGHTS_ARG) $(TEST_ARGS)
 
 unit-test:
 	$(PYTHON) -m pytest test $(PYTEST_ARGS)

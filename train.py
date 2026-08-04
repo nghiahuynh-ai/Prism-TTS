@@ -33,6 +33,7 @@ from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism
 from dataset.dataset import BatchCollate, PrismDataset, build_shared_token_layout
 from models.prism_tts import PrismTTS
 from models.prism_tts_lightning import PrismTTSLightning
+from utils.pretrained_weights import load_pretrained_weights
 
 try:
     import lightning.pytorch as pl
@@ -99,6 +100,25 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Checkpoint path to resume from for fit/validate/test.",
+    )
+    parser.add_argument(
+        "--pretrained-weights",
+        type=Path,
+        default=None,
+        help=(
+            "Initialize model weights from a raw state dict or Lightning checkpoint before "
+            "training. Does not restore Trainer, optimizer, scheduler, or step state."
+        ),
+    )
+    parser.add_argument(
+        "--pretrained-use-ema",
+        action="store_true",
+        help="Use ema_state from --pretrained-weights when it is available.",
+    )
+    parser.add_argument(
+        "--pretrained-strict",
+        action="store_true",
+        help="Require --pretrained-weights to match the current model exactly.",
     )
     parser.add_argument(
         "--validate-only",
@@ -1628,6 +1648,12 @@ def _prepare_experiment_run_dir(
 
 
 def run(args: argparse.Namespace) -> None:
+    if args.ckpt_path is not None and args.pretrained_weights is not None:
+        raise ValueError(
+            "--ckpt-path resumes Lightning Trainer state and cannot be combined with "
+            "--pretrained-weights. Choose one."
+        )
+
     resolved = _load_merged_configs(args)
     config = resolved.merged
     if _DEFAULTED_CUDA_ALLOC_CONF:
@@ -1664,6 +1690,14 @@ def run(args: argparse.Namespace) -> None:
 
     stage_start = time.perf_counter()
     model = _build_model(config)
+    if args.pretrained_weights is not None:
+        load_result = load_pretrained_weights(
+            model,
+            args.pretrained_weights,
+            use_ema=bool(args.pretrained_use_ema),
+            strict=bool(args.pretrained_strict),
+        )
+        print(f"[train.py] Pretrained-weight initialization: {load_result.summary()}")
     lightning_module = _build_lightning_module(config, model=model)
     print(
         f"[train.py] Model + Lightning module built in {time.perf_counter() - stage_start:.2f}s."

@@ -13,6 +13,7 @@ from transformers import LlamaConfig
 
 from dataset.dataset import SharedVocabTokenizer
 from models.prism_tts import PrismTTS
+from utils.pretrained_weights import extract_model_state_dict
 
 try:
     import yaml
@@ -117,26 +118,7 @@ def _extract_model_state_dict(
     *,
     use_ema: bool,
 ) -> dict[str, torch.Tensor]:
-    if use_ema:
-        ema_state = checkpoint_payload.get("ema_state")
-        if isinstance(ema_state, dict) and ema_state:
-            return dict(ema_state)
-
-    state_dict = checkpoint_payload.get("state_dict")
-    if isinstance(state_dict, dict) and state_dict:
-        stripped: dict[str, torch.Tensor] = {}
-        for key, value in state_dict.items():
-            if key.startswith("model."):
-                stripped[key[len("model.") :]] = value
-            else:
-                stripped[key] = value
-        return stripped
-
-    if checkpoint_payload and all(isinstance(key, str) for key in checkpoint_payload):
-        if all(torch.is_tensor(value) for value in checkpoint_payload.values()):
-            return dict(checkpoint_payload)
-
-    raise ValueError("Unable to find a model state dict in checkpoint payload.")
+    return extract_model_state_dict(checkpoint_payload, use_ema=use_ema)
 
 
 def load_checkpoint(
