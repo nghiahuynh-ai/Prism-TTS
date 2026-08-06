@@ -45,7 +45,7 @@ data:
       # Upper bound for dynamic batch size (allows adding samples when memory is underused).
       max_batch_size: 1024
       # Sampler RNG seed; null falls back to trainer.seed (or 0).
-      seed: null
+      seed: 6677
 
   shared_layout:
     # Discrete ids are [0, discrete_token_count - 1].
