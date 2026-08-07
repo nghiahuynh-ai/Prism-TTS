@@ -327,7 +327,7 @@ def main() -> None:
         append_eos=bool(dataset_cfg.get("append_eos_to_text", False)),
     )
 
-    prompt_audio, prompt_sample_rate = generate_utils.read_wav(args.prompt_audio)
+    prompt_audio, prompt_sample_rate = generate_utils.read_audio(args.prompt_audio)
 
     feature_extractor = AutoFeatureExtractor.from_pretrained(
         args.mimi_model,

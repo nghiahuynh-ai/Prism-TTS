@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -39,7 +39,7 @@ except ModuleNotFoundError:
 
 
 SchedulerFactory = Callable[[torch.optim.Optimizer], Any]
-AudioDecoder = Callable[[torch.FloatTensor], torch.Tensor | np.ndarray]
+AudioDecoder = Callable[[torch.FloatTensor], Union[torch.Tensor, np.ndarray]]
 
 PrismBatch = LU.PrismBatch
 PeriodicEvalSample = LU.PeriodicEvalSample

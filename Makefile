@@ -2,12 +2,13 @@ SHELL := /bin/bash
 
 .DEFAULT_GOAL := help
 
-.PHONY: help train validate test unit-test eval generate
+.PHONY: help train validate test unit-test eval generate generate-metadata
 
 PYTHON ?= python3
 TRAIN_SCRIPT ?= train.py
 EVAL_SCRIPT ?= evaluate/eval.py
 GENERATE_SCRIPT ?= generate.py
+GENERATE_METADATA_SCRIPT ?= scripts/generate_from_metadata.py
 
 TRAINER_CONFIG ?= config/trainer.yaml
 MODEL_CONFIG ?= config/model.yaml
@@ -23,7 +24,19 @@ EXPERIMENT_CONFIG ?= config/experiment.yaml
 endif
 
 CKPT ?=
+DISCRETE_CKPT ?=
+CONTINUOUS_CKPT ?=
 PRETRAINED_WEIGHTS ?=
+
+# Batch inference defaults for the LibriSpeech-style four-column metadata
+# format: target_id|target_text|prompt_id|prompt_text.
+METADATA ?= /astro/nghiahuynh/data/librispeech/LibriSpeech/metadata-test-clean.txt
+METADATA_AUDIO_ROOT ?= /astro/nghiahuynh/data/librispeech/LibriSpeech
+# Leave empty to infer the split from metadata-test-clean.txt.
+METADATA_SPLIT ?=
+METADATA_AUDIO_EXTENSION ?= .flac
+METADATA_OUTPUT_DIR ?= synth/librispeech-test-clean
+METADATA_REPORT ?= $(METADATA_OUTPUT_DIR)/report.jsonl
 
 # Defaults aligned with config/experiment.yaml
 WANDB_PROJECT ?= prism_tts
@@ -42,6 +55,7 @@ TEST_ARGS ?=
 PYTEST_ARGS ?=
 EVAL_ARGS ?=
 GENERATE_ARGS ?=
+METADATA_ARGS ?= --skip-existing
 
 COMMON_TRAIN_ARGS = \
 	--trainer-config $(TRAINER_CONFIG) \
@@ -87,6 +101,26 @@ else
 PRETRAINED_WEIGHTS_ARG :=
 endif
 
+ifneq ($(strip $(METADATA_SPLIT)),)
+METADATA_SPLIT_ARG := --split "$(METADATA_SPLIT)"
+else
+METADATA_SPLIT_ARG :=
+endif
+
+ifneq ($(strip $(METADATA_REPORT)),)
+METADATA_REPORT_ARG := --report "$(METADATA_REPORT)"
+else
+METADATA_REPORT_ARG :=
+endif
+
+ifneq ($(strip $(DISCRETE_CKPT)$(CONTINUOUS_CKPT)),)
+METADATA_CHECKPOINT_ARGS := \
+	--discrete-checkpoint "$(DISCRETE_CKPT)" \
+	--continuous-checkpoint "$(CONTINUOUS_CKPT)"
+else
+METADATA_CHECKPOINT_ARGS := --checkpoint "$(CKPT)"
+endif
+
 help:
 	@echo "Prism-TTS workflow automation"
 	@echo ""
@@ -96,10 +130,12 @@ help:
 	@echo "  make test       - Train/Resume then run test loop (--test-after-fit)"
 	@echo "  make unit-test  - Run pytest suite in ./test"
 	@echo "  make eval       - Evaluate outputs (TBD until evaluate/eval.py is implemented)"
-	@echo "  make generate   - Generate samples (TBD until generate.py is implemented)"
+	@echo "  make generate            - Generate one sample with generate.py"
+	@echo "  make generate-metadata   - Batch-generate from four-column LibriSpeech metadata"
 	@echo ""
 	@echo "Common overrides:"
-	@echo "  CKPT=<path>            Add --ckpt-path"
+	@echo "  CKPT=<path>            Add --ckpt-path (or legacy --checkpoint for generate-metadata)"
+	@echo "  DISCRETE_CKPT=... CONTINUOUS_CKPT=...  Two-stage generate-metadata checkpoints"
 	@echo "  PRETRAINED_WEIGHTS=<path>  Initialize model weights without resuming Trainer state"
 	@echo "  EXPERIMENT=<name>      Use config/<name>.yaml as experiment config"
 	@echo "  EXPERIMENT_CONFIG=...  Override experiment config"
@@ -115,6 +151,11 @@ help:
 	@echo "  WANDB_GROUP=...        Override WandB group"
 	@echo "  WANDB_TAGS=a,b,c       Override WandB tags"
 	@echo "  PYTORCH_CUDA_ALLOC_CONF=...  CUDA allocator config (default: expandable segments)"
+	@echo "  METADATA=...            Four-column target/prompt metadata file"
+	@echo "  METADATA_AUDIO_ROOT=... LibriSpeech root containing split directories"
+	@echo "  METADATA_SPLIT=...      Override inferred split (e.g. test-clean)"
+	@echo "  METADATA_OUTPUT_DIR=... Batch WAV output directory"
+	@echo "  METADATA_REPORT=...     JSONL batch report path (empty to disable)"
 	@echo ""
 	@echo "Extra args:"
 	@echo "  TRAIN_ARGS='...'"
@@ -123,6 +164,7 @@ help:
 	@echo "  PYTEST_ARGS='...'"
 	@echo "  EVAL_ARGS='...'"
 	@echo "  GENERATE_ARGS='...'"
+	@echo "  METADATA_ARGS='...'"
 
 train:
 	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
@@ -157,3 +199,27 @@ generate:
 	else \
 		$(PYTHON) $(GENERATE_SCRIPT) $(GENERATE_ARGS); \
 	fi
+
+generate-metadata:
+	@if [ -n "$(CKPT)" ] && { [ -n "$(DISCRETE_CKPT)" ] || [ -n "$(CONTINUOUS_CKPT)" ]; }; then \
+		echo "[make generate-metadata] Use CKPT for legacy generation, or DISCRETE_CKPT plus CONTINUOUS_CKPT for two-stage generation." >&2; \
+		exit 2; \
+	fi
+	@if [ -z "$(CKPT)" ] && { [ -z "$(DISCRETE_CKPT)" ] || [ -z "$(CONTINUOUS_CKPT)" ]; }; then \
+		echo "[make generate-metadata] Set CKPT, or both DISCRETE_CKPT and CONTINUOUS_CKPT." >&2; \
+		exit 2; \
+	fi
+	@if [ ! -s "$(GENERATE_METADATA_SCRIPT)" ]; then \
+		echo "[make generate-metadata] Missing script: $(GENERATE_METADATA_SCRIPT)" >&2; \
+		exit 2; \
+	fi
+	PYTORCH_CUDA_ALLOC_CONF="$(PYTORCH_CUDA_ALLOC_CONF)" \
+	$(PYTHON) $(GENERATE_METADATA_SCRIPT) \
+		$(METADATA_CHECKPOINT_ARGS) \
+		--metadata "$(METADATA)" \
+		--audio-root "$(METADATA_AUDIO_ROOT)" \
+		$(METADATA_SPLIT_ARG) \
+		--audio-extension "$(METADATA_AUDIO_EXTENSION)" \
+		--output-dir "$(METADATA_OUTPUT_DIR)" \
+		$(METADATA_REPORT_ARG) \
+		$(METADATA_ARGS)
