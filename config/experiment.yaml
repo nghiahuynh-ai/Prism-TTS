@@ -13,10 +13,10 @@ experiment:
   # experiment-specific values here.
   trainer:
     logger:
-      name: masking
+      name: ar-2048
 
     checkpoint:
-      dirpath: checkpoints/masking
+      dirpath: checkpoints/ar-2048
 
     distributed:
       enabled: true

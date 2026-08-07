@@ -26,6 +26,7 @@ __all__ = [
     "discrete_quality_score",
     "estimate_max_new_blocks",
     "is_collapsed_discrete_stats",
+    "read_audio",
     "load_checkpoint",
     "read_wav",
     "read_yaml",
@@ -189,6 +190,47 @@ def read_wav(path: Path) -> tuple[np.ndarray, int]:
     if channels > 1:
         audio = audio.reshape(-1, channels).mean(axis=1)
     return audio.astype(np.float32, copy=False), sample_rate
+
+
+def read_audio(path: Path) -> tuple[np.ndarray, int]:
+    """Read mono audio from a WAV or any format supported by SoundFile.
+
+    The original inference entry point only needed PCM WAV input and keeps
+    :func:`read_wav` for that lightweight dependency-free path.  Benchmark
+    manifests such as LibriSpeech, however, reference FLAC files.  SoundFile
+    provides reliable FLAC support while preserving the existing WAV fallback
+    when it is not installed.
+    """
+    resolved = path.expanduser()
+    if not resolved.is_absolute():
+        resolved = Path.cwd() / resolved
+    resolved = resolved.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Audio file not found: {resolved}")
+
+    try:
+        import soundfile as sf
+    except ModuleNotFoundError as exc:
+        if resolved.suffix.lower() in {".wav", ".wave"}:
+            return read_wav(resolved)
+        raise ImportError(
+            f"Reading {resolved.suffix or 'this audio format'} requires SoundFile. "
+            "Install project dependencies with `pip install -r requirements.txt`."
+        ) from exc
+
+    try:
+        audio, sample_rate = sf.read(str(resolved), dtype="float32", always_2d=False)
+    except RuntimeError as exc:
+        raise RuntimeError(f"Unable to decode audio file: {resolved}") from exc
+
+    waveform = np.asarray(audio, dtype=np.float32)
+    if waveform.size == 0:
+        raise ValueError(f"Audio file is empty: {resolved}")
+    if waveform.ndim == 2:
+        waveform = waveform.mean(axis=1)
+    elif waveform.ndim != 1:
+        raise ValueError(f"Unexpected audio shape {tuple(waveform.shape)} from {resolved}")
+    return waveform.astype(np.float32, copy=False), int(sample_rate)
 
 
 def write_wav(path: Path, waveform: np.ndarray, sample_rate: int) -> None:
