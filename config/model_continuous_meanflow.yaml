@@ -1,0 +1,33 @@
+# Stage 2: causal MeanFlow continuous-latent model conditioned on discrete tokens.
+model:
+  name: prism_continuous_meanflow
+  prism_tts:
+    num_discrete_tokens: 1
+    discrete_vocab_size: 2051
+    continuous_latent_size: 512
+    normalize_continuous_latents: true
+    continuous_latent_mean: 0.008161894
+    continuous_latent_std: 3.101865141
+    continuous_latent_std_eps: 1.0e-6
+    # A window is sampled uniformly from this inclusive range during training.
+    min_train_window: 1
+    max_train_window: 16
+    # Active patch frames independently sample t in [eps, 1-eps].
+    time_epsilon: 1.0e-4
+
+  llama_config:
+    vocab_size: 2444
+    hidden_size: 512
+    intermediate_size: 2048
+    num_hidden_layers: 16
+    num_attention_heads: 8
+    num_key_value_heads: 8
+    max_position_embeddings: 8192
+    rope_theta: 10000.0
+    rms_norm_eps: 1.0e-6
+    initializer_range: 0.02
+    pad_token_id: 2050
+    eos_token_id: 2049
+    use_cache: false
+    tie_word_embeddings: false
+    _attn_implementation: sdpa

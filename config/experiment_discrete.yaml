@@ -1,0 +1,6 @@
+experiment:
+  name: prism-discrete
+  config_paths:
+    trainer: config/trainer_discrete.yaml
+    model: config/model_discrete.yaml
+    data: config/data.yaml

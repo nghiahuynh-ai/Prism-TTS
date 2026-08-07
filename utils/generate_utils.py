@@ -13,6 +13,8 @@ from transformers import LlamaConfig
 
 from dataset.dataset import SharedVocabTokenizer
 from models.prism_tts import PrismTTS
+from models.prism_discrete_tts import PrismDiscreteTTS
+from models.prism_continuous_meanflow import PrismContinuousMeanFlowTTS
 from utils.pretrained_weights import extract_model_state_dict
 
 try:
@@ -84,12 +86,46 @@ def require_mapping(config: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def build_model(model_config: dict[str, Any]) -> PrismTTS:
+def build_model(
+    model_config: dict[str, Any],
+) -> PrismTTS | PrismDiscreteTTS | PrismContinuousMeanFlowTTS:
     model_cfg = require_mapping(model_config, "model")
     prism_cfg = require_mapping(model_cfg, "prism_tts")
     llama_cfg = dict(require_mapping(model_cfg, "llama_config"))
 
     llama_config = LlamaConfig(**llama_cfg)
+    model_name = str(model_cfg.get("name", "prism_tts"))
+    if model_name == "prism_discrete":
+        return PrismDiscreteTTS(
+            llama_config=llama_config,
+            num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
+            discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
+            discrete_regular_token_loss_weight=float(
+                prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
+            ),
+            discrete_special_token_loss_weight=float(
+                prism_cfg.get("discrete_special_token_loss_weight", 1.0)
+            ),
+        )
+    if model_name == "prism_continuous_meanflow":
+        return PrismContinuousMeanFlowTTS(
+            llama_config=llama_config,
+            num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
+            discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
+            continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
+            min_train_window=int(prism_cfg.get("min_train_window", 1)),
+            max_train_window=int(prism_cfg.get("max_train_window", 16)),
+            time_epsilon=float(prism_cfg.get("time_epsilon", 1e-4)),
+            normalize_continuous_latents=prism_cfg.get("normalize_continuous_latents", False),
+            continuous_latent_mean=prism_cfg.get("continuous_latent_mean", 0.0),
+            continuous_latent_std=prism_cfg.get("continuous_latent_std", 1.0),
+            continuous_latent_std_eps=float(prism_cfg.get("continuous_latent_std_eps", 1e-6)),
+        )
+    if model_name != "prism_tts":
+        raise ValueError(
+            f"Unsupported model.name={model_name!r}. Supported: prism_tts, prism_discrete, "
+            "prism_continuous_meanflow."
+        )
     return PrismTTS(
         llama_config=llama_config,
         num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
@@ -122,7 +158,7 @@ def _extract_model_state_dict(
 
 
 def load_checkpoint(
-    model: PrismTTS,
+    model: PrismTTS | PrismDiscreteTTS | PrismContinuousMeanFlowTTS,
     checkpoint_path: Path,
     *,
     use_ema: bool,
@@ -137,6 +173,24 @@ def load_checkpoint(
     payload = torch.load(resolved, map_location="cpu")
     if not isinstance(payload, dict):
         raise ValueError(f"Unsupported checkpoint payload type: {type(payload).__name__}.")
+
+    expected_stage = str(getattr(model, "stage", "joint"))
+    saved_stage = payload.get("prism_stage")
+    if saved_stage is not None and str(saved_stage) != expected_stage:
+        raise RuntimeError(
+            f"Checkpoint stage mismatch: checkpoint is {saved_stage!r}, "
+            f"but the configured model is {expected_stage!r}."
+        )
+    representation = payload.get("prism_representation")
+    if isinstance(representation, dict):
+        for name in ("num_discrete_tokens", "discrete_vocab_size", "continuous_latent_size"):
+            saved_value = representation.get(name)
+            current_value = getattr(model, name, 0)
+            if saved_value is not None and int(saved_value) != int(current_value):
+                raise RuntimeError(
+                    f"Checkpoint representation mismatch for {name}: "
+                    f"checkpoint={saved_value}, configured={current_value}."
+                )
 
     state_dict = _extract_model_state_dict(payload, use_ema=use_ema)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)

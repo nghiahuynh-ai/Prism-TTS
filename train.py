@@ -32,6 +32,8 @@ from transformers import LlamaConfig
 from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism_sample_lengths
 from dataset.dataset import BatchCollate, PrismDataset, build_shared_token_layout
 from models.prism_tts import PrismTTS
+from models.prism_discrete_tts import PrismDiscreteTTS
+from models.prism_continuous_meanflow import PrismContinuousMeanFlowTTS
 from models.prism_tts_lightning import PrismTTSLightning
 from utils.pretrained_weights import load_pretrained_weights
 
@@ -473,11 +475,14 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
         )
 
 
-def _build_model(config: dict[str, Any]) -> PrismTTS:
+def _build_model(config: dict[str, Any]) -> PrismTTS | PrismDiscreteTTS | PrismContinuousMeanFlowTTS:
     model_cfg = _require_mapping(config, "model")
     model_name = model_cfg.get("name", "prism_tts")
-    if model_name != "prism_tts":
-        raise ValueError(f"Unsupported model.name={model_name!r}. Only 'prism_tts' is supported.")
+    if model_name not in {"prism_tts", "prism_discrete", "prism_continuous_meanflow"}:
+        raise ValueError(
+            f"Unsupported model.name={model_name!r}. Supported: prism_tts, prism_discrete, "
+            "prism_continuous_meanflow."
+        )
 
     prism_cfg = _require_mapping(model_cfg, "prism_tts")
     llama_cfg = dict(_require_mapping(model_cfg, "llama_config"))
@@ -497,21 +502,40 @@ def _build_model(config: dict[str, Any]) -> PrismTTS:
         )
     llama_config = LlamaConfig(**llama_cfg)
 
-    return PrismTTS(
+    common_kwargs = dict(
         llama_config=llama_config,
         num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
         discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
-        continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
-        flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
-        flow_model_channels=prism_cfg.get("flow_model_channels"),
-        flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
-        continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
         discrete_regular_token_loss_weight=float(
             prism_cfg.get("discrete_regular_token_loss_weight", 1.0)
         ),
         discrete_special_token_loss_weight=float(
             prism_cfg.get("discrete_special_token_loss_weight", 1.0)
         ),
+    )
+    if model_name == "prism_discrete":
+        return PrismDiscreteTTS(**common_kwargs)
+    if model_name == "prism_continuous_meanflow":
+        return PrismContinuousMeanFlowTTS(
+            llama_config=llama_config,
+            num_discrete_tokens=int(prism_cfg["num_discrete_tokens"]),
+            discrete_vocab_size=int(prism_cfg["discrete_vocab_size"]),
+            continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
+            min_train_window=int(prism_cfg.get("min_train_window", 1)),
+            max_train_window=int(prism_cfg.get("max_train_window", 16)),
+            time_epsilon=float(prism_cfg.get("time_epsilon", 1e-4)),
+            normalize_continuous_latents=prism_cfg.get("normalize_continuous_latents", False),
+            continuous_latent_mean=prism_cfg.get("continuous_latent_mean", 0.0),
+            continuous_latent_std=prism_cfg.get("continuous_latent_std", 1.0),
+            continuous_latent_std_eps=float(prism_cfg.get("continuous_latent_std_eps", 1e-6)),
+        )
+    return PrismTTS(
+        **common_kwargs,
+        continuous_latent_size=int(prism_cfg["continuous_latent_size"]),
+        flow_num_res_blocks=int(prism_cfg.get("flow_num_res_blocks", 4)),
+        flow_model_channels=prism_cfg.get("flow_model_channels"),
+        flow_loss_weight=float(prism_cfg.get("flow_loss_weight", 1.0)),
+        continuous_loss_weight=float(prism_cfg.get("continuous_loss_weight", 1.0)),
         flow_sample_steps=int(prism_cfg.get("flow_sample_steps", 64)),
         normalize_continuous_latents=prism_cfg.get("normalize_continuous_latents", False),
         continuous_latent_mean=prism_cfg.get("continuous_latent_mean", 0.0),
@@ -567,7 +591,7 @@ def _build_scheduler_factory(
 
 def _build_lightning_module(
     config: dict[str, Any],
-    model: PrismTTS,
+    model: PrismTTS | PrismDiscreteTTS | PrismContinuousMeanFlowTTS,
 ) -> PrismTTSLightning:
     trainer_cfg = _require_mapping(config, "trainer")
     module_cfg = _require_mapping(trainer_cfg, "lightning_module")

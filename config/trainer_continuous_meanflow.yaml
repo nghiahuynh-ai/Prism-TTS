@@ -1,0 +1,63 @@
+trainer:
+  seed: null
+  seed_workers: true
+  lightning_module:
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.95]
+    eval_every_n_steps: 100000
+    log_media_on_validation_end: false
+    cuda_cache_cleanup_every_n_steps: 0
+    ema_decay: 0.999
+    ema_start_step: 0
+    ema_update_every_n_steps: 1
+    ema_warmup_steps: 0
+    use_ema_for_validation: true
+    use_ema_for_periodic_eval: false
+    sync_dist_logging: false
+  distributed:
+    enabled: false
+    accelerator: gpu
+    devices: auto
+    strategy: ddp_find_unused_parameters_false
+    num_nodes: 1
+    sync_dist_logging: true
+  optimizer:
+    name: adamw
+    foreach: false
+  scheduler:
+    name: cosine_with_warmup
+    enabled: true
+    warmup_steps: 2000
+    min_lr_ratio: 0.1
+  lightning_trainer:
+    accelerator: auto
+    devices: 1
+    strategy: auto
+    precision: bf16-mixed
+    max_steps: 2000000
+    gradient_clip_val: 1.0
+    accumulate_grad_batches: 1
+    log_every_n_steps: 10
+    val_check_interval: 100000
+    num_sanity_val_steps: 0
+    benchmark: true
+    deterministic: false
+    enable_checkpointing: true
+    enable_progress_bar: true
+    enable_model_summary: true
+  checkpoint:
+    dirpath: checkpoints/continuous_meanflow
+    filename: prism-continuous-{step:07d}
+    monitor: val/loss
+    mode: min
+    save_top_k: 3
+    save_last: true
+    every_n_train_steps: 100000
+  logger:
+    type: wandb
+    project: prism_tts
+    name: continuous-meanflow
+    save_dir: logs
+    offline: false
+    log_model: false

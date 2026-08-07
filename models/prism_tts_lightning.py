@@ -10,6 +10,8 @@ import torch
 from torch.optim import AdamW
 
 from models.prism_tts import PrismTTS
+from models.prism_discrete_tts import PrismDiscreteTTS
+from models.prism_continuous_meanflow import PrismContinuousMeanFlowTTS
 from utils import lightning_utils as LU
 from utils.model_utils import (
     PrismTTSGenerationOutput,
@@ -51,7 +53,7 @@ class PrismTTSLightning(pl.LightningModule):
 
     def __init__(
         self,
-        model: PrismTTS,
+        model: PrismTTS | PrismDiscreteTTS | PrismContinuousMeanFlowTTS,
         learning_rate: float = 3e-4,
         weight_decay: float = 0.01,
         betas: tuple[float, float] = (0.9, 0.95),
@@ -327,6 +329,15 @@ class PrismTTSLightning(pl.LightningModule):
             self._periodic_eval_active = False
 
     def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        checkpoint["prism_stage"] = str(getattr(self.model, "stage", "joint"))
+        checkpoint["prism_representation"] = {
+            "num_discrete_tokens": int(getattr(self.model, "num_discrete_tokens", 0)),
+            "discrete_vocab_size": int(getattr(self.model, "discrete_vocab_size", 0)),
+            "continuous_latent_size": int(getattr(self.model, "continuous_latent_size", 0)),
+            "normalize_continuous_latents": bool(
+                getattr(self.model, "normalize_continuous_latents", False)
+            ),
+        }
         if not self._ema_state:
             return
         checkpoint["ema_state"] = {
@@ -347,6 +358,57 @@ class PrismTTSLightning(pl.LightningModule):
         self._last_ema_step = int(checkpoint.get("ema_last_step", -1))
 
     def _forward_batch(self, batch_inputs: PrismBatch) -> PrismTTSOutput:
+        stage = getattr(self.model, "stage", "joint")
+        if stage == "continuous_meanflow":
+            required = (
+                batch_inputs.text_prompt,
+                batch_inputs.discrete_prompt,
+                batch_inputs.continuous_prompt,
+                batch_inputs.text_target,
+                batch_inputs.discrete_target,
+                batch_inputs.continuous_target,
+            )
+            if any(value is None for value in required):
+                raise ValueError(
+                    "Continuous MeanFlow batches require prompt and target text, "
+                    "discrete tokens, and continuous latents."
+                )
+            return self.model(
+                text_prompt=batch_inputs.text_prompt,
+                discrete_prompt=batch_inputs.discrete_prompt,
+                continuous_prompt=batch_inputs.continuous_prompt,
+                text_target=batch_inputs.text_target,
+                discrete_target=batch_inputs.discrete_target,
+                continuous_target=batch_inputs.continuous_target,
+                text_prompt_lengths=batch_inputs.text_prompt_lengths,
+                speech_prompt_lengths=batch_inputs.speech_prompt_lengths,
+                text_target_lengths=batch_inputs.text_target_lengths,
+                speech_target_lengths=batch_inputs.speech_target_lengths,
+                return_dict=True,
+            )
+
+        if stage == "discrete":
+            if (
+                batch_inputs.flat_token_ids is None
+                or batch_inputs.flat_discrete_values is None
+                or batch_inputs.flat_token_type_ids is None
+                or batch_inputs.flat_target_discrete_values is None
+                or batch_inputs.flat_target_block_ids is None
+            ):
+                raise ValueError(
+                    "Discrete AR batches require flattened token ids, discrete values, "
+                    "token types, target discrete values, and target block ids."
+                )
+            return self.model(
+                flat_token_ids=batch_inputs.flat_token_ids,
+                flat_discrete_values=batch_inputs.flat_discrete_values,
+                flat_token_type_ids=batch_inputs.flat_token_type_ids,
+                flat_target_discrete_values=batch_inputs.flat_target_discrete_values,
+                flat_target_block_ids=batch_inputs.flat_target_block_ids,
+                attention_mask=batch_inputs.attention_mask,
+                return_dict=True,
+            )
+
         if (
             batch_inputs.flat_token_ids is None
             or batch_inputs.flat_discrete_values is None
@@ -560,6 +622,11 @@ class PrismTTSLightning(pl.LightningModule):
         )
 
     def _run_periodic_eval(self, train_batch: Optional[Any] = None) -> None:
+        # Two-stage generation requires both checkpoints.  The standalone
+        # wrappers keep validation loss/EMA behavior, while end-to-end audio is
+        # evaluated by the two-checkpoint generator.
+        if getattr(self.model, "stage", "joint") != "joint":
+            return
         eval_batch = self._next_eval_batch()
         if train_batch is None:
             train_batch = self._next_train_batch()

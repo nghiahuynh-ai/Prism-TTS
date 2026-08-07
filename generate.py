@@ -25,14 +25,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        required=True,
-        help="Path to a PrismTTS checkpoint (.ckpt or state_dict .pt).",
+        default=None,
+        help="Legacy joint PrismTTS checkpoint. Use the two stage-specific checkpoints for new models.",
     )
     parser.add_argument(
         "--model-config",
         type=Path,
         default=Path("config/model.yaml"),
         help="Path to model YAML config.",
+    )
+    parser.add_argument(
+        "--discrete-checkpoint",
+        type=Path,
+        default=None,
+        help="Stage-1 PrismDiscreteTTS checkpoint.",
+    )
+    parser.add_argument(
+        "--discrete-model-config",
+        type=Path,
+        default=Path("config/model_discrete.yaml"),
+        help="Stage-1 discrete model YAML config.",
+    )
+    parser.add_argument(
+        "--continuous-checkpoint",
+        type=Path,
+        default=None,
+        help="Stage-2 PrismContinuousMeanFlowTTS checkpoint.",
+    )
+    parser.add_argument(
+        "--continuous-model-config",
+        type=Path,
+        default=Path("config/model_continuous_meanflow.yaml"),
+        help="Stage-2 continuous MeanFlow model YAML config.",
     )
     parser.add_argument(
         "--data-config",
@@ -152,6 +176,18 @@ def parse_args() -> argparse.Namespace:
         help="Override flow sampling steps for continuous latents.",
     )
     parser.add_argument(
+        "--continuous-window-size",
+        type=str,
+        default="1",
+        help="One positive patch width or comma-separated widths that cover the generated sequence.",
+    )
+    parser.add_argument(
+        "--continuous-time-stagger",
+        type=float,
+        default=0.5,
+        help="Stage-2 per-frame integration-time staggering in [0, 1).",
+    )
+    parser.add_argument(
         "--generation-method",
         type=str,
         default="ar",
@@ -200,6 +236,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _parse_continuous_window_size(value: str) -> int | list[int]:
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if not parts:
+        raise ValueError("--continuous-window-size must not be empty.")
+    try:
+        widths = [int(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError("--continuous-window-size must contain positive integers.") from exc
+    if any(width < 1 for width in widths):
+        raise ValueError("--continuous-window-size values must be >= 1.")
+    return widths[0] if len(widths) == 1 else widths
+
+
 def main() -> None:
     args = parse_args()
     if args.seed is not None:
@@ -209,12 +258,54 @@ def main() -> None:
     device = generate_utils.resolve_device(args.device)
     model_dtype = generate_utils.resolve_torch_dtype(args.dtype)
 
-    model_config = generate_utils.read_yaml(args.model_config)
     data_config = generate_utils.read_yaml(args.data_config)
-    model = generate_utils.build_model(model_config)
-    generate_utils.load_checkpoint(model, args.checkpoint, use_ema=bool(args.use_ema))
-    model.to(device=device, dtype=model_dtype)
-    model.eval()
+    has_discrete = args.discrete_checkpoint is not None
+    has_continuous = args.continuous_checkpoint is not None
+    if has_discrete != has_continuous:
+        raise ValueError(
+            "Two-stage generation requires both --discrete-checkpoint and --continuous-checkpoint."
+        )
+    two_stage = has_discrete and has_continuous
+    if two_stage:
+        discrete_model = generate_utils.build_model(
+            generate_utils.read_yaml(args.discrete_model_config)
+        )
+        continuous_model = generate_utils.build_model(
+            generate_utils.read_yaml(args.continuous_model_config)
+        )
+        if getattr(discrete_model, "stage", None) != "discrete":
+            raise ValueError("--discrete-model-config must select model.name=prism_discrete.")
+        if getattr(continuous_model, "stage", None) != "continuous_meanflow":
+            raise ValueError(
+                "--continuous-model-config must select model.name=prism_continuous_meanflow."
+            )
+        if (
+            discrete_model.num_discrete_tokens != continuous_model.num_discrete_tokens
+            or discrete_model.discrete_vocab_size != continuous_model.discrete_vocab_size
+        ):
+            raise ValueError("Discrete and continuous stage configs have incompatible token layouts.")
+        generate_utils.load_checkpoint(
+            discrete_model, args.discrete_checkpoint, use_ema=bool(args.use_ema)
+        )
+        generate_utils.load_checkpoint(
+            continuous_model, args.continuous_checkpoint, use_ema=bool(args.use_ema)
+        )
+        discrete_model.to(device=device, dtype=model_dtype).eval()
+        continuous_model.to(device=device, dtype=model_dtype).eval()
+        model = continuous_model
+    else:
+        if args.checkpoint is None:
+            raise ValueError(
+                "Provide --checkpoint for legacy joint generation, or both stage-specific checkpoints."
+            )
+        model_config = generate_utils.read_yaml(args.model_config)
+        model = generate_utils.build_model(model_config)
+        if getattr(model, "stage", None) is not None:
+            raise ValueError("A stage-specific model config requires both stage-specific checkpoints.")
+        generate_utils.load_checkpoint(model, args.checkpoint, use_ema=bool(args.use_ema))
+        model.to(device=device, dtype=model_dtype).eval()
+        discrete_model = model
+        continuous_model = model
 
     data_cfg = generate_utils.require_mapping(data_config, "data")
     shared_layout_cfg = generate_utils.require_mapping(data_cfg, "shared_layout")
@@ -293,7 +384,7 @@ def main() -> None:
         prompt_latents = mimi_model.quantizer.decode(prompt_codes)
         # prompt_codes: [B, N, T], prompt_latents: [B, C, T]
 
-    raw_prompt_discrete = prompt_codes[0, : model.num_discrete_tokens].transpose(0, 1).to(
+    raw_prompt_discrete = prompt_codes[0, : discrete_model.num_discrete_tokens].transpose(0, 1).to(
         dtype=torch.long
     ).cpu()
     raw_prompt_continuous = prompt_latents[0].transpose(0, 1).to(dtype=torch.float32).cpu()
@@ -328,6 +419,8 @@ def main() -> None:
     text_target = target_text_tokens.unsqueeze(0).to(device=device, dtype=torch.long)
     special_token_ids = (eos_token_id, pad_token_id)
 
+    continuous_window_size = _parse_continuous_window_size(args.continuous_window_size)
+
     def _run_generation(
         *,
         do_sample: bool,
@@ -336,6 +429,50 @@ def main() -> None:
         top_p: float,
     ) -> Any:
         with torch.no_grad():
+            if two_stage:
+                discrete_generation = discrete_model.generate(
+                    text_prompt=text_prompt,
+                    discrete_prompt=discrete_prompt,
+                    text_target=text_target,
+                    text_prompt_lengths=torch.tensor([text_prompt.shape[1]], device=device, dtype=torch.long),
+                    speech_prompt_lengths=torch.tensor(
+                        [raw_prompt_discrete.shape[0]], device=device, dtype=torch.long
+                    ),
+                    text_target_lengths=torch.tensor([text_target.shape[1]], device=device, dtype=torch.long),
+                    max_new_blocks=int(max_new_blocks),
+                    discrete_eos_token_id=eos_token_id,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                    return_dict=True,
+                )
+                if discrete_generation.discrete_ids is None:
+                    raise RuntimeError("Stage 1 produced no discrete tokens.")
+                generation = continuous_model.generate(
+                    text_prompt=text_prompt,
+                    discrete_prompt=discrete_prompt,
+                    continuous_prompt=continuous_prompt,
+                    text_target=text_target,
+                    discrete_target=discrete_generation.discrete_ids,
+                    text_prompt_lengths=torch.tensor([text_prompt.shape[1]], device=device, dtype=torch.long),
+                    speech_prompt_lengths=torch.tensor(
+                        [raw_prompt_discrete.shape[0]], device=device, dtype=torch.long
+                    ),
+                    text_target_lengths=torch.tensor([text_target.shape[1]], device=device, dtype=torch.long),
+                    discrete_target_lengths=torch.tensor(
+                        [discrete_generation.discrete_ids.shape[-1]], device=device, dtype=torch.long
+                    ),
+                    window_size=continuous_window_size,
+                    flow_num_steps=args.flow_num_steps,
+                    time_stagger=args.continuous_time_stagger,
+                    return_dict=True,
+                )
+                if generation.continuous_latents is not None:
+                    generation.discrete_ids = discrete_generation.discrete_ids[
+                        :, :, : generation.continuous_latents.shape[1]
+                    ]
+                return generation
             return model.generate(
                 text_prompt=text_prompt,
                 discrete_prompt=discrete_prompt,
@@ -376,7 +513,7 @@ def main() -> None:
             return None
         candidate_stats = generate_utils.summarize_discrete_generation(
             discrete_ids=candidate_generation.discrete_ids[0],
-            num_discrete_tokens=int(model.num_discrete_tokens),
+            num_discrete_tokens=int(discrete_model.num_discrete_tokens),
             special_token_ids=special_token_ids,
         )
         attempt_records.append(
@@ -483,7 +620,7 @@ def main() -> None:
         sample_latents = generate_utils.trim_latent_special_blocks(
             latents=sample_latents,
             discrete_ids=sample_discrete,
-            num_discrete_tokens=int(model.num_discrete_tokens),
+            num_discrete_tokens=int(discrete_model.num_discrete_tokens),
             special_token_ids=special_token_ids,
             trim_head=bool(args.trim_leading_special_blocks),
             trim_tail=bool(args.trim_tail_special_blocks),

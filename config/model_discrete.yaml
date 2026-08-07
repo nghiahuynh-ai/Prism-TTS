@@ -1,0 +1,27 @@
+# Stage 1: causal discrete-token AR model.
+model:
+  name: prism_discrete
+  prism_tts:
+    num_discrete_tokens: 1
+    discrete_vocab_size: 2051
+    # Retained for shared data-layout validation; Stage 1 never consumes it.
+    continuous_latent_size: 512
+    discrete_regular_token_loss_weight: 1.0
+    discrete_special_token_loss_weight: 1.0
+
+  llama_config:
+    vocab_size: 2444
+    hidden_size: 1024
+    intermediate_size: 4096
+    num_hidden_layers: 16
+    num_attention_heads: 16
+    num_key_value_heads: 16
+    max_position_embeddings: 8192
+    rope_theta: 10000.0
+    rms_norm_eps: 1.0e-6
+    initializer_range: 0.02
+    pad_token_id: 2050
+    eos_token_id: 2049
+    use_cache: false
+    tie_word_embeddings: false
+    _attn_implementation: sdpa

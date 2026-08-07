@@ -1,0 +1,6 @@
+experiment:
+  name: prism-continuous-meanflow
+  config_paths:
+    trainer: config/trainer_continuous_meanflow.yaml
+    model: config/model_continuous_meanflow.yaml
+    data: config/data.yaml

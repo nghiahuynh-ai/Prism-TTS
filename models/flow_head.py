@@ -44,7 +44,11 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
+        # The sinusoidal construction is intentionally float32, but inference
+        # may place this module in bf16/fp16 without an autocast context.
+        # Match the first projection so both the legacy FlowHead and stage-2
+        # causal MeanFlow path work in their requested generation dtype.
+        t_emb = self.mlp(t_freq.to(dtype=self.mlp[0].weight.dtype))
         return t_emb
 
 
