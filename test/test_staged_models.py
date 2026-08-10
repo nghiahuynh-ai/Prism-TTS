@@ -12,7 +12,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from dataset.dataset import BatchCollate  # noqa: E402
+from dataset.dataset import (  # noqa: E402
+    ASR_TASK_ID,
+    PREDICTION_DISCRETE,
+    PREDICTION_TEXT,
+    TTS_TASK_ID,
+    BatchCollate,
+    MultitaskBatchCollate,
+)
 from models.prism_continuous_meanflow import PrismContinuousMeanFlowTTS  # noqa: E402
 from models.prism_discrete_tts import PrismDiscreteTTS  # noqa: E402
 from utils import model_utils as MU  # noqa: E402
@@ -83,6 +90,27 @@ def _discrete() -> PrismDiscreteTTS:
     )
 
 
+def _multitask_discrete() -> PrismDiscreteTTS:
+    return PrismDiscreteTTS(
+        llama_config=_config(),
+        num_discrete_tokens=2,
+        discrete_vocab_size=35,
+        tts_token_id=94,
+        asr_token_id=95,
+    )
+
+
+def _multitask_collate(task_mode: str) -> MultitaskBatchCollate:
+    return MultitaskBatchCollate(
+        discrete_token_count=32,
+        tts_token_id=94,
+        asr_token_id=95,
+        task_mode=task_mode,
+        text_token_offset=35,
+        text_vocab_size=59,
+    )
+
+
 def _continuous(**kwargs: object) -> PrismContinuousMeanFlowTTS:
     return PrismContinuousMeanFlowTTS(
         llama_config=_config(),
@@ -112,6 +140,149 @@ def test_discrete_stage_is_invariant_to_continuous_payloads() -> None:
         ).loss
 
     assert torch.allclose(run(batch), run(changed), atol=1e-7, rtol=0.0)
+
+
+def test_multitask_collate_builds_tts_and_asr_with_typed_targets() -> None:
+    batch = _multitask_collate("both")([_sample()])
+    assert batch["flat_task_ids"].tolist() == [TTS_TASK_ID, ASR_TASK_ID]
+
+    # TTS prepends its task token and retains one-frame-shifted speech targets.
+    tts_mask = batch["attention_mask"][0]
+    tts_len = int(tts_mask.sum().item())
+    assert batch["flat_token_ids"][0, :9].tolist() == [94, 40, 41, 32, 34, 34, 33, 42, 32]
+    assert batch["flat_prediction_kind"][0, :tts_len].tolist() == [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        PREDICTION_DISCRETE,
+        PREDICTION_DISCRETE,
+        PREDICTION_DISCRETE,
+        PREDICTION_DISCRETE,
+    ]
+    assert batch["flat_target_block_ids"][0, :tts_len].tolist() == [
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        -1,
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert batch["flat_target_discrete_values"][0, 8:12].tolist() == [
+        [5, 6],
+        [7, 8],
+        [9, 10],
+        [33, 33],
+    ]
+
+    # ASR observes the full speech utterance, then scalar EOS anchors target
+    # text.  The last transcript input anchors its EOT target.
+    asr_mask = batch["attention_mask"][1]
+    asr_len = int(asr_mask.sum().item())
+    assert batch["flat_token_ids"][1, :asr_len].tolist() == [95, 34, 34, 34, 33, 42]
+    assert batch["flat_token_type_ids"][1, :asr_len].tolist() == [0, 3, 3, 3, 0, 0]
+    assert batch["flat_prediction_kind"][1, :asr_len].tolist() == [
+        0,
+        0,
+        0,
+        0,
+        PREDICTION_TEXT,
+        PREDICTION_TEXT,
+    ]
+    assert batch["flat_target_text_values"][1, 4:6].tolist() == [42, 32]
+    assert torch.all(batch["flat_target_block_ids"][1, :asr_len] == -1)
+
+
+def test_multitask_random_collation_is_per_sample_and_seed_reproducible() -> None:
+    samples = [_sample(), _sample(), _sample(), _sample()]
+    torch.manual_seed(17)
+    first = _multitask_collate("random")(samples)
+    torch.manual_seed(17)
+    second = _multitask_collate("random")(samples)
+    assert first["flat_task_ids"].shape == (4,)
+    assert torch.equal(first["flat_task_ids"], second["flat_task_ids"])
+    assert set(first["flat_task_ids"].tolist()).issubset({TTS_TASK_ID, ASR_TASK_ID})
+
+
+def test_multitask_model_uses_typed_losses_and_is_causal_for_asr_text() -> None:
+    torch.manual_seed(4)
+    model = _multitask_discrete().eval()
+    sample = _sample()
+    sample["text_target"] = torch.tensor([42, 43], dtype=torch.long)
+    first = _multitask_collate("both")([sample])
+    changed_sample = {key: value.clone() for key, value in sample.items()}
+    changed_sample["text_target"] = torch.tensor([42, 44], dtype=torch.long)
+    second = _multitask_collate("both")([changed_sample])
+
+    outputs = model(
+        flat_token_ids=first["flat_token_ids"],
+        flat_discrete_values=first["flat_discrete_values"],
+        flat_token_type_ids=first["flat_token_type_ids"],
+        flat_target_discrete_values=first["flat_target_discrete_values"],
+        flat_target_block_ids=first["flat_target_block_ids"],
+        flat_target_text_values=first["flat_target_text_values"],
+        flat_prediction_kind=first["flat_prediction_kind"],
+        flat_task_ids=first["flat_task_ids"],
+        attention_mask=first["attention_mask"],
+    )
+    assert torch.isfinite(outputs.loss)
+    assert torch.isfinite(outputs.tts_loss)
+    assert torch.isfinite(outputs.asr_loss)
+    assert torch.allclose(outputs.loss, (outputs.tts_loss + outputs.asr_loss) / 2.0)
+    assert outputs.tts_sample_count.item() == 1
+    assert outputs.asr_sample_count.item() == 1
+
+    def first_asr_text_logits(batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        with torch.no_grad():
+            hidden = model._encode(
+                token_ids=batch["flat_token_ids"],
+                discrete_values=batch["flat_discrete_values"],
+                token_type_ids=batch["flat_token_type_ids"],
+                attention_mask=batch["attention_mask"],
+            )
+        asr_index = 1
+        first_text_anchor = torch.nonzero(
+            batch["flat_prediction_kind"][asr_index] == PREDICTION_TEXT,
+            as_tuple=False,
+        )[0].item()
+        return model._text_logits(hidden[asr_index, first_text_anchor]).detach()
+
+    # The second transcript character is a future input position, so it cannot
+    # affect the EOS anchor used to predict the first character.
+    assert torch.allclose(
+        first_asr_text_logits(first), first_asr_text_logits(second), atol=1e-6, rtol=1e-6
+    )
+
+
+def test_multitask_asr_generation_starts_from_the_asr_prefix() -> None:
+    torch.manual_seed(5)
+    model = _multitask_discrete().eval()
+    speech = _sample()["discrete_target"].unsqueeze(0)
+    prefix_ids, _, prefix_types = model._build_asr_generation_prefix(
+        discrete_speech=speech[0]
+    )
+    assert prefix_ids[0].tolist() == [95, 34, 34, 34, 33]
+    assert prefix_types[0].tolist() == [0, 3, 3, 3, 0]
+
+    transcription = model.transcribe(
+        discrete_speech=speech,
+        max_new_tokens=2,
+        do_sample=False,
+    )
+    assert transcription.text_ids is not None
+    assert transcription.text_ids.shape[0] == 1
+    if transcription.text_ids.numel():
+        assert torch.all((transcription.text_ids >= 35) & (transcription.text_ids < 94))
 
 
 def test_continuous_velocity_cannot_see_future_discrete_noise_or_time() -> None:

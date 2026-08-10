@@ -26,6 +26,15 @@ SPEECH_DISCRETE_TOKEN_TYPE = 1
 SPEECH_CONTINUOUS_TOKEN_TYPE = 2
 SPEECH_FRAME_TOKEN_TYPE = 3
 
+# Stage-1 multitask labels.  These are deliberately separate from token-type
+# ids: task ids describe the whole sequence, whereas prediction kinds describe
+# what the hidden state at an individual position is trained to emit.
+TTS_TASK_ID = 0
+ASR_TASK_ID = 1
+PREDICTION_NONE = 0
+PREDICTION_DISCRETE = 1
+PREDICTION_TEXT = 2
+
 
 def build_shared_token_layout(discrete_token_count: int) -> tuple[int, int, int, int]:
     """
@@ -923,3 +932,279 @@ class BatchCollate:
         if not all(presence):
             raise ValueError(f"{key} must be provided for all samples or for none.")
         output[key] = _pad_2d([sample[key] for sample in samples], pad_value)
+
+
+class MultitaskBatchCollate(BatchCollate):
+    """Build Stage-1 TTS/ASR causal sequences with one task per sample.
+
+    Training mode chooses TTS or ASR independently for every source sample.
+    Validation mode can use ``task_mode="both"`` to emit both sequences for
+    every source sample, which keeps validation metrics stable instead of
+    sampling a changing task mixture.
+
+    TTS:
+        ``<TTS> text_prompt <EOT> d_prompt <EOS> text_target <EOT> d_target``
+
+    ASR:
+        ``<ASR> d_target <EOS> text_target <EOT>``
+
+    Speech and text targets are attached to their preceding causal anchor.  In
+    particular, ASR's first transcript token is predicted from the scalar
+    speech EOS marker, so it sees the full input utterance but no future text.
+    """
+
+    def __init__(
+        self,
+        *,
+        tts_token_id: int,
+        asr_token_id: int,
+        task_mode: str = "random",
+        tts_probability: float = 0.5,
+        text_token_offset: int | None = None,
+        text_vocab_size: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.tts_token_id = int(tts_token_id)
+        self.asr_token_id = int(asr_token_id)
+        self.task_mode = str(task_mode).strip().lower()
+        self.tts_probability = float(tts_probability)
+        self.text_token_offset = (
+            None if text_token_offset is None else int(text_token_offset)
+        )
+        self.text_vocab_size = None if text_vocab_size is None else int(text_vocab_size)
+
+        if self.task_mode not in {"random", "tts", "asr", "both"}:
+            raise ValueError("task_mode must be one of: random, tts, asr, both.")
+        if not 0.0 <= self.tts_probability <= 1.0:
+            raise ValueError("tts_probability must be in [0, 1].")
+        if self.tts_token_id == self.asr_token_id:
+            raise ValueError("tts_token_id and asr_token_id must be distinct.")
+        reserved_ids = {self.eot_token_id, self.eos_token_id, self.pad_token_id}
+        if self.tts_token_id in reserved_ids or self.asr_token_id in reserved_ids:
+            raise ValueError("Task token ids must not overlap EOT, EOS, or PAD.")
+        if (self.text_token_offset is None) != (self.text_vocab_size is None):
+            raise ValueError(
+                "text_token_offset and text_vocab_size must be provided together."
+            )
+        if self.text_vocab_size is not None:
+            if self.text_vocab_size < 1:
+                raise ValueError("text_vocab_size must be >= 1 when provided.")
+            assert self.text_token_offset is not None
+            first_free_text_id = self.text_token_offset + self.text_vocab_size
+            if min(self.tts_token_id, self.asr_token_id) < first_free_text_id:
+                raise ValueError(
+                    "Task token ids overlap the configured text-token range. "
+                    f"Task ids must be >= {first_free_text_id}."
+                )
+            expected_task_ids = {first_free_text_id, first_free_text_id + 1}
+            if {self.tts_token_id, self.asr_token_id} != expected_task_ids:
+                raise ValueError(
+                    "Task token ids must be the two ids immediately after the configured "
+                    f"text vocabulary: expected {sorted(expected_task_ids)}."
+                )
+
+    def __call__(self, batch: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tensor]:
+        if not batch:
+            raise ValueError("MultitaskBatchCollate received an empty batch.")
+
+        normalized_samples = [self._validate_collate_sample(item) for item in batch]
+        samples = [self._append_target_eos_block(sample) for sample in normalized_samples]
+
+        flat_per_sample: list[dict[str, torch.Tensor]] = []
+        for sample in samples:
+            for task_id in self._tasks_for_sample():
+                flat_per_sample.append(self._build_multitask_flat_sample(sample, task_id))
+
+        flat_multiple = self.flat_sequence_length_multiple
+        return {
+            "flat_token_ids": _pad_1d(
+                [item["token_ids"] for item in flat_per_sample],
+                self.pad_token_id,
+                pad_to_multiple=flat_multiple,
+            ),
+            "flat_discrete_values": _pad_2d(
+                [item["discrete_values"] for item in flat_per_sample],
+                self.pad_token_id,
+                pad_to_multiple=flat_multiple,
+            ),
+            "flat_token_type_ids": _pad_1d(
+                [item["token_type_ids"] for item in flat_per_sample],
+                TEXT_TOKEN_TYPE,
+                pad_to_multiple=flat_multiple,
+            ),
+            "flat_target_discrete_values": _pad_2d(
+                [item["target_discrete_values"] for item in flat_per_sample],
+                self.pad_token_id,
+                pad_to_multiple=flat_multiple,
+            ),
+            "flat_target_text_values": _pad_1d(
+                [item["target_text_values"] for item in flat_per_sample],
+                self.pad_token_id,
+                pad_to_multiple=flat_multiple,
+            ),
+            "flat_target_block_ids": _pad_1d(
+                [item["target_block_ids"] for item in flat_per_sample],
+                -1,
+                pad_to_multiple=flat_multiple,
+            ),
+            "flat_prediction_kind": _pad_1d(
+                [item["prediction_kind"] for item in flat_per_sample],
+                PREDICTION_NONE,
+                pad_to_multiple=flat_multiple,
+            ),
+            "flat_task_ids": torch.tensor(
+                [int(item["task_id"].item()) for item in flat_per_sample],
+                dtype=torch.long,
+            ),
+            "flat_target_block_counts": torch.tensor(
+                [int(item["target_block_count"].item()) for item in flat_per_sample],
+                dtype=torch.long,
+            ),
+            "flat_summary": torch.stack([item["summary"] for item in flat_per_sample], dim=0),
+            "attention_mask": _pad_1d(
+                [item["attention_mask"] for item in flat_per_sample],
+                False,
+                pad_to_multiple=flat_multiple,
+            ).to(dtype=torch.bool),
+        }
+
+    def _tasks_for_sample(self) -> tuple[int, ...]:
+        if self.task_mode == "both":
+            return (TTS_TASK_ID, ASR_TASK_ID)
+        if self.task_mode == "tts":
+            return (TTS_TASK_ID,)
+        if self.task_mode == "asr":
+            return (ASR_TASK_ID,)
+        task_id = TTS_TASK_ID if bool(torch.rand(()) < self.tts_probability) else ASR_TASK_ID
+        return (task_id,)
+
+    def _build_multitask_flat_sample(
+        self,
+        sample: dict[str, torch.Tensor],
+        task_id: int,
+    ) -> dict[str, torch.Tensor]:
+        prompt_text = sample["text_prompt"].to(dtype=torch.long)
+        prompt_discrete = sample["discrete_prompt"].to(dtype=torch.long)
+        target_text = sample["text_target"].to(dtype=torch.long)
+        # BatchCollate guarantees that this ends in a terminal all-stream EOS
+        # frame.  TTS predicts that frame; ASR represents the boundary by the
+        # scalar EOS token after the non-terminal speech frames.
+        target_discrete = sample["discrete_target"].to(dtype=torch.long)
+
+        num_discrete_streams = int(target_discrete.shape[1])
+        pad_discrete = torch.full(
+            (num_discrete_streams,), self.pad_token_id, dtype=torch.long
+        )
+        token_ids: list[int] = []
+        token_type_ids: list[int] = []
+        discrete_values: list[torch.Tensor] = []
+        target_discrete_values: list[torch.Tensor] = []
+        target_text_values: list[int] = []
+        target_block_ids: list[int] = []
+        prediction_kind: list[int] = []
+
+        def append_text(
+            token_id: int,
+            *,
+            kind: int = PREDICTION_NONE,
+            target_text_id: int | None = None,
+            target_block_id: int = -1,
+            target_discrete: torch.Tensor | None = None,
+        ) -> None:
+            token_ids.append(int(token_id))
+            token_type_ids.append(TEXT_TOKEN_TYPE)
+            discrete_values.append(pad_discrete)
+            target_discrete_values.append(
+                pad_discrete if target_discrete is None else target_discrete.to(dtype=torch.long)
+            )
+            target_text_values.append(
+                self.pad_token_id if target_text_id is None else int(target_text_id)
+            )
+            target_block_ids.append(int(target_block_id))
+            prediction_kind.append(int(kind))
+
+        def append_speech_frame(
+            discrete: torch.Tensor,
+            *,
+            kind: int = PREDICTION_NONE,
+            target_block_id: int = -1,
+            target_discrete: torch.Tensor | None = None,
+        ) -> None:
+            token_ids.append(self.pad_token_id)
+            token_type_ids.append(SPEECH_FRAME_TOKEN_TYPE)
+            discrete_values.append(discrete.to(dtype=torch.long))
+            target_discrete_values.append(
+                pad_discrete if target_discrete is None else target_discrete.to(dtype=torch.long)
+            )
+            target_text_values.append(self.pad_token_id)
+            target_block_ids.append(int(target_block_id))
+            prediction_kind.append(int(kind))
+
+        if task_id == TTS_TASK_ID:
+            append_text(self.tts_token_id)
+            for token in prompt_text.tolist():
+                append_text(token)
+            append_text(self.eot_token_id)
+            for frame in prompt_discrete:
+                append_speech_frame(frame)
+            append_text(self.eos_token_id)
+            for token in target_text.tolist():
+                append_text(token)
+            append_text(
+                self.eot_token_id,
+                kind=PREDICTION_DISCRETE,
+                target_block_id=0,
+                target_discrete=target_discrete[0],
+            )
+            for block_idx in range(max(0, int(target_discrete.shape[0]) - 1)):
+                append_speech_frame(
+                    target_discrete[block_idx],
+                    kind=PREDICTION_DISCRETE,
+                    target_block_id=block_idx + 1,
+                    target_discrete=target_discrete[block_idx + 1],
+                )
+            target_block_count = int(target_discrete.shape[0])
+        elif task_id == ASR_TASK_ID:
+            append_text(self.asr_token_id)
+            for frame in target_discrete[:-1]:
+                append_speech_frame(frame)
+            first_text_target = (
+                int(target_text[0].item()) if int(target_text.shape[0]) else self.eot_token_id
+            )
+            append_text(
+                self.eos_token_id,
+                kind=PREDICTION_TEXT,
+                target_text_id=first_text_target,
+            )
+            for text_idx in range(int(target_text.shape[0])):
+                next_text_target = (
+                    int(target_text[text_idx + 1].item())
+                    if text_idx + 1 < int(target_text.shape[0])
+                    else self.eot_token_id
+                )
+                append_text(
+                    int(target_text[text_idx].item()),
+                    kind=PREDICTION_TEXT,
+                    target_text_id=next_text_target,
+                )
+            target_block_count = 0
+        else:
+            raise ValueError(f"Unsupported multitask task_id={task_id}.")
+
+        seq_len = len(token_ids)
+        return {
+            "token_ids": torch.tensor(token_ids, dtype=torch.long),
+            "discrete_values": torch.stack(discrete_values, dim=0).to(dtype=torch.long),
+            "token_type_ids": torch.tensor(token_type_ids, dtype=torch.long),
+            "target_discrete_values": torch.stack(target_discrete_values, dim=0).to(
+                dtype=torch.long
+            ),
+            "target_text_values": torch.tensor(target_text_values, dtype=torch.long),
+            "target_block_ids": torch.tensor(target_block_ids, dtype=torch.long),
+            "prediction_kind": torch.tensor(prediction_kind, dtype=torch.long),
+            "task_id": torch.tensor(task_id, dtype=torch.long),
+            "target_block_count": torch.tensor(target_block_count, dtype=torch.long),
+            "attention_mask": torch.ones(seq_len, dtype=torch.bool),
+            "summary": torch.tensor([task_id, seq_len, target_block_count], dtype=torch.long),
+        }

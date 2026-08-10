@@ -8,9 +8,13 @@ model:
     continuous_latent_size: 512
     discrete_regular_token_loss_weight: 1.0
     discrete_special_token_loss_weight: 1.0
+    # These follow the character vocabulary and select the Stage-1 direction.
+    tts_token_id: 2444
+    asr_token_id: 2445
+    text_loss_weight: 1.0
 
   llama_config:
-    vocab_size: 2444
+    vocab_size: 2446
     hidden_size: 1024
     intermediate_size: 4096
     num_hidden_layers: 16

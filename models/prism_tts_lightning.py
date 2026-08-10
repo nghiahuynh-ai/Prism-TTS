@@ -216,6 +216,45 @@ class PrismTTSLightning(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
+        if getattr(self.model, "stage", "joint") == "discrete" and outputs.tts_loss is not None:
+            self.log(
+                "train/tts_loss",
+                outputs.tts_loss,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=self.sync_dist_logging,
+            )
+            self.log(
+                "train/asr_loss",
+                outputs.asr_loss,
+                prog_bar=False,
+                on_step=True,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=self.sync_dist_logging,
+            )
+            if outputs.tts_sample_count is not None:
+                self.log(
+                    "train/tts_samples",
+                    outputs.tts_sample_count.to(dtype=torch.float32),
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=False,
+                    batch_size=1,
+                    sync_dist=self.sync_dist_logging,
+                )
+            if outputs.asr_sample_count is not None:
+                self.log(
+                    "train/asr_samples",
+                    outputs.asr_sample_count.to(dtype=torch.float32),
+                    prog_bar=False,
+                    on_step=True,
+                    on_epoch=False,
+                    batch_size=1,
+                    sync_dist=self.sync_dist_logging,
+                )
 
         discrete_ppl = torch.exp(outputs.discrete_loss.detach().clamp(max=20.0))
         self.log(
@@ -284,6 +323,25 @@ class PrismTTSLightning(pl.LightningModule):
             batch_size=batch_size,
             sync_dist=self.sync_dist_logging,
         )
+        if getattr(self.model, "stage", "joint") == "discrete" and outputs.tts_loss is not None:
+            self.log(
+                "val/tts_loss",
+                outputs.tts_loss,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=self.sync_dist_logging,
+            )
+            self.log(
+                "val/asr_loss",
+                outputs.asr_loss,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                batch_size=batch_size,
+                sync_dist=self.sync_dist_logging,
+            )
         return outputs.loss
 
     def on_fit_start(self) -> None:
@@ -334,6 +392,8 @@ class PrismTTSLightning(pl.LightningModule):
             "num_discrete_tokens": int(getattr(self.model, "num_discrete_tokens", 0)),
             "discrete_vocab_size": int(getattr(self.model, "discrete_vocab_size", 0)),
             "continuous_latent_size": int(getattr(self.model, "continuous_latent_size", 0)),
+            "tts_token_id": getattr(self.model, "tts_token_id", None),
+            "asr_token_id": getattr(self.model, "asr_token_id", None),
             "normalize_continuous_latents": bool(
                 getattr(self.model, "normalize_continuous_latents", False)
             ),
@@ -405,6 +465,9 @@ class PrismTTSLightning(pl.LightningModule):
                 flat_token_type_ids=batch_inputs.flat_token_type_ids,
                 flat_target_discrete_values=batch_inputs.flat_target_discrete_values,
                 flat_target_block_ids=batch_inputs.flat_target_block_ids,
+                flat_target_text_values=batch_inputs.flat_target_text_values,
+                flat_prediction_kind=batch_inputs.flat_prediction_kind,
+                flat_task_ids=batch_inputs.flat_task_ids,
                 attention_mask=batch_inputs.attention_mask,
                 return_dict=True,
             )
@@ -450,15 +513,6 @@ class PrismTTSLightning(pl.LightningModule):
         )
 
     def _parse_mapping_batch(self, batch: Mapping[str, Any]) -> PrismBatch:
-        required_flat = (
-            "flat_token_ids",
-            "flat_discrete_values",
-            "flat_continuous_values",
-            "flat_token_type_ids",
-            "flat_target_discrete_values",
-            "flat_target_continuous_values",
-            "flat_target_block_ids",
-        )
         required = (
             "text_target",
             "discrete_target",
@@ -485,14 +539,24 @@ class PrismTTSLightning(pl.LightningModule):
                 flat_continuous_values=batch.get("flat_continuous_values"),
                 flat_token_type_ids=batch.get("flat_token_type_ids"),
                 flat_target_discrete_values=batch.get("flat_target_discrete_values"),
+                flat_target_text_values=batch.get("flat_target_text_values"),
                 flat_target_continuous_values=batch.get("flat_target_continuous_values"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
+                flat_prediction_kind=batch.get("flat_prediction_kind"),
+                flat_task_ids=batch.get("flat_task_ids"),
                 flow_timesteps=batch.get("flow_timesteps"),
                 noise=batch.get("noise"),
             )
 
-        if all(key in batch for key in required_flat):
+        required_discrete_flat = (
+            "flat_token_ids",
+            "flat_discrete_values",
+            "flat_token_type_ids",
+            "flat_target_discrete_values",
+            "flat_target_block_ids",
+        )
+        if all(key in batch for key in required_discrete_flat):
             return PrismBatch(
                 attention_mask=batch.get("attention_mask"),
                 flat_token_ids=batch.get("flat_token_ids"),
@@ -500,9 +564,12 @@ class PrismTTSLightning(pl.LightningModule):
                 flat_continuous_values=batch.get("flat_continuous_values"),
                 flat_token_type_ids=batch.get("flat_token_type_ids"),
                 flat_target_discrete_values=batch.get("flat_target_discrete_values"),
+                flat_target_text_values=batch.get("flat_target_text_values"),
                 flat_target_continuous_values=batch.get("flat_target_continuous_values"),
                 flat_target_block_ids=batch.get("flat_target_block_ids"),
                 flat_target_block_counts=batch.get("flat_target_block_counts"),
+                flat_prediction_kind=batch.get("flat_prediction_kind"),
+                flat_task_ids=batch.get("flat_task_ids"),
                 flow_timesteps=batch.get("flow_timesteps"),
                 noise=batch.get("noise"),
             )
@@ -533,9 +600,8 @@ class PrismTTSLightning(pl.LightningModule):
             "Mapping batch is missing PrismTTS keys. Required keys: "
             "(text_target, discrete_target, continuous_target, text_prompt, "
             "discrete_prompt, continuous_prompt) or "
-            "(flat_token_ids, flat_discrete_values, flat_continuous_values, "
-            "flat_token_type_ids, flat_target_discrete_values, "
-            "flat_target_continuous_values, flat_target_block_ids)."
+            "(flat_token_ids, flat_discrete_values, flat_token_type_ids, "
+            "flat_target_discrete_values, flat_target_block_ids)."
         )
 
     def _parse_sequence_batch(self, batch: list[Any] | tuple[Any, ...]) -> PrismBatch:

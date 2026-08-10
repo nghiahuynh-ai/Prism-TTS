@@ -28,9 +28,12 @@ class PrismBatch:
     flat_continuous_values: Optional[torch.FloatTensor] = None
     flat_token_type_ids: Optional[torch.LongTensor] = None
     flat_target_discrete_values: Optional[torch.LongTensor] = None
+    flat_target_text_values: Optional[torch.LongTensor] = None
     flat_target_continuous_values: Optional[torch.FloatTensor] = None
     flat_target_block_ids: Optional[torch.LongTensor] = None
     flat_target_block_counts: Optional[torch.LongTensor] = None
+    flat_prediction_kind: Optional[torch.LongTensor] = None
+    flat_task_ids: Optional[torch.LongTensor] = None
     flow_timesteps: Optional[torch.FloatTensor] = None
     noise: Optional[torch.FloatTensor] = None
 

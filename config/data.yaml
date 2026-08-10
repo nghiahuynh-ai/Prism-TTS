@@ -83,3 +83,8 @@ data:
     # reserved memory up across variable-length steps. Set 1 to disable.
     flat_sequence_length_multiple: 64
     codec_frame_rate_hz: 12.5
+    # Used only by model.name=prism_discrete.  Every train sample independently
+    # chooses one task; validation expands every source example into TTS + ASR.
+    multitask:
+      tts_probability: 0.5
+      validation_task_mode: both

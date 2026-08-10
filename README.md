@@ -5,7 +5,9 @@
 Prism-TTS now trains independent representations in two stages:
 
 ```text
-Stage 1: prompt text/discrete tokens + target text -> causal AR discrete tokens
+Stage 1: a shared causal discrete model trains one direction per sample:
+         TTS: <TTS> prompt text <EOT> prompt discrete <EOS> target text <EOT> -> target discrete
+         ASR: <ASR> target discrete <EOS> -> target text <EOT>
 Stage 2: prompt text/discrete/continuous latents + Stage-1 discrete tokens
          -> causal MeanFlow continuous latents
 ```
@@ -20,6 +22,12 @@ python train.py --experiment-config config/experiment_continuous_meanflow.yaml
 Stage 2 samples a variable target patch during training. Every active frame has
 its own noise level, and causal attention prevents any target frame from seeing
 future discrete tokens, noisy latents, or time levels.
+
+For Stage 1, the training collator independently selects TTS or ASR for each
+sample (`data.collate.multitask.tts_probability`, default 0.5). Validation
+constructs both directions per source sample, yielding stable `val/tts_loss`
+and `val/asr_loss`. TTS generation continues to use `generate.py`; the Stage-1
+model also exposes `transcribe(discrete_speech=...)` for programmatic ASR.
 
 Generate with both checkpoints. `--continuous-window-size` accepts one patch
 width (`8`) or an exact comma-separated schedule (`8,8,4`); each patch is

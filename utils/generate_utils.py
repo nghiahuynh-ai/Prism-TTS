@@ -107,6 +107,9 @@ def build_model(
             discrete_special_token_loss_weight=float(
                 prism_cfg.get("discrete_special_token_loss_weight", 1.0)
             ),
+            tts_token_id=prism_cfg.get("tts_token_id"),
+            asr_token_id=prism_cfg.get("asr_token_id"),
+            text_loss_weight=float(prism_cfg.get("text_loss_weight", 1.0)),
         )
     if model_name == "prism_continuous_meanflow":
         return PrismContinuousMeanFlowTTS(
@@ -184,10 +187,23 @@ def load_checkpoint(
         )
     representation = payload.get("prism_representation")
     if isinstance(representation, dict):
-        for name in ("num_discrete_tokens", "discrete_vocab_size", "continuous_latent_size"):
+        for name in (
+            "num_discrete_tokens",
+            "discrete_vocab_size",
+            "continuous_latent_size",
+            "tts_token_id",
+            "asr_token_id",
+        ):
             saved_value = representation.get(name)
             current_value = getattr(model, name, 0)
-            if saved_value is not None and int(saved_value) != int(current_value):
+            if saved_value is not None and saved_value != current_value:
+                if saved_value is None or current_value is None:
+                    raise RuntimeError(
+                        f"Checkpoint representation mismatch for {name}: "
+                        f"checkpoint={saved_value}, configured={current_value}."
+                    )
+                if int(saved_value) == int(current_value):
+                    continue
                 raise RuntimeError(
                     f"Checkpoint representation mismatch for {name}: "
                     f"checkpoint={saved_value}, configured={current_value}."

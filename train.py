@@ -30,7 +30,12 @@ from torch.utils.data import DataLoader
 from transformers import LlamaConfig
 
 from dataset.adaptive_batching import AdaptiveMemoryBatchSampler, estimate_prism_sample_lengths
-from dataset.dataset import BatchCollate, PrismDataset, build_shared_token_layout
+from dataset.dataset import (
+    BatchCollate,
+    MultitaskBatchCollate,
+    PrismDataset,
+    build_shared_token_layout,
+)
 from models.prism_tts import PrismTTS
 from models.prism_discrete_tts import PrismDiscreteTTS
 from models.prism_continuous_meanflow import PrismContinuousMeanFlowTTS
@@ -474,6 +479,25 @@ def _validate_config_consistency(config: dict[str, Any]) -> None:
             f"model.llama_config.eos_token_id must equal data shared eos token id ({eos_id})."
         )
 
+    if str(model_cfg.get("name", "prism_tts")) == "prism_discrete":
+        tts_token_id = prism_cfg.get("tts_token_id")
+        asr_token_id = prism_cfg.get("asr_token_id")
+        if tts_token_id is None or asr_token_id is None:
+            raise ValueError(
+                "Stage-1 prism_discrete requires model.prism_tts.tts_token_id and "
+                "model.prism_tts.asr_token_id for multitask training."
+            )
+        tts_token_id = int(tts_token_id)
+        asr_token_id = int(asr_token_id)
+        if tts_token_id == asr_token_id:
+            raise ValueError("TTS and ASR task token ids must be distinct.")
+        if min(tts_token_id, asr_token_id) < text_offset:
+            raise ValueError("Stage-1 task token ids must not overlap structural special ids.")
+        if max(tts_token_id, asr_token_id) >= llama_vocab_size:
+            raise ValueError("Stage-1 task token ids must fit model.llama_config.vocab_size.")
+        if float(prism_cfg.get("text_loss_weight", 1.0)) < 0.0:
+            raise ValueError("model.prism_tts.text_loss_weight must be >= 0.")
+
 
 def _build_model(config: dict[str, Any]) -> PrismTTS | PrismDiscreteTTS | PrismContinuousMeanFlowTTS:
     model_cfg = _require_mapping(config, "model")
@@ -514,7 +538,12 @@ def _build_model(config: dict[str, Any]) -> PrismTTS | PrismDiscreteTTS | PrismC
         ),
     )
     if model_name == "prism_discrete":
-        return PrismDiscreteTTS(**common_kwargs)
+        return PrismDiscreteTTS(
+            **common_kwargs,
+            tts_token_id=prism_cfg.get("tts_token_id"),
+            asr_token_id=prism_cfg.get("asr_token_id"),
+            text_loss_weight=float(prism_cfg.get("text_loss_weight", 1.0)),
+        )
     if model_name == "prism_continuous_meanflow":
         return PrismContinuousMeanFlowTTS(
             llama_config=llama_config,
@@ -951,7 +980,7 @@ def _build_data_objects(
     test_manifest = _optional_path(data_cfg.get("test_manifest"))
     test_dataset = build_manifest_dataset(test_manifest, split="test") if test_manifest else None
 
-    collate = BatchCollate(
+    collate_kwargs = dict(
         text_pad_value=collate_cfg.get("text_pad_value"),
         discrete_pad_value=collate_cfg.get("discrete_pad_value"),
         continuous_pad_value=float(collate_cfg.get("continuous_pad_value", 0.0)),
@@ -961,6 +990,34 @@ def _build_data_objects(
             collate_cfg.get("flat_sequence_length_multiple", 1)
         ),
     )
+    model_cfg = _require_mapping(config, "model")
+    prism_cfg = _require_mapping(model_cfg, "prism_tts")
+    is_stage1_multitask = str(model_cfg.get("name", "prism_tts")) == "prism_discrete"
+    if is_stage1_multitask:
+        multitask_cfg_raw = collate_cfg.get("multitask", {})
+        if not isinstance(multitask_cfg_raw, dict):
+            raise ValueError("data.collate.multitask must be a mapping when provided.")
+        multitask_cfg = multitask_cfg_raw
+        text_vocab_size = len(train_dataset.tokenizer.char_to_id)
+        common_multitask_kwargs = dict(
+            **collate_kwargs,
+            tts_token_id=int(prism_cfg["tts_token_id"]),
+            asr_token_id=int(prism_cfg["asr_token_id"]),
+            tts_probability=float(multitask_cfg.get("tts_probability", 0.5)),
+            text_token_offset=train_dataset.text_token_offset,
+            text_vocab_size=text_vocab_size,
+        )
+        train_collate = MultitaskBatchCollate(
+            **common_multitask_kwargs,
+            task_mode="random",
+        )
+        eval_collate = MultitaskBatchCollate(
+            **common_multitask_kwargs,
+            task_mode=str(multitask_cfg.get("validation_task_mode", "both")),
+        )
+    else:
+        train_collate = BatchCollate(**collate_kwargs)
+        eval_collate = train_collate
 
     num_workers = int(loader_cfg.get("num_workers", 0))
     persistent_workers = bool(loader_cfg.get("persistent_workers", False)) and num_workers > 0
@@ -985,7 +1042,6 @@ def _build_data_objects(
         "num_workers": num_workers,
         "pin_memory": pin_memory,
         "persistent_workers": persistent_workers,
-        "collate_fn": collate,
     }
     prefetch_factor = loader_cfg.get("prefetch_factor")
     if num_workers > 0 and prefetch_factor is not None:
@@ -1075,6 +1131,7 @@ def _build_data_objects(
         train_loader = StartupPrefetchDataLoader(
             train_dataset,
             batch_sampler=train_batch_sampler,
+            collate_fn=train_collate,
             **common_loader_kwargs,
         )
 
@@ -1093,6 +1150,7 @@ def _build_data_objects(
             batch_size=train_batch_size,
             shuffle=shuffle_train,
             drop_last=drop_last_train,
+            collate_fn=train_collate,
             **common_loader_kwargs,
         )
 
@@ -1126,6 +1184,7 @@ def _build_data_objects(
             batch_size=int(loader_cfg.get("val_batch_size", 8)),
             shuffle=bool(loader_cfg.get("shuffle_val", False)),
             drop_last=False,
+            collate_fn=eval_collate,
             **common_loader_kwargs,
         )
 
@@ -1136,6 +1195,7 @@ def _build_data_objects(
             batch_size=int(loader_cfg.get("test_batch_size", 8)),
             shuffle=bool(loader_cfg.get("shuffle_test", False)),
             drop_last=False,
+            collate_fn=eval_collate,
             **common_loader_kwargs,
         )
 
