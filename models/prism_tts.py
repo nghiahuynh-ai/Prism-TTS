@@ -19,8 +19,9 @@ from utils import model_utils as MU
 class PrismTTS(nn.Module):
     """Autoregressive fused-frame Prism-TTS model.
 
-    Speech is represented by one token per codec frame.  Each input frame packs
-    every discrete stream and its continuous latent along the model hidden axis.
+    Speech is represented by one token per codec frame. Each input frame fuses
+    every discrete stream with its continuous latent additively in the model
+    hidden space.
     Target frame ``t`` is predicted from the preceding position, which makes
     teacher-forced training and autoregressive rollout use the same context.
     """
@@ -54,8 +55,8 @@ class PrismTTS(nn.Module):
             )
         if continuous_latent_size < 1:
             raise ValueError("continuous_latent_size must be at least 1.")
-        if llama_config.hidden_size < 2:
-            raise ValueError("llama_config.hidden_size must be at least 2 for fused frames.")
+        if llama_config.hidden_size < 1:
+            raise ValueError("llama_config.hidden_size must be positive.")
         if flow_loss_weight < 0.0 or continuous_loss_weight < 0.0:
             raise ValueError("continuous and flow loss weights must be >= 0.")
         if discrete_regular_token_loss_weight < 0.0 or discrete_special_token_loss_weight < 0.0:
@@ -68,8 +69,6 @@ class PrismTTS(nn.Module):
             raise ValueError("continuous_latent_std_eps must be > 0.")
 
         self.hidden_size = int(llama_config.hidden_size)
-        self.discrete_hidden_size = self.hidden_size // 2
-        self.continuous_hidden_size = self.hidden_size - self.discrete_hidden_size
         self.num_discrete_tokens = int(num_discrete_tokens)
         self.discrete_vocab_size = int(discrete_vocab_size)
         self.continuous_latent_size = int(continuous_latent_size)
@@ -85,15 +84,17 @@ class PrismTTS(nn.Module):
         self.continuous_latent_std_eps = float(continuous_latent_std_eps)
 
         self.backbone = LlamaBackbone(llama_config)
-        self.discrete_frame_proj = nn.Linear(self.hidden_size, self.discrete_hidden_size)
-        self.continuous_proj = nn.Linear(self.continuous_latent_size, self.continuous_hidden_size)
+        # Both modalities must occupy the full backbone width before they can
+        # be fused by addition. Both output heads consume that full fused state.
+        self.discrete_frame_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.continuous_proj = nn.Linear(self.continuous_latent_size, self.hidden_size)
         self.discrete_lm_head = nn.Linear(
-            self.discrete_hidden_size,
+            self.hidden_size,
             self.num_discrete_tokens * self.discrete_vocab_size,
             bias=False,
         )
         self.continuous_prior_head = nn.Linear(
-            self.continuous_hidden_size,
+            self.hidden_size,
             self.continuous_latent_size,
         )
 
@@ -323,7 +324,7 @@ class PrismTTS(nn.Module):
         discrete_frame = per_stream.sum(dim=2) / math.sqrt(float(self.num_discrete_tokens))
         discrete_frame = self.discrete_frame_proj(discrete_frame)
         continuous_frame = self.continuous_proj(continuous_values)
-        fused_frame = torch.cat((discrete_frame, continuous_frame), dim=-1)
+        fused_frame = discrete_frame + continuous_frame
 
         return torch.where(is_frame.unsqueeze(-1), fused_frame, text_embeds)
 
@@ -385,31 +386,24 @@ class PrismTTS(nn.Module):
         )
         return outputs.last_hidden_state
 
-    def _split_hidden(self, hidden_states: torch.FloatTensor) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        return torch.split(
-            hidden_states,
-            (self.discrete_hidden_size, self.continuous_hidden_size),
-            dim=-1,
-        )
-
-    def _discrete_logits(self, discrete_hidden: torch.FloatTensor) -> torch.FloatTensor:
-        logits = self.discrete_lm_head(discrete_hidden)
+    def _discrete_logits(self, hidden_states: torch.FloatTensor) -> torch.FloatTensor:
+        logits = self.discrete_lm_head(hidden_states)
         return logits.view(*logits.shape[:-1], self.num_discrete_tokens, self.discrete_vocab_size)
 
     def _compute_discrete_loss(
         self,
         *,
-        discrete_hidden: torch.FloatTensor,
+        hidden_states: torch.FloatTensor,
         target_discrete: torch.LongTensor,
         prediction_mask: torch.BoolTensor,
     ) -> tuple[torch.Tensor, torch.FloatTensor]:
         if not prediction_mask.any():
-            zero = discrete_hidden.new_zeros(())
-            return zero, discrete_hidden.new_zeros(
+            zero = hidden_states.new_zeros(())
+            return zero, hidden_states.new_zeros(
                 (0, self.num_discrete_tokens, self.discrete_vocab_size)
             )
 
-        selected_hidden = discrete_hidden[prediction_mask]
+        selected_hidden = hidden_states[prediction_mask]
         selected_targets = target_discrete[prediction_mask]
         logits = self._discrete_logits(selected_hidden)
         flat_logits = logits.flatten(0, 1)
@@ -438,7 +432,7 @@ class PrismTTS(nn.Module):
     def _compute_continuous_losses(
         self,
         *,
-        continuous_hidden: torch.FloatTensor,
+        hidden_states: torch.FloatTensor,
         target_continuous: torch.FloatTensor,
         target_block_ids: torch.LongTensor,
         prediction_mask: torch.BoolTensor,
@@ -446,16 +440,16 @@ class PrismTTS(nn.Module):
         noise: Optional[torch.FloatTensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if not prediction_mask.any():
-            zero = continuous_hidden.new_zeros(())
+            zero = hidden_states.new_zeros(())
             return zero, zero
 
-        selected_hidden = continuous_hidden[prediction_mask]
+        selected_hidden = hidden_states[prediction_mask]
         prior_prediction = self.continuous_prior_head(selected_hidden)
         selected_target = target_continuous[prediction_mask]
         reconstruction_loss = F.mse_loss(prior_prediction, selected_target)
 
         batch_size, seq_len = prediction_mask.shape
-        batch_indices = torch.arange(continuous_hidden.shape[0], device=continuous_hidden.device).view(-1, 1)
+        batch_indices = torch.arange(hidden_states.shape[0], device=hidden_states.device).view(-1, 1)
         batch_indices = batch_indices.expand(batch_size, seq_len)[prediction_mask]
         block_indices = target_block_ids[prediction_mask]
 
@@ -519,15 +513,14 @@ class PrismTTS(nn.Module):
         )
         flat = self._normalize_autoregressive_batch(flat)
         hidden_states = self._encode(flat)
-        discrete_hidden, continuous_hidden = self._split_hidden(hidden_states)
         prediction_mask = flat.attention_mask & (flat.target_block_ids >= 0)
         discrete_loss, _ = self._compute_discrete_loss(
-            discrete_hidden=discrete_hidden,
+            hidden_states=hidden_states,
             target_discrete=flat.target_discrete_values,
             prediction_mask=prediction_mask,
         )
         continuous_loss, flow_loss = self._compute_continuous_losses(
-            continuous_hidden=continuous_hidden,
+            hidden_states=hidden_states,
             target_continuous=flat.target_continuous_values,
             target_block_ids=flat.target_block_ids,
             prediction_mask=prediction_mask,
@@ -687,8 +680,7 @@ class PrismTTS(nn.Module):
         )
 
         for step_idx in range(max_new_blocks):
-            discrete_hidden, continuous_hidden = self._split_hidden(hidden)
-            logits = self._discrete_logits(discrete_hidden)[0]
+            logits = self._discrete_logits(hidden)[0]
             sampled_discrete = self._sample_discrete_ids(
                 logits,
                 temperature=temperature,
@@ -696,7 +688,7 @@ class PrismTTS(nn.Module):
                 top_p=top_p,
                 do_sample=do_sample,
             )
-            prior = self.continuous_prior_head(continuous_hidden)[0]
+            prior = self.continuous_prior_head(hidden)[0]
             is_terminal = self._is_terminal_block(sampled_discrete, discrete_eos_id)
             is_special = bool(
                 MU.build_special_block_mask(

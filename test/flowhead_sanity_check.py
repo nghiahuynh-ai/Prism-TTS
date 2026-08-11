@@ -319,9 +319,8 @@ def main() -> None:
         )
         flat = model._normalize_autoregressive_batch(flat)
         hidden = model._encode(flat)
-        _, continuous_hidden = model._split_hidden(hidden)
         prediction_mask = flat.attention_mask & (flat.target_block_ids >= 0)
-        cond = model.continuous_prior_head(continuous_hidden[prediction_mask])
+        cond = model.continuous_prior_head(hidden[prediction_mask])
         sampled_latents = model.sample_continuous_latent(
             cond=cond,
             num_steps=args.flow_num_steps,

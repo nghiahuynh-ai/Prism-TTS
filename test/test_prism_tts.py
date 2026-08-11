@@ -177,6 +177,49 @@ def test_forward_computes_fused_ar_losses() -> None:
     assert int((batch["flat_target_block_ids"] >= 0).sum().item()) == 8
 
 
+def test_frame_embedding_adds_full_width_modal_representations() -> None:
+    """Speech frames are an additive, not concatenated, modal fusion."""
+    torch.manual_seed(17)
+    model = _model().eval()
+    assert model.discrete_frame_proj.out_features == model.hidden_size
+    assert model.continuous_proj.out_features == model.hidden_size
+    assert model.discrete_lm_head.in_features == model.hidden_size
+    assert model.continuous_prior_head.in_features == model.hidden_size
+
+    token_ids = torch.tensor([[40, 34]], dtype=torch.long)
+    discrete_values = torch.tensor([[[1, 2], [3, 4]]], dtype=torch.long)
+    continuous_values = torch.tensor(
+        [[[0.1] * 8, [0.2] * 8]],
+        dtype=torch.float32,
+    )
+    token_type_ids = torch.tensor(
+        [[MU.SPEECH_FRAME_TOKEN_TYPE, MU.TEXT_TOKEN_TYPE]],
+        dtype=torch.long,
+    )
+
+    with torch.no_grad():
+        inputs_embeds = model._build_inputs_embeds(
+            token_ids=token_ids,
+            discrete_values=discrete_values,
+            continuous_values=continuous_values,
+            token_type_ids=token_type_ids,
+        )
+        per_stream = model.discrete_embedding(discrete_values)
+        per_stream = per_stream + model.discrete_stream_embeddings.view(
+            1,
+            1,
+            model.num_discrete_tokens,
+            model.hidden_size,
+        )
+        expected_discrete = model.discrete_frame_proj(
+            per_stream.sum(dim=2) / (model.num_discrete_tokens**0.5)
+        )
+        expected_continuous = model.continuous_proj(continuous_values)
+
+    assert torch.allclose(inputs_embeds[:, 0], expected_discrete[:, 0] + expected_continuous[:, 0])
+    assert torch.allclose(inputs_embeds[:, 1], model.text_embedding(token_ids)[:, 1])
+
+
 def test_continuous_latent_normalization_keeps_structural_zeros() -> None:
     model = _model(
         normalize_continuous_latents=True,
@@ -245,9 +288,8 @@ def test_first_frame_prediction_cannot_see_future_target_frames() -> None:
         )
         with torch.no_grad():
             hidden = model._encode(flat)
-            discrete_hidden, _ = model._split_hidden(hidden)
             position = torch.nonzero(flat.target_block_ids[0] == 0, as_tuple=False).item()
-            return model._discrete_logits(discrete_hidden[0, position]).detach()
+            return model._discrete_logits(hidden[0, position]).detach()
 
     assert torch.allclose(first_logits(first), first_logits(second), atol=1e-6, rtol=1e-6)
 
